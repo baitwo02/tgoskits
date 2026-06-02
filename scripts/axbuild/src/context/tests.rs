@@ -7,7 +7,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use ostool::{Tool, ToolConfig};
+use ostool::{Tool, ToolConfig, build::config::Cargo, run::qemu::QemuConfig};
 use tempfile::tempdir;
 
 use super::*;
@@ -433,6 +433,37 @@ fn should_use_loongarch_lvz_only_for_axvisor_loongarch() {
 }
 
 #[test]
+fn direct_loongarch_qemu_stdio_only_for_plain_interactive_axvisor() {
+    let cargo = Cargo {
+        package: crate::axvisor::build::AXVISOR_PACKAGE.to_string(),
+        target: "loongarch64-unknown-none-softfloat".to_string(),
+        ..Default::default()
+    };
+    let qemu = QemuConfig {
+        to_bin: false,
+        ..Default::default()
+    };
+
+    assert!(should_use_direct_loongarch_qemu_stdio(&cargo, &qemu));
+}
+
+#[test]
+fn direct_loongarch_qemu_stdio_keeps_automated_runs_on_ostool_runner() {
+    let cargo = Cargo {
+        package: crate::axvisor::build::AXVISOR_PACKAGE.to_string(),
+        target: "loongarch64-unknown-none-softfloat".to_string(),
+        ..Default::default()
+    };
+    let qemu = QemuConfig {
+        to_bin: false,
+        success_regex: vec!["test pass".to_string()],
+        ..Default::default()
+    };
+
+    assert!(!should_use_direct_loongarch_qemu_stdio(&cargo, &qemu));
+}
+
+#[test]
 fn find_loongarch_qemu_dir_prefers_explicit_env_override() {
     let _lock = ENV_LOCK.lock().unwrap();
     let root = tempdir().unwrap();
@@ -477,6 +508,26 @@ fn find_loongarch_qemu_dir_checks_home_before_workspace_ancestors() {
         find_loongarch_qemu_dir(&workspace_root),
         Some(home_qemu_dir)
     );
+}
+
+#[test]
+fn find_loongarch_qemu_dir_prefers_ci_pinned_home_install() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let home = tempdir().unwrap();
+    let root = tempdir().unwrap();
+    let ci_qemu_dir = home.path().join("qemu-lvz-ci-install/bin");
+    let legacy_qemu_dir = home.path().join("QEMU-LVZ/build");
+
+    fs::create_dir_all(&ci_qemu_dir).unwrap();
+    fs::create_dir_all(&legacy_qemu_dir).unwrap();
+    fs::write(ci_qemu_dir.join("qemu-system-loongarch64"), "").unwrap();
+    fs::write(legacy_qemu_dir.join("qemu-system-loongarch64"), "").unwrap();
+
+    let _qemu_dir = TempEnvVar::unset("AXBUILD_QEMU_DIR");
+    let _qemu_bin = TempEnvVar::unset("AXBUILD_QEMU_SYSTEM_LOONGARCH64");
+    let _home = TempEnvVar::set("HOME", home.path());
+
+    assert_eq!(find_loongarch_qemu_dir(root.path()), Some(ci_qemu_dir));
 }
 
 #[test]

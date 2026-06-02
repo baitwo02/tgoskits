@@ -3,6 +3,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 use anyhow::Context;
@@ -16,6 +17,8 @@ use ostool::{
         uboot::UbootConfig,
     },
 };
+
+use crate::support::process::ProcessExt;
 
 mod arch;
 mod resolve;
@@ -146,6 +149,11 @@ impl AppContext {
         let _env_guard = EnvRestoreGuard::set(&cargo.env);
         let _path_guard = self.scoped_qemu_path(&cargo)?;
         self.set_build_config_path(build_config_path);
+        if let Some(qemu) = qemu.as_ref()
+            && should_use_direct_loongarch_qemu_stdio(&cargo, qemu)
+        {
+            return self.run_direct_loongarch_qemu_stdio(&cargo, qemu).await;
+        }
         self.tool
             .cargo_run(
                 &cargo,
@@ -157,6 +165,36 @@ impl AppContext {
                 })),
             )
             .await
+    }
+
+    async fn run_direct_loongarch_qemu_stdio(
+        &mut self,
+        cargo: &Cargo,
+        qemu: &QemuConfig,
+    ) -> anyhow::Result<()> {
+        info!("Using direct stdio QEMU runner for LoongArch AxVisor");
+        self.tool.cargo_build(cargo).await?;
+
+        let artifacts = self.tool.ctx().artifacts.clone();
+        let kernel = artifacts
+            .bin
+            .or(artifacts.elf)
+            .context("cargo build did not produce a QEMU-loadable artifact")?;
+
+        let mut cmd = Command::new("qemu-system-loongarch64");
+        cmd.current_dir(self.workspace_root())
+            .args(&qemu.args)
+            .arg("-kernel")
+            .arg(kernel)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        if self.debug {
+            cmd.arg("-s").arg("-S");
+        }
+
+        cmd.exec()
     }
 
     pub(crate) async fn run_qemu(
@@ -331,6 +369,17 @@ fn should_use_loongarch_lvz_for(package: &str, target: &str) -> bool {
     package == "axvisor" && target.contains("loongarch64")
 }
 
+fn should_use_direct_loongarch_qemu_stdio(cargo: &Cargo, qemu: &QemuConfig) -> bool {
+    should_use_loongarch_lvz_for(&cargo.package, &cargo.target)
+        && !qemu.uefi
+        && !qemu.to_bin
+        && qemu.success_regex.is_empty()
+        && qemu.fail_regex.is_empty()
+        && qemu.shell_prefix.is_none()
+        && qemu.shell_init_cmd.is_none()
+        && qemu.timeout.unwrap_or(0) == 0
+}
+
 fn configure_loongarch_qemu_path(workspace_root: &Path) -> anyhow::Result<()> {
     let Some(qemu_dir) = find_loongarch_qemu_dir(workspace_root) else {
         return Ok(());
@@ -369,13 +418,21 @@ fn loongarch_qemu_dir_candidates(workspace_root: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        for suffix in ["QEMU-LVZ/build", "qemu-lvz/build"] {
+        for suffix in [
+            "qemu-lvz-ci-install/bin",
+            "QEMU-LVZ/build",
+            "qemu-lvz/build",
+        ] {
             candidates.push(home.join(suffix));
         }
     }
 
     for ancestor in workspace_root.ancestors() {
-        for suffix in ["QEMU-LVZ/build", "qemu-lvz/build"] {
+        for suffix in [
+            "qemu-lvz-ci-install/bin",
+            "QEMU-LVZ/build",
+            "qemu-lvz/build",
+        ] {
             candidates.push(ancestor.join(suffix));
         }
     }
