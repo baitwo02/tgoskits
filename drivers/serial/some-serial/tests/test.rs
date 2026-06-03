@@ -153,7 +153,7 @@ mod tests {
         let payload = b"irq-loopback";
         let mut remaining = payload.as_slice();
         while !remaining.is_empty() {
-            let written = tx.submit_tx(remaining);
+            let written = tx.try_write(remaining);
             if written == 0 {
                 core::hint::spin_loop();
                 continue;
@@ -186,7 +186,7 @@ mod tests {
         );
 
         let mut buffer = [0u8; 32];
-        let received = rx.submit_rx(&mut buffer).expect("failed to read loopback");
+        let received = rx.try_read(&mut buffer).expect("failed to read loopback");
         assert_eq!(&buffer[..received], payload);
 
         serial.disable_loopback();
@@ -338,7 +338,7 @@ mod tests {
     fn clean_rx(rx: &mut BRxQueue) {
         let mut buffer = [0u8; 64];
         loop {
-            match rx.submit_rx(&mut buffer) {
+            match rx.try_read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -360,12 +360,12 @@ mod tests {
         for &byte in expected {
             let mut written = 0usize;
             while written == 0 {
-                written = tx.submit_tx(&[byte]);
+                written = tx.try_write(&[byte]);
                 core::hint::spin_loop();
             }
 
             loop {
-                match rx.submit_rx(&mut received[total..total + 1]) {
+                match rx.try_read(&mut received[total..total + 1]) {
                     Ok(1) => {
                         total += 1;
                         break;

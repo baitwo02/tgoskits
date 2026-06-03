@@ -214,7 +214,7 @@ unsafe fn serial_raw_irq_handler(
 
 impl TtyRead for SerialReader {
     fn read(&mut self, buf: &mut [u8]) -> usize {
-        match self.backend.rx.lock().submit_rx(buf) {
+        match self.backend.rx.lock().try_read(buf) {
             Ok(read) => read,
             Err(err) => {
                 if err.bytes_transferred == 0 {
@@ -234,7 +234,7 @@ impl TtyWrite for SerialWriter {
         let mut tx = self.backend.tx.lock();
         let mut written = 0;
         while written < buf.len() {
-            let next = tx.submit_tx(&buf[written..]);
+            let next = tx.try_write(&buf[written..]);
             written += next;
             if next == 0 {
                 drop(tx);

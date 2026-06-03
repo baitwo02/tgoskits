@@ -231,14 +231,6 @@ pub trait InterfaceRaw: Send + Any + 'static {
     fn try_write(&mut self, bytes: &[u8]) -> usize;
     fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError>;
     fn handle_irq(&mut self) -> SerialEvent;
-
-    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        self.try_write(bytes)
-    }
-
-    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        self.try_read(bytes)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -313,13 +305,13 @@ pub trait Interface: DriverGeneric {
 pub trait TTxQueue: Send + 'static {
     fn base_addr(&self) -> usize;
     fn poll(&mut self) -> SerialEvent;
-    fn submit_tx(&mut self, bytes: &[u8]) -> usize;
+    fn try_write(&mut self, bytes: &[u8]) -> usize;
 }
 
 pub trait TRxQueue: Send + 'static {
     fn base_addr(&self) -> usize;
     fn poll(&mut self) -> SerialEvent;
-    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError>;
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError>;
 }
 
 pub trait TIrqHandler: Send + Sync + 'static {
@@ -377,13 +369,34 @@ mod tests {
         assert_eq!(err.actual(), 0x1000);
     }
 
+    #[test]
+    fn split_queues_forward_try_io_to_shared_raw_device() {
+        let mut serial = SerialDyn::new_boxed(MockSerial::new(0x1000));
+        let mut tx = serial.take_tx().expect("TX handle should be available");
+        let mut rx = serial.take_rx().expect("RX handle should be available");
+
+        let written = tx.try_write(b"abc");
+        assert_eq!(written, 3);
+
+        let mut buf = [0; 4];
+        let read = rx.try_read(&mut buf).expect("RX read should succeed");
+        assert_eq!(read, 3);
+        assert_eq!(&buf[..read], b"abc");
+    }
+
     struct MockSerial {
         base: usize,
+        bytes: [u8; 8],
+        len: usize,
     }
 
     impl MockSerial {
         fn new(base: usize) -> Self {
-            Self { base }
+            Self {
+                base,
+                bytes: [0; 8],
+                len: 0,
+            }
         }
     }
 
@@ -447,11 +460,30 @@ mod tests {
         }
 
         fn try_write(&mut self, bytes: &[u8]) -> usize {
-            bytes.len()
+            let mut written = 0;
+            for &byte in bytes {
+                if self.len == self.bytes.len() {
+                    break;
+                }
+                self.bytes[self.len] = byte;
+                self.len += 1;
+                written += 1;
+            }
+            written
         }
 
-        fn try_read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-            Ok(0)
+        fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+            let mut read = 0;
+            for out in bytes {
+                if self.len == 0 {
+                    break;
+                }
+                *out = self.bytes[0];
+                self.bytes.copy_within(1..self.len, 0);
+                self.len -= 1;
+                read += 1;
+            }
+            Ok(read)
         }
 
         fn handle_irq(&mut self) -> SerialEvent {

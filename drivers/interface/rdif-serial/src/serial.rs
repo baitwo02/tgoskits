@@ -192,7 +192,7 @@ impl<T: InterfaceRaw> TTxQueue for TxQueue<T> {
         }
     }
 
-    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+    fn try_write(&mut self, bytes: &[u8]) -> usize {
         self.inner.lock().try_write(bytes)
     }
 }
@@ -219,7 +219,7 @@ impl<T: InterfaceRaw> TRxQueue for RxQueue<T> {
         inner.poll() & (SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN)
     }
 
-    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
         self.inner.lock().try_read(bytes)
     }
 }

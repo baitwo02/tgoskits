@@ -287,14 +287,6 @@ impl<T: Kind> Ns16550<T> {
         Ok(read_count)
     }
 
-    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        self.try_write(bytes)
-    }
-
-    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        self.try_read(bytes)
-    }
-
     pub fn handle_irq(&mut self) -> SerialEvent {
         let iir: InterruptIdentificationFlags = self.read_flags(UART_IIR);
         let mut event = SerialEvent::empty();

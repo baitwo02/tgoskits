@@ -180,7 +180,7 @@ let mut tx = serial.take_tx().expect("missing TX queue");
 let mut sent = 0;
 let bytes = b"runtime serial\n";
 while sent < bytes.len() {
-    let n = tx.submit_tx(&bytes[sent..]);
+    let n = tx.try_write(&bytes[sent..]);
     if n == 0 {
         core::hint::spin_loop();
     }
