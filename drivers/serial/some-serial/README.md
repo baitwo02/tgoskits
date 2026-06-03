@@ -161,7 +161,8 @@ if event.rx_ready() {
 #### 平台检测与适配
 
 需要运行时动态分发的 rdrive/Starry 路径可以把 concrete 设备包装成 `rdif_serial::BSerial`。
-这个对象只负责控制和 split/restore；I/O 仍然从拆出的 queue/handler 走。
+这个对象只负责控制和 split/restore；拆出的 TX/RX/IRQ runtime parts 各自持有可复制寄存器入口，
+并通过共享原子状态同步 IRQ event 和 read-clear 错误位，不在 rdif adapter 内使用 Mutex。
 
 ```rust
 use core::ptr::NonNull;

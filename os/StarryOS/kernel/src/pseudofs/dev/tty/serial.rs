@@ -3,6 +3,7 @@ use core::ptr::NonNull;
 
 use ax_driver::serial::{
     self as ax_serial, BIrqHandler, BRxQueue, BTxQueue, SerialDevice, SerialEvent,
+    SerialRuntimePortControl,
 };
 use ax_errno::AxResult;
 use ax_kspin::SpinNoIrq;
@@ -47,10 +48,11 @@ struct SerialBackend {
     name: String,
     tty_name: String,
     number: usize,
-    device: SpinNoIrq<SerialDevice>,
+    control: SpinNoIrq<SerialRuntimePortControl>,
     tx: SpinNoIrq<BTxQueue>,
     rx: SpinNoIrq<BRxQueue>,
     irq_handler: Option<BIrqHandler>,
+    irq_num: Option<usize>,
     input_source: Arc<PollSet>,
 }
 
@@ -143,20 +145,22 @@ impl SerialRegistry {
     }
 }
 
-fn new_serial_tty(number: usize, mut serial: SerialDevice) -> AxResult<SerialTtyEntry> {
+fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntry> {
     let tty_name = format!("ttyS{number}");
     let input_source = Arc::new(PollSet::new());
-    let tx = serial.take_tx().ok_or(ax_errno::AxError::BadState)?;
-    let rx = serial.take_rx().ok_or(ax_errno::AxError::BadState)?;
-    let irq_handler = serial.take_irq_handler();
+    let runtime = serial.into_runtime_port()?;
+    let name = runtime.name().into();
+    let irq_num = runtime.irq_num();
+    let (control, tx, rx, irq_handler) = runtime.split();
     let backend = Arc::new(SerialBackend {
-        name: serial.name().into(),
+        name,
         tty_name: tty_name.clone(),
         number,
-        device: SpinNoIrq::new(serial),
+        control: SpinNoIrq::new(control),
         tx: SpinNoIrq::new(tx),
         rx: SpinNoIrq::new(rx),
         irq_handler,
+        irq_num,
         input_source,
     });
     let process_mode = serial_process_mode(&backend).unwrap_or(ProcessMode::Manual);
@@ -175,7 +179,7 @@ fn new_serial_tty(number: usize, mut serial: SerialDevice) -> AxResult<SerialTty
 }
 
 fn serial_process_mode(backend: &Arc<SerialBackend>) -> Option<ProcessMode> {
-    let irq_num = backend.device.lock().irq_num()?;
+    let irq_num = backend.irq_num?;
     if backend.irq_handler.is_none() {
         warn!(
             "{} has irq {irq_num} but no serial IRQ handler; using polling mode",
@@ -194,7 +198,7 @@ fn serial_process_mode(backend: &Arc<SerialBackend>) -> Option<ProcessMode> {
         }
         return None;
     }
-    backend.device.lock().enable_rx_interrupts();
+    backend.control.lock().enable_rx_interrupts();
     Some(ProcessMode::InterruptDriven(backend.input_source.clone()))
 }
 
@@ -251,7 +255,7 @@ impl TtyWrite for SerialWriter {
         if old.baudrate() == Some(new_baud) {
             return;
         }
-        if let Err(err) = self.backend.device.lock().set_baudrate(new_baud) {
+        if let Err(err) = self.backend.control.lock().set_baudrate(new_baud) {
             warn!(
                 "{} failed to set baudrate {new_baud} on {}: {:?}",
                 self.backend.tty_name, self.backend.name, err

@@ -55,6 +55,19 @@ pub struct SerialDevice {
     interface: BSerial,
 }
 
+pub struct SerialRuntimePort {
+    name: String,
+    info: SerialDeviceInfo,
+    pub control: SerialRuntimePortControl,
+    pub tx: BTxQueue,
+    pub rx: BRxQueue,
+    pub irq_handler: Option<BIrqHandler>,
+}
+
+pub struct SerialRuntimePortControl {
+    interface: BSerial,
+}
+
 impl PlatformSerialDevice {
     fn new(name: String, info: SerialDeviceInfo, interface: BSerial) -> Self {
         Self {
@@ -152,6 +165,83 @@ impl SerialDevice {
 
     pub fn set_irq_handler(&mut self, irq: BIrqHandler) -> Result<(), SetBackError> {
         self.interface.set_irq_handler(irq)
+    }
+
+    pub fn into_runtime_port(mut self) -> Result<SerialRuntimePort, AxError> {
+        let tx = self.interface.take_tx().ok_or(AxError::BadState)?;
+        let rx = self.interface.take_rx().ok_or(AxError::BadState)?;
+        let irq_handler = self.interface.take_irq_handler();
+        Ok(SerialRuntimePort {
+            name: self.name,
+            info: self.info,
+            control: SerialRuntimePortControl {
+                interface: self.interface,
+            },
+            tx,
+            rx,
+            irq_handler,
+        })
+    }
+}
+
+impl SerialRuntimePort {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn info(&self) -> &SerialDeviceInfo {
+        &self.info
+    }
+
+    pub fn fdt_path(&self) -> &str {
+        &self.info.fdt_path
+    }
+
+    pub fn alias_index(&self) -> Option<usize> {
+        self.info.alias_index
+    }
+
+    pub fn irq_num(&self) -> Option<usize> {
+        self.info.irq_num
+    }
+
+    pub fn split(
+        self,
+    ) -> (
+        SerialRuntimePortControl,
+        BTxQueue,
+        BRxQueue,
+        Option<BIrqHandler>,
+    ) {
+        (self.control, self.tx, self.rx, self.irq_handler)
+    }
+}
+
+impl SerialRuntimePortControl {
+    pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
+        self.interface.set_config(config)
+    }
+
+    pub fn set_baudrate(&mut self, baudrate: u32) -> Result<(), ConfigError> {
+        self.interface.set_config(&Config::new().baudrate(baudrate))
+    }
+
+    pub fn set_irq_mask(&mut self, mask: InterruptMask) {
+        self.interface.set_irq_mask(mask);
+    }
+
+    pub fn get_irq_mask(&self) -> InterruptMask {
+        self.interface.get_irq_mask()
+    }
+
+    pub fn enable_rx_interrupts(&mut self) {
+        let mask = self.interface.get_irq_mask() | InterruptMask::RX_AVAILABLE;
+        self.interface.set_irq_mask(mask);
+    }
+
+    pub fn disable_rx_interrupts(&mut self) {
+        let mask = self.interface.get_irq_mask() & !InterruptMask::RX_AVAILABLE;
+        self.interface.set_irq_mask(mask);
     }
 }
 
