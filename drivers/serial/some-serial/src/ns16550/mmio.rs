@@ -42,11 +42,9 @@ impl Ns16550<Mmio> {
         };
 
         Ns16550 {
-            base: base.clone(),
+            base,
             clock_freq,
-            tx_taken: false,
-            rx_taken: false,
-            irq_taken: false,
+            saved_lsr: super::registers::LineStatusFlags::empty(),
         }
     }
 

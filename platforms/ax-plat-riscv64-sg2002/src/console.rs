@@ -25,33 +25,23 @@ impl ConsoleIf for ConsoleIfImpl {
     /// Writes bytes to the console from input u8 slice.
     fn write_bytes(bytes: &[u8]) {
         let mut uart = UART.lock();
-        let Some(mut tx) = uart.take_tx() else {
-            return;
-        };
         for &c in bytes {
             match c {
                 b'\n' => {
-                    write_byte(&mut tx, b'\r');
-                    write_byte(&mut tx, b'\n');
+                    write_byte(&mut uart, b'\r');
+                    write_byte(&mut uart, b'\n');
                 }
-                c => write_byte(&mut tx, c),
+                c => write_byte(&mut uart, c),
             }
         }
-        let _ = uart.set_tx(tx);
     }
 
     /// Reads bytes from the console into the given mutable slice.
     /// Returns the number of bytes read.
     fn read_bytes(bytes: &mut [u8]) -> usize {
         let mut uart = UART.lock();
-        let Some(mut rx) = uart.take_rx() else {
-            return 0;
-        };
-        let n = rx
-            .submit_rx(bytes)
-            .unwrap_or_else(|err| err.bytes_transferred);
-        let _ = uart.set_rx(rx);
-        n
+        uart.try_read(bytes)
+            .unwrap_or_else(|err| err.bytes_transferred)
     }
 
     /// Returns the IRQ number for the console, if applicable.
@@ -70,11 +60,8 @@ impl ConsoleIf for ConsoleIfImpl {
     }
 }
 
-fn write_byte(
-    tx: &mut some_serial::ns16550::Ns16550TxQueue<some_serial::ns16550::dw_apb::DwApb>,
-    byte: u8,
-) {
-    while tx.submit_tx(&[byte]) == 0 {
+fn write_byte(uart: &mut DwApbUart, byte: u8) {
+    while uart.try_write(&[byte]) == 0 {
         core::hint::spin_loop();
     }
 }

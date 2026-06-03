@@ -49,12 +49,7 @@ fn deal_with_spsr(spsr: &PhysicalMapping<impl Handler, Spcr>) -> Option<()> {
                 base_address.access_size as _,
             );
             uart.open();
-            let tx = uart.take_tx()?;
-            let rx = uart.take_rx()?;
-            crate::console::set_earlycon_serial(
-                crate::console::EarlySerialTx::Ns16550Mmio(tx),
-                crate::console::EarlySerialRx::Ns16550Mmio(rx),
-            );
+            crate::console::set_earlycon_serial(crate::console::EarlySerial::Ns16550Mmio(uart));
         }
         t => {
             println!("Unsupported SPCR interface type `{t:?}` for early console.");

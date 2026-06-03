@@ -1,8 +1,7 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
 use rdif_serial::{
-    BSerial, InterfaceRaw, SerialDyn, SerialEvent, SetBackError, TIrqHandler, TRxQueue, TTxQueue,
-    TransBytesError, TransferError,
+    BSerial, InterfaceRaw, SerialDirection, SerialDyn, SerialEvent, TransBytesError, TransferError,
 };
 use tock_registers::{interfaces::*, register_bitfields, register_structs, registers::*};
 
@@ -142,9 +141,6 @@ unsafe impl Sync for Pl011Registers {}
 pub struct Pl011 {
     base: Reg,
     clock_freq: u32,
-    tx_taken: bool,
-    rx_taken: bool,
-    irq_taken: bool,
 }
 
 impl Pl011 {
@@ -161,13 +157,7 @@ impl Pl011 {
     pub fn new(base: NonNull<u8>, clock_freq: u32) -> Self {
         let base = Reg(base.cast());
 
-        Self {
-            base,
-            clock_freq,
-            tx_taken: false,
-            rx_taken: false,
-            irq_taken: false,
-        }
+        Self { base, clock_freq }
     }
 
     pub fn new_boxed(base: NonNull<u8>, clock_freq: u32) -> BSerial {
@@ -344,23 +334,55 @@ impl Pl011 {
         mask
     }
 
-    fn submit_tx_from_reg(base: Reg, bytes: &[u8]) -> usize {
+    pub fn pending(&mut self, direction: SerialDirection) -> bool {
+        match direction {
+            SerialDirection::Input => !self.registers().uartfr.is_set(UARTFR::RXFE),
+            SerialDirection::Output => !self.registers().uartfr.is_set(UARTFR::TXFF),
+        }
+    }
+
+    pub fn poll(&mut self) -> SerialEvent {
+        let mut event = SerialEvent::empty();
+        let fr = self.registers().uartfr.extract();
+        if !fr.is_set(UARTFR::RXFE) {
+            event |= SerialEvent::RX_READY;
+        }
+        if !fr.is_set(UARTFR::TXFF) {
+            event |= SerialEvent::TX_READY;
+        }
+
+        let rsr = self.registers().uartrsr_ecr.extract();
+        if rsr.is_set(UARTRSR_ECR::FE) || rsr.is_set(UARTRSR_ECR::PE) || rsr.is_set(UARTRSR_ECR::BE)
+        {
+            event |= SerialEvent::RX_ERROR;
+        }
+        if rsr.is_set(UARTRSR_ECR::OE) {
+            event |= SerialEvent::RX_ERROR | SerialEvent::OVERRUN;
+        }
+
+        event
+    }
+
+    pub fn try_write(&mut self, bytes: &[u8]) -> usize {
         let mut written = 0;
         for &byte in bytes {
-            if base.registers().uartfr.is_set(UARTFR::TXFF) {
+            if !self.pending(SerialDirection::Output) {
                 break;
             }
-            base.registers().uartdr.set(byte as _);
+            self.registers().uartdr.set(byte as _);
             written += 1;
         }
         written
     }
 
-    fn submit_rx_from_reg(base: Reg, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+    pub fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
         let mut count = 0;
         let mut overrun_data = None;
         for byte in bytes.iter_mut() {
-            match read_byte_from_reg(base) {
+            if !self.pending(SerialDirection::Input) {
+                break;
+            }
+            match self.read_byte() {
                 Some(Ok(b)) => {
                     *byte = b;
                 }
@@ -389,8 +411,16 @@ impl Pl011 {
         Ok(count)
     }
 
-    fn handle_irq_from_reg(base: Reg) -> SerialEvent {
-        let mis = base.registers().uartmis.extract();
+    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        self.try_write(bytes)
+    }
+
+    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        self.try_read(bytes)
+    }
+
+    pub fn handle_irq(&mut self) -> SerialEvent {
+        let mis = self.registers().uartmis.extract();
         let mut event = SerialEvent::empty();
 
         if mis.is_set(UARTIS::RX) || mis.is_set(UARTIS::RT) {
@@ -406,8 +436,32 @@ impl Pl011 {
             event |= SerialEvent::RX_ERROR | SerialEvent::OVERRUN;
         }
 
-        base.registers().uarticr.set(mis.get());
+        self.registers().uarticr.set(mis.get());
         event
+    }
+
+    fn read_byte(&mut self) -> Option<Result<u8, TransferError>> {
+        if self.registers().uartfr.is_set(UARTFR::RXFE) {
+            return None;
+        }
+
+        let dr = self.registers().uartdr.extract();
+        let data = dr.read(UARTDR::DATA) as u8;
+
+        if dr.is_set(UARTDR::FE) {
+            return Some(Err(TransferError::Framing));
+        }
+        if dr.is_set(UARTDR::PE) {
+            return Some(Err(TransferError::Parity));
+        }
+        if dr.is_set(UARTDR::OE) {
+            return Some(Err(TransferError::Overrun(data)));
+        }
+        if dr.is_set(UARTDR::BE) {
+            return Some(Err(TransferError::Break));
+        }
+
+        Some(Ok(data))
     }
 }
 
@@ -416,124 +470,7 @@ struct Reg(NonNull<Pl011Registers>);
 
 unsafe impl Send for Reg {}
 
-impl Reg {
-    fn registers(&self) -> &Pl011Registers {
-        unsafe { self.0.as_ref() }
-    }
-}
-
-pub struct Pl011TxQueue {
-    base: Reg,
-}
-
-impl Pl011TxQueue {
-    pub fn base_addr(&self) -> usize {
-        self.base.0.as_ptr() as usize
-    }
-
-    pub fn poll(&mut self) -> SerialEvent {
-        if self.base.registers().uartfr.is_set(UARTFR::TXFF) {
-            SerialEvent::empty()
-        } else {
-            SerialEvent::TX_READY
-        }
-    }
-
-    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        Pl011::submit_tx_from_reg(self.base, bytes)
-    }
-}
-
-impl TTxQueue for Pl011TxQueue {
-    fn base_addr(&self) -> usize {
-        Pl011TxQueue::base_addr(self)
-    }
-
-    fn poll(&mut self) -> SerialEvent {
-        Pl011TxQueue::poll(self)
-    }
-
-    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        Pl011TxQueue::submit_tx(self, bytes)
-    }
-}
-
-pub struct Pl011RxQueue {
-    base: Reg,
-}
-
-impl Pl011RxQueue {
-    pub fn base_addr(&self) -> usize {
-        self.base.0.as_ptr() as usize
-    }
-
-    pub fn poll(&mut self) -> SerialEvent {
-        let mut event = SerialEvent::empty();
-        let fr = self.base.registers().uartfr.extract();
-        if !fr.is_set(UARTFR::RXFE) {
-            event |= SerialEvent::RX_READY;
-        }
-        let rsr = self.base.registers().uartrsr_ecr.extract();
-        if rsr.is_set(UARTRSR_ECR::FE) || rsr.is_set(UARTRSR_ECR::PE) || rsr.is_set(UARTRSR_ECR::BE)
-        {
-            event |= SerialEvent::RX_ERROR;
-        }
-        if rsr.is_set(UARTRSR_ECR::OE) {
-            event |= SerialEvent::RX_ERROR | SerialEvent::OVERRUN;
-        }
-        event
-    }
-
-    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        Pl011::submit_rx_from_reg(self.base, bytes)
-    }
-}
-
-impl TRxQueue for Pl011RxQueue {
-    fn base_addr(&self) -> usize {
-        Pl011RxQueue::base_addr(self)
-    }
-
-    fn poll(&mut self) -> SerialEvent {
-        Pl011RxQueue::poll(self)
-    }
-
-    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        Pl011RxQueue::submit_rx(self, bytes)
-    }
-}
-
-pub struct Pl011IrqHandler {
-    base: Reg,
-}
-
-unsafe impl Sync for Pl011IrqHandler {}
-
-impl Pl011IrqHandler {
-    pub fn base_addr(&self) -> usize {
-        self.base.0.as_ptr() as usize
-    }
-
-    pub fn handle_irq(&self) -> SerialEvent {
-        Pl011::handle_irq_from_reg(self.base)
-    }
-}
-
-impl TIrqHandler for Pl011IrqHandler {
-    fn base_addr(&self) -> usize {
-        Pl011IrqHandler::base_addr(self)
-    }
-
-    fn handle_irq(&self) -> SerialEvent {
-        Pl011IrqHandler::handle_irq(self)
-    }
-}
-
 impl InterfaceRaw for Pl011 {
-    type TxQueue = Pl011TxQueue;
-    type RxQueue = Pl011RxQueue;
-    type IrqHandler = Pl011IrqHandler;
-
     fn name(&self) -> &str {
         "PL011 UART"
     }
@@ -670,75 +607,29 @@ impl InterfaceRaw for Pl011 {
         Pl011::get_irq_mask(self)
     }
 
-    fn take_tx(&mut self) -> Option<Self::TxQueue> {
-        Pl011::take_tx(self)
+    fn pending(&mut self, direction: SerialDirection) -> bool {
+        Pl011::pending(self, direction)
     }
 
-    fn take_rx(&mut self) -> Option<Self::RxQueue> {
-        Pl011::take_rx(self)
+    fn poll(&mut self) -> SerialEvent {
+        Pl011::poll(self)
     }
 
-    fn take_irq_handler(&mut self) -> Option<Self::IrqHandler> {
-        Pl011::take_irq_handler(self)
+    fn try_write(&mut self, bytes: &[u8]) -> usize {
+        Pl011::try_write(self, bytes)
     }
 
-    fn set_tx(&mut self, tx: Self::TxQueue) -> Result<(), SetBackError> {
-        Pl011::set_tx(self, tx)
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        Pl011::try_read(self, bytes)
     }
 
-    fn set_rx(&mut self, rx: Self::RxQueue) -> Result<(), SetBackError> {
-        Pl011::set_rx(self, rx)
-    }
-
-    fn set_irq_handler(&mut self, irq: Self::IrqHandler) -> Result<(), SetBackError> {
-        Pl011::set_irq_handler(self, irq)
+    fn handle_irq(&mut self) -> SerialEvent {
+        Pl011::handle_irq(self)
     }
 }
 
 // 额外的便利方法，用于 FIFO 和流控制
 impl Pl011 {
-    pub fn take_tx(&mut self) -> Option<Pl011TxQueue> {
-        if self.tx_taken {
-            return None;
-        }
-        self.tx_taken = true;
-        Some(Pl011TxQueue { base: self.base })
-    }
-
-    pub fn take_rx(&mut self) -> Option<Pl011RxQueue> {
-        if self.rx_taken {
-            return None;
-        }
-        self.rx_taken = true;
-        Some(Pl011RxQueue { base: self.base })
-    }
-
-    pub fn take_irq_handler(&mut self) -> Option<Pl011IrqHandler> {
-        if self.irq_taken {
-            return None;
-        }
-        self.irq_taken = true;
-        Some(Pl011IrqHandler { base: self.base })
-    }
-
-    pub fn set_tx(&mut self, tx: Pl011TxQueue) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.0.as_ptr() as usize, tx.base_addr())?;
-        self.tx_taken = false;
-        Ok(())
-    }
-
-    pub fn set_rx(&mut self, rx: Pl011RxQueue) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.0.as_ptr() as usize, rx.base_addr())?;
-        self.rx_taken = false;
-        Ok(())
-    }
-
-    pub fn set_irq_handler(&mut self, irq: Pl011IrqHandler) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.0.as_ptr() as usize, irq.base_addr())?;
-        self.irq_taken = false;
-        Ok(())
-    }
-
     /// 启用或禁用 FIFO
     pub fn enable_fifo(&self, enable: bool) {
         if enable {
@@ -780,35 +671,3 @@ impl Pl011 {
 }
 
 // ModemStatus 现在在 lib.rs 中定义，这里只是导出
-
-fn read_byte_from_reg(base: Reg) -> Option<Result<u8, TransferError>> {
-    if base.registers().uartfr.is_set(UARTFR::RXFE) {
-        return None;
-    }
-
-    let dr = base.registers().uartdr.extract();
-    let data = dr.read(UARTDR::DATA) as u8;
-
-    if dr.is_set(UARTDR::FE) {
-        return Some(Err(TransferError::Framing));
-    }
-    if dr.is_set(UARTDR::PE) {
-        return Some(Err(TransferError::Parity));
-    }
-    if dr.is_set(UARTDR::OE) {
-        return Some(Err(TransferError::Overrun(data)));
-    }
-    if dr.is_set(UARTDR::BE) {
-        return Some(Err(TransferError::Break));
-    }
-
-    Some(Ok(data))
-}
-
-fn ensure_same_base(want: usize, actual: usize) -> Result<(), SetBackError> {
-    if want == actual {
-        Ok(())
-    } else {
-        Err(SetBackError::new(want, actual))
-    }
-}

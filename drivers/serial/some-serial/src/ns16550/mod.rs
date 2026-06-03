@@ -9,8 +9,8 @@ mod registers;
 
 use bitflags::Flags;
 use rdif_serial::{
-    Config, ConfigError, DataBits, InterfaceRaw, InterruptMask, Parity, SerialEvent, SetBackError,
-    StopBits, TIrqHandler, TRxQueue, TTxQueue, TransBytesError, TransferError,
+    Config, ConfigError, DataBits, InterfaceRaw, InterruptMask, Parity, SerialDirection,
+    SerialEvent, StopBits, TransBytesError, TransferError,
 };
 use registers::*;
 
@@ -88,16 +88,10 @@ pub trait Kind: Clone + Send + Sync + 'static {
 pub struct Ns16550<T: Kind> {
     pub(crate) base: T,
     pub(crate) clock_freq: u32,
-    pub(crate) tx_taken: bool,
-    pub(crate) rx_taken: bool,
-    pub(crate) irq_taken: bool,
+    pub(crate) saved_lsr: LineStatusFlags,
 }
 
 impl<T: Kind> InterfaceRaw for Ns16550<T> {
-    type TxQueue = Ns16550TxQueue<T>;
-    type RxQueue = Ns16550RxQueue<T>;
-    type IrqHandler = Ns16550IrqHandler<T>;
-
     fn name(&self) -> &str {
         "NS16550 UART"
     }
@@ -215,28 +209,24 @@ impl<T: Kind> InterfaceRaw for Ns16550<T> {
         Ns16550::get_irq_mask(self)
     }
 
-    fn take_tx(&mut self) -> Option<Self::TxQueue> {
-        Ns16550::take_tx(self)
+    fn pending(&mut self, direction: SerialDirection) -> bool {
+        Ns16550::pending(self, direction)
     }
 
-    fn take_rx(&mut self) -> Option<Self::RxQueue> {
-        Ns16550::take_rx(self)
+    fn poll(&mut self) -> SerialEvent {
+        Ns16550::poll(self)
     }
 
-    fn take_irq_handler(&mut self) -> Option<Self::IrqHandler> {
-        Ns16550::take_irq_handler(self)
+    fn try_write(&mut self, bytes: &[u8]) -> usize {
+        Ns16550::try_write(self, bytes)
     }
 
-    fn set_tx(&mut self, tx: Self::TxQueue) -> Result<(), SetBackError> {
-        Ns16550::set_tx(self, tx)
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        Ns16550::try_read(self, bytes)
     }
 
-    fn set_rx(&mut self, rx: Self::RxQueue) -> Result<(), SetBackError> {
-        Ns16550::set_rx(self, rx)
-    }
-
-    fn set_irq_handler(&mut self, irq: Self::IrqHandler) -> Result<(), SetBackError> {
-        Ns16550::set_irq_handler(self, irq)
+    fn handle_irq(&mut self) -> SerialEvent {
+        Ns16550::handle_irq(self)
     }
 }
 
@@ -250,23 +240,37 @@ impl<T: Kind> Ns16550<T> {
         self.base.write_reg(reg, val.bits());
     }
 
-    fn submit_tx_from_base(base: &T, bytes: &[u8]) -> usize {
+    pub fn pending(&mut self, direction: SerialDirection) -> bool {
+        let lsr = self.read_lsr_preserving();
+        match direction {
+            SerialDirection::Input => lsr.contains(LineStatusFlags::DATA_READY),
+            SerialDirection::Output => lsr.contains(LineStatusFlags::TRANSMITTER_HOLDING_EMPTY),
+        }
+    }
+
+    pub fn poll(&mut self) -> SerialEvent {
+        serial_event_from_lsr(self.read_lsr_preserving())
+    }
+
+    pub fn try_write(&mut self, bytes: &[u8]) -> usize {
         let mut written = 0;
         for &byte in bytes {
-            let lsr: LineStatusFlags = base.read_flags(UART_LSR);
-            if !lsr.contains(LineStatusFlags::TRANSMITTER_HOLDING_EMPTY) {
+            if !self.pending(SerialDirection::Output) {
                 break;
             }
-            base.write_reg(UART_THR, byte);
+            self.base.write_reg(UART_THR, byte);
             written += 1;
         }
         written
     }
 
-    fn submit_rx_from_base(base: &T, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+    pub fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
         let mut read_count = 0;
         for byte in bytes.iter_mut() {
-            match read_byte_from_kind(base) {
+            if !self.pending(SerialDirection::Input) {
+                break;
+            }
+            match self.read_byte() {
                 Some(Ok(b)) => {
                     *byte = b;
                     read_count += 1;
@@ -283,8 +287,16 @@ impl<T: Kind> Ns16550<T> {
         Ok(read_count)
     }
 
-    fn handle_irq_from_base(base: &T) -> SerialEvent {
-        let iir: InterruptIdentificationFlags = base.read_flags(UART_IIR);
+    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        self.try_write(bytes)
+    }
+
+    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        self.try_read(bytes)
+    }
+
+    pub fn handle_irq(&mut self) -> SerialEvent {
+        let iir: InterruptIdentificationFlags = self.read_flags(UART_IIR);
         let mut event = SerialEvent::empty();
 
         if iir.contains(InterruptIdentificationFlags::NO_INTERRUPT_PENDING) {
@@ -293,7 +305,7 @@ impl<T: Kind> Ns16550<T> {
 
         let interrupt_id = iir & InterruptIdentificationFlags::INTERRUPT_ID_MASK;
         if interrupt_id == InterruptIdentificationFlags::RECEIVER_LINE_STATUS {
-            event |= serial_event_from_lsr(base.read_flags(UART_LSR))
+            event |= serial_event_from_lsr(self.read_lsr_preserving())
                 & (SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN);
             if event.is_empty() {
                 event |= SerialEvent::RX_ERROR;
@@ -302,13 +314,49 @@ impl<T: Kind> Ns16550<T> {
             || interrupt_id == InterruptIdentificationFlags::CHARACTER_TIMEOUT
         {
             event |= SerialEvent::RX_READY;
-            event |= serial_event_from_lsr(base.read_flags(UART_LSR))
+            event |= serial_event_from_lsr(self.read_lsr_preserving())
                 & (SerialEvent::RX_ERROR | SerialEvent::OVERRUN);
         } else if interrupt_id == InterruptIdentificationFlags::TRANSMITTER_HOLDING_EMPTY {
             event |= SerialEvent::TX_READY;
         }
 
         event
+    }
+
+    fn read_lsr_preserving(&mut self) -> LineStatusFlags {
+        let lsr: LineStatusFlags = self.read_flags(UART_LSR);
+        self.saved_lsr
+            .insert(lsr & (LineStatusFlags::ERROR_MASK | LineStatusFlags::FIFO_ERROR));
+        lsr | self.saved_lsr
+    }
+
+    fn read_byte(&mut self) -> Option<Result<u8, TransferError>> {
+        let lsr = self.read_lsr_preserving();
+
+        if lsr.contains(LineStatusFlags::OVERRUN_ERROR) {
+            let b = self.base.read_reg(UART_RBR);
+            self.saved_lsr.remove(LineStatusFlags::OVERRUN_ERROR);
+            return Some(Err(TransferError::Overrun(b)));
+        }
+        if lsr.contains(LineStatusFlags::PARITY_ERROR) {
+            let _ = self.base.read_reg(UART_RBR);
+            self.saved_lsr.remove(LineStatusFlags::PARITY_ERROR);
+            return Some(Err(TransferError::Parity));
+        }
+        if lsr.contains(LineStatusFlags::FRAMING_ERROR) {
+            let _ = self.base.read_reg(UART_RBR);
+            self.saved_lsr.remove(LineStatusFlags::FRAMING_ERROR);
+            return Some(Err(TransferError::Framing));
+        }
+        if lsr.contains(LineStatusFlags::BREAK_INTERRUPT) {
+            let _ = self.base.read_reg(UART_RBR);
+            self.saved_lsr.remove(LineStatusFlags::BREAK_INTERRUPT);
+            return Some(Err(TransferError::Break));
+        }
+        if lsr.contains(LineStatusFlags::DATA_READY) {
+            return Some(Ok(self.base.read_reg(UART_RBR)));
+        }
+        None
     }
 
     pub fn open(&mut self) {
@@ -349,54 +397,6 @@ impl<T: Kind> Ns16550<T> {
         }
 
         mask
-    }
-
-    pub fn take_tx(&mut self) -> Option<Ns16550TxQueue<T>> {
-        if self.tx_taken {
-            return None;
-        }
-        self.tx_taken = true;
-        Some(Ns16550TxQueue {
-            base: self.base.clone(),
-        })
-    }
-
-    pub fn take_rx(&mut self) -> Option<Ns16550RxQueue<T>> {
-        if self.rx_taken {
-            return None;
-        }
-        self.rx_taken = true;
-        Some(Ns16550RxQueue {
-            base: self.base.clone(),
-        })
-    }
-
-    pub fn take_irq_handler(&mut self) -> Option<Ns16550IrqHandler<T>> {
-        if self.irq_taken {
-            return None;
-        }
-        self.irq_taken = true;
-        Some(Ns16550IrqHandler {
-            base: self.base.clone(),
-        })
-    }
-
-    pub fn set_tx(&mut self, tx: Ns16550TxQueue<T>) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.get_base(), tx.base.get_base())?;
-        self.tx_taken = false;
-        Ok(())
-    }
-
-    pub fn set_rx(&mut self, rx: Ns16550RxQueue<T>) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.get_base(), rx.base.get_base())?;
-        self.rx_taken = false;
-        Ok(())
-    }
-
-    pub fn set_irq_handler(&mut self, irq: Ns16550IrqHandler<T>) -> Result<(), SetBackError> {
-        ensure_same_base(self.base.get_base(), irq.base.get_base())?;
-        self.irq_taken = false;
-        Ok(())
     }
 
     /// 检查是否为 16550+（支持 FIFO）
@@ -528,97 +528,6 @@ impl<T: Kind> Ns16550<T> {
     }
 }
 
-pub struct Ns16550TxQueue<T: Kind> {
-    pub(crate) base: T,
-}
-
-impl<T: Kind> Ns16550TxQueue<T> {
-    pub fn base_addr(&self) -> usize {
-        self.base.get_base()
-    }
-
-    pub fn poll(&mut self) -> SerialEvent {
-        serial_event_from_lsr(self.base.read_flags(UART_LSR)) & SerialEvent::TX_READY
-    }
-
-    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        Ns16550::<T>::submit_tx_from_base(&self.base, bytes)
-    }
-}
-
-impl<T: Kind> TTxQueue for Ns16550TxQueue<T> {
-    fn base_addr(&self) -> usize {
-        Ns16550TxQueue::base_addr(self)
-    }
-
-    fn poll(&mut self) -> SerialEvent {
-        Ns16550TxQueue::poll(self)
-    }
-
-    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
-        Ns16550TxQueue::submit_tx(self, bytes)
-    }
-}
-
-pub struct Ns16550RxQueue<T: Kind> {
-    pub(crate) base: T,
-}
-
-impl<T: Kind> Ns16550RxQueue<T> {
-    pub fn base_addr(&self) -> usize {
-        self.base.get_base()
-    }
-
-    pub fn poll(&mut self) -> SerialEvent {
-        serial_event_from_lsr(self.base.read_flags(UART_LSR))
-            & (SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN)
-    }
-
-    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        Ns16550::<T>::submit_rx_from_base(&self.base, bytes)
-    }
-}
-
-impl<T: Kind> TRxQueue for Ns16550RxQueue<T> {
-    fn base_addr(&self) -> usize {
-        Ns16550RxQueue::base_addr(self)
-    }
-
-    fn poll(&mut self) -> SerialEvent {
-        Ns16550RxQueue::poll(self)
-    }
-
-    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        Ns16550RxQueue::submit_rx(self, bytes)
-    }
-}
-
-pub struct Ns16550IrqHandler<T: Kind> {
-    pub(crate) base: T,
-}
-
-unsafe impl<T: Kind> Sync for Ns16550IrqHandler<T> {}
-
-impl<T: Kind> Ns16550IrqHandler<T> {
-    pub fn base_addr(&self) -> usize {
-        self.base.get_base()
-    }
-
-    pub fn handle_irq(&self) -> SerialEvent {
-        Ns16550::<T>::handle_irq_from_base(&self.base)
-    }
-}
-
-impl<T: Kind> TIrqHandler for Ns16550IrqHandler<T> {
-    fn base_addr(&self) -> usize {
-        Ns16550IrqHandler::base_addr(self)
-    }
-
-    fn handle_irq(&self) -> SerialEvent {
-        Ns16550IrqHandler::handle_irq(self)
-    }
-}
-
 fn serial_event_from_lsr(lsr: LineStatusFlags) -> SerialEvent {
     let mut event = SerialEvent::empty();
     if lsr.contains(LineStatusFlags::DATA_READY) {
@@ -640,35 +549,119 @@ fn serial_event_from_lsr(lsr: LineStatusFlags) -> SerialEvent {
     event
 }
 
-fn read_byte_from_kind<T: Kind>(base: &T) -> Option<Result<u8, TransferError>> {
-    let lsr: LineStatusFlags = base.read_flags(UART_LSR);
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
-    if lsr.contains(LineStatusFlags::OVERRUN_ERROR) {
-        let b = base.read_reg(UART_RBR);
-        return Some(Err(TransferError::Overrun(b)));
-    }
-    if lsr.contains(LineStatusFlags::PARITY_ERROR) {
-        let _ = base.read_reg(UART_RBR);
-        return Some(Err(TransferError::Parity));
-    }
-    if lsr.contains(LineStatusFlags::FRAMING_ERROR) {
-        let _ = base.read_reg(UART_RBR);
-        return Some(Err(TransferError::Framing));
-    }
-    if lsr.contains(LineStatusFlags::BREAK_INTERRUPT) {
-        let _ = base.read_reg(UART_RBR);
-        return Some(Err(TransferError::Break));
-    }
-    if lsr.contains(LineStatusFlags::DATA_READY) {
-        return Some(Ok(base.read_reg(UART_RBR)));
-    }
-    None
-}
+    use super::*;
 
-fn ensure_same_base(want: usize, actual: usize) -> Result<(), SetBackError> {
-    if want == actual {
-        Ok(())
-    } else {
-        Err(SetBackError::new(want, actual))
+    static REGS: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone)]
+    struct MockKind;
+
+    impl Kind for MockKind {
+        fn read_reg(&self, reg: u8) -> u8 {
+            REGS[reg as usize].load(Ordering::SeqCst)
+        }
+
+        fn write_reg(&self, reg: u8, val: u8) {
+            REGS[reg as usize].store(val, Ordering::SeqCst);
+            if reg == UART_THR {
+                REGS[UART_LSR as usize].fetch_and(
+                    !LineStatusFlags::TRANSMITTER_HOLDING_EMPTY.bits(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        fn get_base(&self) -> usize {
+            0x1000
+        }
+    }
+
+    fn reset_regs() {
+        for reg in &REGS {
+            reg.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn serial() -> (MutexGuard<'static, ()>, Ns16550<MockKind>) {
+        let guard = TEST_LOCK.lock().unwrap();
+        reset_regs();
+        (
+            guard,
+            Ns16550 {
+                base: MockKind,
+                clock_freq: 1_843_200,
+                saved_lsr: LineStatusFlags::empty(),
+            },
+        )
+    }
+
+    #[test]
+    fn pending_output_preserves_rx_error_latch() {
+        let (_guard, mut uart) = serial();
+        REGS[UART_LSR as usize].store(
+            (LineStatusFlags::TRANSMITTER_HOLDING_EMPTY | LineStatusFlags::PARITY_ERROR).bits(),
+            Ordering::SeqCst,
+        );
+
+        assert!(uart.pending(SerialDirection::Output));
+
+        REGS[UART_LSR as usize].store(LineStatusFlags::DATA_READY.bits(), Ordering::SeqCst);
+        let mut buf = [0];
+        let err = uart
+            .try_read(&mut buf)
+            .expect_err("saved parity error should be reported by next read");
+        assert_eq!(err.bytes_transferred, 0);
+        assert_eq!(err.kind, TransferError::Parity);
+    }
+
+    #[test]
+    fn try_write_stops_when_tx_fifo_becomes_full() {
+        let (_guard, mut uart) = serial();
+        REGS[UART_LSR as usize].store(
+            LineStatusFlags::TRANSMITTER_HOLDING_EMPTY.bits(),
+            Ordering::SeqCst,
+        );
+
+        assert_eq!(uart.try_write(b"ab"), 1);
+        assert_eq!(REGS[UART_THR as usize].load(Ordering::SeqCst), b'a');
+    }
+
+    #[test]
+    fn try_read_empty_returns_zero() {
+        let (_guard, mut uart) = serial();
+        let mut buf = [0];
+
+        assert_eq!(uart.try_read(&mut buf), Ok(0));
+    }
+
+    #[test]
+    fn handle_irq_saves_rx_error_for_task_read() {
+        let (_guard, mut uart) = serial();
+        REGS[UART_IIR as usize].store(
+            InterruptIdentificationFlags::RECEIVER_LINE_STATUS.bits(),
+            Ordering::SeqCst,
+        );
+        REGS[UART_LSR as usize].store(
+            (LineStatusFlags::DATA_READY | LineStatusFlags::OVERRUN_ERROR).bits(),
+            Ordering::SeqCst,
+        );
+        REGS[UART_RBR as usize].store(0xab, Ordering::SeqCst);
+
+        let event = uart.handle_irq();
+        assert!(event.intersects(SerialEvent::RX_ERROR | SerialEvent::OVERRUN));
+
+        REGS[UART_LSR as usize].store(LineStatusFlags::DATA_READY.bits(), Ordering::SeqCst);
+        let mut buf = [0];
+        let err = uart
+            .try_read(&mut buf)
+            .expect_err("saved overrun should be reported by task read");
+        assert_eq!(err.bytes_transferred, 0);
+        assert_eq!(err.kind, TransferError::Overrun(0xab));
     }
 }

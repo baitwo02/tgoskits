@@ -65,16 +65,15 @@
 some-serial = "0.1.0"
 ```
 
-### Concrete split handle 使用
+### Raw 单对象 polling 使用
 
-驱动对象负责配置、开关、回环和 IRQ mask；数据搬运通过独立的 TX queue、RX queue 和 IRQ handler 完成。
-someboot 等 allocator 初始化前路径直接持有这些 concrete handle，不需要 `Box` 或 rdif trait object。
+raw concrete 驱动直接持有寄存器和状态；读、写、poll、IRQ sync 都通过同一个对象完成。
+someboot 等 allocator 初始化前路径直接保存这个对象，不需要 `Box`、rdif trait object 或内部锁。
 
 ```rust
 use core::ptr::NonNull;
 use some_serial::{
-    ns16550::Ns16550, Config, DataBits, InterfaceRaw, Parity, StopBits, TRxQueue as _,
-    TTxQueue as _,
+    ns16550::Ns16550, Config, DataBits, InterfaceRaw as _, Parity, SerialDirection, StopBits,
 };
 
 let base_addr = NonNull::new(0x9000000 as *mut u8).unwrap();
@@ -90,23 +89,20 @@ uart.set_config(&config).expect("Failed to configure UART");
 uart.open();
 uart.enable_loopback();
 
-let mut tx = uart.take_tx().expect("missing TX queue");
-let mut rx = uart.take_rx().expect("missing RX queue");
-
 let test_data = b"Hello, Serial!";
 let mut sent = 0;
 while sent < test_data.len() {
-    if !tx.poll().tx_ready() {
+    let n = uart.try_write(&test_data[sent..]);
+    if n == 0 {
         core::hint::spin_loop();
-        continue;
     }
-    sent += tx.submit_tx(&test_data[sent..]);
+    sent += n;
 }
 println!("Sent {} bytes", sent);
 
 let mut buffer = [0u8; 64];
-let received = if rx.poll().rx_ready() {
-    rx.submit_rx(&mut buffer).expect("Failed to receive")
+let received = if uart.pending(SerialDirection::Input) {
+    uart.try_read(&mut buffer).expect("Failed to receive")
 } else {
     0
 };
@@ -142,7 +138,7 @@ let mut uart = some_serial::ns16550::Ns16550::new_mmio(
 #### 中断驱动通信
 
 ```rust
-use some_serial::{InterfaceRaw, InterruptMask, TIrqHandler as _};
+use some_serial::{InterfaceRaw as _, InterruptMask};
 use some_serial::pl011::Pl011;
 
 // 创建并配置 UART
@@ -152,15 +148,14 @@ uart.open();
 
 // 启用中断
 uart.set_irq_mask(InterruptMask::RX_AVAILABLE | InterruptMask::TX_EMPTY);
-let irq_handler = uart.take_irq_handler().expect("missing IRQ handler");
 
 // 在中断控制器回调中同步硬件 IRQ 状态
-let event = irq_handler.handle_irq();
+let event = uart.handle_irq();
 if event.rx_ready() {
     // 运行时决定唤醒任务或继续轮询
 }
 
-// 数据搬运仍由任务态通过 submit_rx/submit_tx 推进
+// 数据搬运仍由任务态通过 try_read/try_write 推进
 ```
 
 #### 平台检测与适配
@@ -182,10 +177,15 @@ let mut serial = create_serial_for_runtime(
 );
 
 let mut tx = serial.take_tx().expect("missing TX queue");
-while !tx.poll().tx_ready() {
-    core::hint::spin_loop();
+let mut sent = 0;
+let bytes = b"runtime serial\n";
+while sent < bytes.len() {
+    let n = tx.submit_tx(&bytes[sent..]);
+    if n == 0 {
+        core::hint::spin_loop();
+    }
+    sent += n;
 }
-tx.submit_tx(b"runtime serial\n");
 ```
 
 #### 平台特定配置获取
@@ -236,8 +236,8 @@ let stop_bits = uart.stop_bits();
 let parity = uart.parity();
 
 // 查询 I/O 就绪事件
-let tx_event = tx.poll();
-let rx_event = rx.poll();
+let event = uart.poll();
+let can_write = uart.pending(some_serial::SerialDirection::Output);
 ```
 
 ## 测试
@@ -288,7 +288,7 @@ cargo test --test test --  --show-output --uboot
 ### 添加新驱动支持
 
 1. **创建驱动模块**：在 `src/` 目录下创建新的驱动文件
-2. **实现 split 接口**：驱动对象实现 `InterfaceRaw`，TX/RX/IRQ handle 分别实现 `TTxQueue`、`TRxQueue`、`TIrqHandler`
+2. **实现 raw 接口**：驱动对象实现 `InterfaceRaw` 的配置、IRQ mask、`pending`、`poll`、`try_write`、`try_read`、`handle_irq`
 3. **添加测试**：为新驱动编写完整的测试套件
 4. **更新文档**：在 README 中添加驱动说明和使用示例
 5. **提交 PR**：详细描述新驱动的功能和使用方法
@@ -300,39 +300,12 @@ cargo test --test test --  --show-output --uboot
 ```rust
 // 新驱动的基本结构示例
 pub struct NewDriver {
-    // 驱动特定的状态
-}
-
-pub struct NewDriverTxQueue {
-    // TX 队列状态
-}
-
-pub struct NewDriverRxQueue {
-    // RX 队列状态
-}
-
-pub struct NewDriverIrqHandler {
-    // IRQ 同步状态
+    // 驱动寄存器句柄、时钟、saved status、IRQ mask shadow 等状态
 }
 
 impl InterfaceRaw for NewDriver {
-    type TxQueue = NewDriverTxQueue;
-    type RxQueue = NewDriverRxQueue;
-    type IrqHandler = NewDriverIrqHandler;
-
-    // 实现配置、开关、IRQ mask、take/set 生命周期方法
-}
-
-impl TTxQueue for NewDriverTxQueue {
-    // 实现 poll + submit_tx
-}
-
-impl TRxQueue for NewDriverRxQueue {
-    // 实现 poll + submit_rx
-}
-
-impl TIrqHandler for NewDriverIrqHandler {
-    // 实现 handle_irq
+    // 实现配置、开关、IRQ mask
+    // 实现 pending/poll/try_write/try_read/handle_irq
 }
 ```
 

@@ -40,16 +40,11 @@ unsafe fn cvi_camera_raw_irq_handler(
     let mut uart3 = some_serial::ns16550::dw_apb::DwApbUart::new(
         phys_to_virt(PhysAddr::from(UART3_ADDR)).as_usize(),
     );
-    let Some(mut rx) = uart3.take_rx() else {
-        return ax_runtime::hal::irq::IrqReturn::Handled;
-    };
+    let _ = uart3.handle_irq();
     let mut scratch = [0u8; 64];
     let mut buf = CAMERA_UART_BUF.lock();
     loop {
-        if !rx.poll().rx_ready() {
-            break;
-        }
-        let n = match rx.submit_rx(&mut scratch) {
+        let n = match uart3.try_read(&mut scratch) {
             Ok(n) => n,
             Err(err) => err.bytes_transferred,
         };
@@ -58,7 +53,6 @@ unsafe fn cvi_camera_raw_irq_handler(
         }
         buf.extend(scratch[..n].iter().copied());
     }
-    let _ = uart3.set_rx(rx);
     let mask = uart3.get_irq_mask();
     uart3.set_irq_mask(mask | InterruptMask::RX_AVAILABLE);
     ax_runtime::hal::irq::IrqReturn::Handled
@@ -348,23 +342,15 @@ impl UartTransport for Uart3 {
         let mut uart3 = some_serial::ns16550::dw_apb::DwApbUart::new(
             phys_to_virt(PhysAddr::from(UART3_ADDR)).as_usize(),
         );
-        let Some(mut tx) = uart3.take_tx() else {
-            return Err(CameraError::TransportError);
-        };
         let mut written = 0;
         while written < data.len() {
-            if !tx.poll().tx_ready() {
-                core::hint::spin_loop();
-                continue;
-            }
-            let n = tx.submit_tx(&data[written..]);
+            let n = uart3.try_write(&data[written..]);
             if n == 0 {
                 core::hint::spin_loop();
                 continue;
             }
             written += n;
         }
-        let _ = uart3.set_tx(tx);
         Ok(())
     }
 

@@ -8,7 +8,7 @@
 //!
 //! ## 特性
 //!
-//! - 🏗️ 统一抽象接口 - 基于 `rdif-serial` 的控制对象和独立 TX/RX/IRQ handle
+//! - 🏗️ 统一抽象接口 - raw 层使用单对象 `try_read`/`try_write`，rdif 层提供可拆分队列
 //! - 🛡️ 无标准库设计 (`no_std`) - 适用于裸机和嵌入式系统
 //! - 📦 模块化架构 - 每个驱动独立模块，按需选择
 //! - 🔒 类型安全 - 使用 Rust 类型系统确保内存安全
@@ -27,10 +27,10 @@
 //!
 //! ## 快速开始
 //!
-//! ```rust
+//! ```rust,no_run
 //! use core::ptr::NonNull;
 //!
-//! use some_serial::{Config, InterfaceRaw, TTxQueue as _, ns16550::Ns16550};
+//! use some_serial::{Config, InterfaceRaw as _, ns16550::Ns16550};
 //!
 //! // 选择合适的驱动
 //! #[cfg(target_arch = "aarch64")]
@@ -49,12 +49,13 @@
 //! uart.set_config(&config).unwrap();
 //! uart.open();
 //!
-//! let mut tx = uart.take_tx().unwrap();
-//! while !tx.poll().tx_ready() {
+//! while uart.try_write(b"hello\n") == 0 {
 //!     core::hint::spin_loop();
 //! }
-//! tx.submit_tx(b"hello\n");
 //! ```
+
+#[cfg(test)]
+extern crate std;
 
 pub mod ns16550;
 pub mod pl011;

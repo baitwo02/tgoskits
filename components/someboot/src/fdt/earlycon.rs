@@ -51,24 +51,16 @@ fn set_by_stdout() -> Option<()> {
             "arm,pl011" | "arm,primecell" => {
                 let mut serial = pl011::Pl011::new(addr, clock);
                 serial.open();
-                let tx = serial.take_tx()?;
-                let rx = serial.take_rx()?;
-                crate::console::set_earlycon_serial(
-                    crate::console::EarlySerialTx::Pl011(tx),
-                    crate::console::EarlySerialRx::Pl011(rx),
-                );
+                crate::console::set_earlycon_serial(crate::console::EarlySerial::Pl011(serial));
                 installed = true;
                 break;
             }
             "snps,dw-apb-uart" | "ns16550a" | "ns16550" => {
                 let mut serial = ns16550::Ns16550::new_mmio(addr, clock, reg_width);
                 serial.open();
-                let tx = serial.take_tx()?;
-                let rx = serial.take_rx()?;
-                crate::console::set_earlycon_serial(
-                    crate::console::EarlySerialTx::Ns16550Mmio(tx),
-                    crate::console::EarlySerialRx::Ns16550Mmio(rx),
-                );
+                crate::console::set_earlycon_serial(crate::console::EarlySerial::Ns16550Mmio(
+                    serial,
+                ));
                 installed = true;
                 break;
             }

@@ -234,12 +234,6 @@ impl TtyWrite for SerialWriter {
         let mut tx = self.backend.tx.lock();
         let mut written = 0;
         while written < buf.len() {
-            if !tx.poll().tx_ready() {
-                drop(tx);
-                ax_task::yield_now();
-                tx = self.backend.tx.lock();
-                continue;
-            }
             let next = tx.submit_tx(&buf[written..]);
             written += next;
             if next == 0 {

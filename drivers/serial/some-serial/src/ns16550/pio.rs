@@ -35,11 +35,9 @@ impl Ns16550<Port> {
         let base = Port { port };
 
         Ns16550 {
-            base: base.clone(),
+            base,
             clock_freq,
-            tx_taken: false,
-            rx_taken: false,
-            irq_taken: false,
+            saved_lsr: super::registers::LineStatusFlags::empty(),
         }
     }
 

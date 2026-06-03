@@ -155,6 +155,12 @@ impl SerialEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialDirection {
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub baudrate: Option<u32>,
@@ -190,10 +196,6 @@ impl Config {
 }
 
 pub trait InterfaceRaw: Send + Any + 'static {
-    type TxQueue: TTxQueue;
-    type RxQueue: TRxQueue;
-    type IrqHandler: TIrqHandler;
-
     fn name(&self) -> &str;
 
     fn base_addr(&self) -> usize;
@@ -224,13 +226,19 @@ pub trait InterfaceRaw: Send + Any + 'static {
     /// 获取当前中断使能掩码
     fn get_irq_mask(&self) -> InterruptMask;
 
-    fn take_tx(&mut self) -> Option<Self::TxQueue>;
-    fn take_rx(&mut self) -> Option<Self::RxQueue>;
-    fn take_irq_handler(&mut self) -> Option<Self::IrqHandler>;
+    fn pending(&mut self, direction: SerialDirection) -> bool;
+    fn poll(&mut self) -> SerialEvent;
+    fn try_write(&mut self, bytes: &[u8]) -> usize;
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError>;
+    fn handle_irq(&mut self) -> SerialEvent;
 
-    fn set_tx(&mut self, tx: Self::TxQueue) -> Result<(), SetBackError>;
-    fn set_rx(&mut self, rx: Self::RxQueue) -> Result<(), SetBackError>;
-    fn set_irq_handler(&mut self, irq: Self::IrqHandler) -> Result<(), SetBackError>;
+    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        self.try_write(bytes)
+    }
+
+    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        self.try_read(bytes)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -321,6 +329,8 @@ pub trait TIrqHandler: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZeroU32;
+
     use super::*;
 
     #[test]
@@ -330,5 +340,122 @@ mod tests {
         assert!(event.rx_ready());
         assert!(!event.tx_ready());
         assert!(event.rx_error());
+    }
+
+    #[test]
+    fn split_handle_drop_restores_take_lifecycle() {
+        let mut serial = SerialDyn::new_boxed(MockSerial::new(0x1000));
+
+        let tx = serial.take_tx().expect("first TX take should work");
+        assert!(serial.take_tx().is_none());
+        drop(tx);
+        assert!(serial.take_tx().is_some());
+
+        let rx = serial.take_rx().expect("first RX take should work");
+        assert!(serial.take_rx().is_none());
+        drop(rx);
+        assert!(serial.take_rx().is_some());
+
+        let irq = serial
+            .take_irq_handler()
+            .expect("first IRQ handler take should work");
+        assert!(serial.take_irq_handler().is_none());
+        drop(irq);
+        assert!(serial.take_irq_handler().is_some());
+    }
+
+    #[test]
+    fn split_restore_rejects_base_mismatch() {
+        let mut left = SerialDyn::new_boxed(MockSerial::new(0x1000));
+        let mut right = SerialDyn::new_boxed(MockSerial::new(0x2000));
+        let tx = left.take_tx().expect("TX handle should be available");
+
+        let err = right
+            .set_tx(tx)
+            .expect_err("wrong serial should reject restored TX handle");
+        assert_eq!(err.want(), 0x2000);
+        assert_eq!(err.actual(), 0x1000);
+    }
+
+    struct MockSerial {
+        base: usize,
+    }
+
+    impl MockSerial {
+        fn new(base: usize) -> Self {
+            Self { base }
+        }
+    }
+
+    impl InterfaceRaw for MockSerial {
+        fn name(&self) -> &str {
+            "mock serial"
+        }
+
+        fn base_addr(&self) -> usize {
+            self.base
+        }
+
+        fn set_config(&mut self, _config: &Config) -> Result<(), ConfigError> {
+            Ok(())
+        }
+
+        fn baudrate(&self) -> u32 {
+            115_200
+        }
+
+        fn data_bits(&self) -> DataBits {
+            DataBits::Eight
+        }
+
+        fn stop_bits(&self) -> StopBits {
+            StopBits::One
+        }
+
+        fn parity(&self) -> Parity {
+            Parity::None
+        }
+
+        fn clock_freq(&self) -> Option<NonZeroU32> {
+            NonZeroU32::new(1_843_200)
+        }
+
+        fn open(&mut self) {}
+
+        fn close(&mut self) {}
+
+        fn enable_loopback(&mut self) {}
+
+        fn disable_loopback(&mut self) {}
+
+        fn is_loopback_enabled(&self) -> bool {
+            false
+        }
+
+        fn set_irq_mask(&mut self, _mask: InterruptMask) {}
+
+        fn get_irq_mask(&self) -> InterruptMask {
+            InterruptMask::empty()
+        }
+
+        fn pending(&mut self, direction: SerialDirection) -> bool {
+            matches!(direction, SerialDirection::Output)
+        }
+
+        fn poll(&mut self) -> SerialEvent {
+            SerialEvent::TX_READY
+        }
+
+        fn try_write(&mut self, bytes: &[u8]) -> usize {
+            bytes.len()
+        }
+
+        fn try_read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+            Ok(0)
+        }
+
+        fn handle_irq(&mut self) -> SerialEvent {
+            SerialEvent::TX_READY
+        }
     }
 }

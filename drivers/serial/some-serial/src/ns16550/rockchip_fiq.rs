@@ -2,20 +2,19 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use core::{any::Any, num::NonZeroU32, ptr::NonNull};
 
 use heapless::{String, Vec};
 use rdif_serial::{
-    BIrqHandler, BRxQueue, BSerial, BTxQueue, Config, ConfigError, DataBits, DriverGeneric,
-    Interface, InterruptMask, Parity, SerialDyn, SetBackError, StopBits,
+    BSerial, Config, ConfigError, DataBits, DriverGeneric, InterfaceRaw, InterruptMask, Parity,
+    SerialDirection, SerialDyn, SerialEvent, StopBits, TransBytesError,
 };
 
 use super::{
     Kind, Ns16550,
     registers::{
-        UART_DLH, UART_DLL, UART_FCR, UART_IER, UART_IER_RDI, UART_LCR, UART_LCR_DLAB,
-        UART_LCR_WLEN8, UART_LSR, UART_LSR_DR, UART_LSR_THRE, UART_MCR, UART_RBR,
+        LineStatusFlags, UART_DLH, UART_DLL, UART_FCR, UART_IER, UART_IER_RDI, UART_LCR,
+        UART_LCR_DLAB, UART_LCR_WLEN8, UART_LSR, UART_LSR_DR, UART_LSR_THRE, UART_MCR, UART_RBR,
     },
 };
 
@@ -521,15 +520,13 @@ impl Ns16550<RockchipFiqPort> {
         Self {
             base,
             clock_freq,
-            tx_taken: false,
-            rx_taken: false,
-            irq_taken: false,
+            saved_lsr: LineStatusFlags::empty(),
         }
     }
 }
 
 pub struct RockchipFiqSerial {
-    serial: BSerial,
+    serial: Ns16550<RockchipFiqPort>,
     debugger: FiqDebugger,
     config: RockchipFiqConfig,
 }
@@ -539,7 +536,7 @@ impl RockchipFiqSerial {
         let config = config.normalised();
         let port = RockchipFiqPort::new(base.as_ptr() as usize);
         port.init_debug_port(config.baudrate);
-        let serial = SerialDyn::new_boxed(Ns16550::new_rockchip_fiq(base, config.clock_hz));
+        let serial = Ns16550::new_rockchip_fiq(base, config.clock_hz);
         Self {
             serial,
             debugger: FiqDebugger::new(config),
@@ -548,7 +545,9 @@ impl RockchipFiqSerial {
     }
 
     pub fn new_boxed(base: NonNull<u8>, config: RockchipFiqConfig) -> BSerial {
-        Box::new(Self::new(base, config))
+        let mut serial = Self::new(base, config);
+        serial.open();
+        SerialDyn::new_boxed(serial)
     }
 
     pub fn config(&self) -> RockchipFiqConfig {
@@ -582,7 +581,11 @@ impl DriverGeneric for RockchipFiqSerial {
     }
 }
 
-impl Interface for RockchipFiqSerial {
+impl InterfaceRaw for RockchipFiqSerial {
+    fn name(&self) -> &str {
+        "Rockchip FIQ Debugger UART"
+    }
+
     fn base_addr(&self) -> usize {
         self.serial.base_addr()
     }
@@ -639,28 +642,24 @@ impl Interface for RockchipFiqSerial {
         self.serial.get_irq_mask()
     }
 
-    fn take_tx(&mut self) -> Option<BTxQueue> {
-        self.serial.take_tx()
+    fn pending(&mut self, direction: SerialDirection) -> bool {
+        self.serial.pending(direction)
     }
 
-    fn take_rx(&mut self) -> Option<BRxQueue> {
-        self.serial.take_rx()
+    fn poll(&mut self) -> SerialEvent {
+        self.serial.poll()
     }
 
-    fn take_irq_handler(&mut self) -> Option<BIrqHandler> {
-        self.serial.take_irq_handler()
+    fn try_write(&mut self, bytes: &[u8]) -> usize {
+        self.serial.try_write(bytes)
     }
 
-    fn set_tx(&mut self, tx: BTxQueue) -> Result<(), SetBackError> {
-        self.serial.set_tx(tx)
+    fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        self.serial.try_read(bytes)
     }
 
-    fn set_rx(&mut self, rx: BRxQueue) -> Result<(), SetBackError> {
-        self.serial.set_rx(rx)
-    }
-
-    fn set_irq_handler(&mut self, irq: BIrqHandler) -> Result<(), SetBackError> {
-        self.serial.set_irq_handler(irq)
+    fn handle_irq(&mut self) -> SerialEvent {
+        self.serial.handle_irq()
     }
 }
 
