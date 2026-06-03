@@ -109,11 +109,9 @@ generate_kallsyms() {
     rust-objcopy --update-section .kallsyms="$kallsyms" "$KERNEL_ELF"
 }
 
-refresh_bin_if_present() {
+refresh_bin() {
     bin="${KERNEL_ELF%.elf}.bin"
-    if [ -f "$bin" ]; then
-        rust-objcopy --strip-all -O binary "$KERNEL_ELF" "$bin"
-    fi
+    rust-objcopy --strip-all -O binary "$KERNEL_ELF" "$bin"
 }
 
 if [ -z "${KERNEL_ELF:-}" ]; then
@@ -123,4 +121,4 @@ fi
 
 ensure_tools
 generate_kallsyms
-refresh_bin_if_present
+refresh_bin

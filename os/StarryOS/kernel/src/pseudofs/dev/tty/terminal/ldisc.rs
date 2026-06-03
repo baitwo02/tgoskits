@@ -56,6 +56,8 @@ pub trait TtyRead: Send + Sync + 'static {
 }
 pub trait TtyWrite: Send + Sync + 'static {
     fn write(&self, buf: &[u8]);
+
+    fn termios_changed(&self, _old: &Termios2, _new: &Termios2) {}
 }
 
 pub fn write_output_bytes<W: TtyWrite + ?Sized>(writer: &W, term: &Termios2, buf: &[u8]) {

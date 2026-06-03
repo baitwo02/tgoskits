@@ -24,29 +24,34 @@ struct ConsoleIfImpl;
 impl ConsoleIf for ConsoleIfImpl {
     /// Writes bytes to the console from input u8 slice.
     fn write_bytes(bytes: &[u8]) {
+        let mut uart = UART.lock();
+        let Some(mut tx) = uart.take_tx() else {
+            return;
+        };
         for &c in bytes {
-            let mut uart = UART.lock();
             match c {
                 b'\n' => {
-                    uart.putchar(b'\r');
-                    uart.putchar(b'\n');
+                    write_byte(&mut tx, b'\r');
+                    write_byte(&mut tx, b'\n');
                 }
-                c => uart.putchar(c),
+                c => write_byte(&mut tx, c),
             }
         }
+        let _ = uart.set_tx(tx);
     }
 
     /// Reads bytes from the console into the given mutable slice.
     /// Returns the number of bytes read.
     fn read_bytes(bytes: &mut [u8]) -> usize {
         let mut uart = UART.lock();
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            match uart.getchar() {
-                Some(c) => *byte = c,
-                None => return i,
-            }
-        }
-        bytes.len()
+        let Some(mut rx) = uart.take_rx() else {
+            return 0;
+        };
+        let n = rx
+            .submit_rx(bytes)
+            .unwrap_or_else(|err| err.bytes_transferred);
+        let _ = uart.set_rx(rx);
+        n
     }
 
     /// Returns the IRQ number for the console, if applicable.
@@ -62,5 +67,14 @@ impl ConsoleIf for ConsoleIfImpl {
     #[cfg(feature = "irq")]
     fn handle_irq() -> ConsoleIrqEvent {
         ConsoleIrqEvent::empty()
+    }
+}
+
+fn write_byte(
+    tx: &mut some_serial::ns16550::Ns16550TxQueue<some_serial::ns16550::dw_apb::DwApb>,
+    byte: u8,
+) {
+    while tx.submit_tx(&[byte]) == 0 {
+        core::hint::spin_loop();
     }
 }

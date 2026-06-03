@@ -65,63 +65,51 @@
 some-serial = "0.1.0"
 ```
 
-### 通用接口使用
+### Concrete split handle 使用
 
-所有驱动都实现了统一的 `Serial` trait，提供一致的使用体验：
+驱动对象负责配置、开关、回环和 IRQ mask；数据搬运通过独立的 TX queue、RX queue 和 IRQ handler 完成。
+someboot 等 allocator 初始化前路径直接持有这些 concrete handle，不需要 `Box` 或 rdif trait object。
 
 ```rust
 use core::ptr::NonNull;
-use some_serial::{Serial, Config};
-
-// 根据平台选择合适的驱动
-#[cfg(target_arch = "aarch64")]
-use some_serial::pl011::Pl011;
-
-#[cfg(not(target_arch = "aarch64"))]
-use some_serial::ns16550::Ns16550Mmio;
-
-// 创建串口实例
-let base_addr = 0x9000000 as *mut u8; // 你的 UART 基地址
-let clock_freq = match target_arch {
-    "aarch64" => 24_000_000, // ARM PL011: 24MHz
-    _ => 1_843_200,          // NS16550: 1.8432MHz
+use some_serial::{
+    ns16550::Ns16550, Config, DataBits, InterfaceRaw, Parity, StopBits, TRxQueue as _,
+    TTxQueue as _,
 };
 
-let mut uart = match target_arch {
-    "aarch64" => Pl011::new(
-        NonNull::new(base_addr).unwrap(),
-        clock_freq
-    ),
-    _ => Ns16550Mmio::new(
-        NonNull::new(base_addr).unwrap(),
-        clock_freq
-    ),
-};
+let base_addr = NonNull::new(0x9000000 as *mut u8).unwrap();
+let mut uart = Ns16550::new_mmio(base_addr, 1_843_200, 1);
 
-// 统一配置接口
 let config = Config::new()
     .baudrate(115200)
-    .data_bits(some_serial::DataBits::Eight)
-    .stop_bits(some_serial::StopBits::One)
-    .parity(some_serial::Parity::None);
+    .data_bits(DataBits::Eight)
+    .stop_bits(StopBits::One)
+    .parity(Parity::None);
 
 uart.set_config(&config).expect("Failed to configure UART");
-uart.open().expect("Failed to open UART");
-
-// 启用回环模式进行测试（如果支持）
+uart.open();
 uart.enable_loopback();
 
-// 获取 TX/RX 接口进行数据传输
-let mut tx = uart.take_tx().unwrap();
-let mut rx = uart.take_rx().unwrap();
+let mut tx = uart.take_tx().expect("missing TX queue");
+let mut rx = uart.take_rx().expect("missing RX queue");
 
-// 发送和接收数据
 let test_data = b"Hello, Serial!";
-let sent = tx.send(test_data);
+let mut sent = 0;
+while sent < test_data.len() {
+    if !tx.poll().tx_ready() {
+        core::hint::spin_loop();
+        continue;
+    }
+    sent += tx.submit_tx(&test_data[sent..]);
+}
 println!("Sent {} bytes", sent);
 
 let mut buffer = [0u8; 64];
-let received = rx.receive(&mut buffer).expect("Failed to receive");
+let received = if rx.poll().rx_ready() {
+    rx.submit_rx(&mut buffer).expect("Failed to receive")
+} else {
+    0
+};
 println!("Received {} bytes: {:?}", received, &buffer[..received]);
 ```
 
@@ -130,48 +118,23 @@ println!("Received {} bytes: {:?}", received, &buffer[..received]);
 根据硬件平台和访问方式选择合适的驱动：
 
 ```rust
-// ARM 平台 - 使用 PL011
-#[cfg(target_arch = "aarch64")]
-use some_serial::pl011::Pl011;
+use core::ptr::NonNull;
 
-// x86_64 平台 - 使用端口 I/O
 #[cfg(target_arch = "x86_64")]
-use some_serial::ns16550::Ns16550Pio;
+let mut uart = some_serial::ns16550::Ns16550::new_port(0x3f8, 1_843_200);
 
-// 其他嵌入式平台 - 使用内存映射 I/O
+#[cfg(target_arch = "aarch64")]
+let mut uart = some_serial::pl011::Pl011::new(
+    NonNull::new(0x9000000 as *mut u8).unwrap(),
+    24_000_000,
+);
+
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-use some_serial::ns16550::Ns16550Mmio;
-
-// 平台特定的创建函数
-fn create_uart_for_platform(base_addr: *mut u8, clock_freq: u32) -> Box<dyn Serial> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        Box::new(Pl011::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        Box::new(Ns16550Pio::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        Box::new(Ns16550Mmio::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
-}
-
-// 统一的创建和使用方式
-let mut uart = create_uart_for_platform(base_addr, clock_freq);
-// ... 后续使用方式完全相同
+let mut uart = some_serial::ns16550::Ns16550::new_mmio(
+    NonNull::new(0x40000000 as *mut u8).unwrap(),
+    16_000_000,
+    1,
+);
 ```
 
 ### 高级功能
@@ -179,77 +142,55 @@ let mut uart = create_uart_for_platform(base_addr, clock_freq);
 #### 中断驱动通信
 
 ```rust
-use some_serial::{Serial, InterruptMask};
+use some_serial::{InterfaceRaw, InterruptMask, TIrqHandler as _};
 use some_serial::pl011::Pl011;
 
 // 创建并配置 UART
 let mut uart = Pl011::new(base_addr, clock_freq);
 uart.set_config(&config).unwrap();
-uart.open().unwrap();
+uart.open();
 
 // 启用中断
-uart.enable_interrupts(InterruptMask::RX_AVAILABLE | InterruptMask::TX_EMPTY);
+uart.set_irq_mask(InterruptMask::RX_AVAILABLE | InterruptMask::TX_EMPTY);
+let irq_handler = uart.take_irq_handler().expect("missing IRQ handler");
 
-// 注册中断处理程序
-let irq_handler = uart.irq_handler().unwrap();
-// 在你的中断控制器中注册 irq_handler...
+// 在中断控制器回调中同步硬件 IRQ 状态
+let event = irq_handler.handle_irq();
+if event.rx_ready() {
+    // 运行时决定唤醒任务或继续轮询
+}
 
-// 现在可以在中断处理中高效处理数据传输
+// 数据搬运仍由任务态通过 submit_rx/submit_tx 推进
 ```
 
 #### 平台检测与适配
 
+需要运行时动态分发的 rdrive/Starry 路径可以把 concrete 设备包装成 `rdif_serial::BSerial`。
+这个对象只负责控制和 split/restore；I/O 仍然从拆出的 queue/handler 走。
+
 ```rust
-// 运行时平台检测示例
-fn create_serial_for_platform(base_addr: *mut u8, clock_freq: u32) -> Box<dyn Serial> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM64 平台，使用 PL011
-        Box::new(Pl011::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
+use core::ptr::NonNull;
+use rdif_serial::{BSerial, Interface as _, TTxQueue as _};
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        // x86_64 平台，使用 NS16550 端口 I/O
-        Box::new(Ns16550Pio::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        // 其他嵌入式平台，使用 NS16550 内存映射 I/O
-        Box::new(Ns16550Mmio::new(
-            NonNull::new(base_addr).unwrap(),
-            clock_freq
-        ))
-    }
+fn create_serial_for_runtime(base_addr: NonNull<u8>, clock_freq: u32) -> BSerial {
+    some_serial::ns16550::Ns16550::new_mmio_boxed(base_addr, clock_freq, 1)
 }
 
-// 系统集成示例
-fn init_system_uart() -> Result<Box<dyn Serial>, &'static str> {
-    let (base_addr, clock_freq) = get_platform_uart_config()?;
+let mut serial = create_serial_for_runtime(
+    NonNull::new(0x40000000 as *mut u8).unwrap(),
+    16_000_000,
+);
 
-    let mut uart = create_serial_for_platform(base_addr, clock_freq);
-
-    // 标准配置
-    let config = Config::new()
-        .baudrate(115200)
-        .data_bits(DataBits::Eight)
-        .stop_bits(StopBits::One)
-        .parity(Parity::None);
-
-    uart.set_config(&config).map_err(|_| "Failed to configure UART")?;
-    uart.open().map_err(|_| "Failed to open UART")?;
-
-    Ok(uart)
+let mut tx = serial.take_tx().expect("missing TX queue");
+while !tx.poll().tx_ready() {
+    core::hint::spin_loop();
 }
+tx.submit_tx(b"runtime serial\n");
+```
 
-// 平台特定配置获取
+#### 平台特定配置获取
+
+```rust
 fn get_platform_uart_config() -> Result<(*mut u8, u32), &'static str> {
     #[cfg(target_arch = "aarch64")]
     {
@@ -288,21 +229,15 @@ let config = Config::new()
 ### 状态查询
 
 ```rust
-// 查询线路状态
-let status = uart.line_status();
-if status.contains(some_serial::LineStatus::DATA_READY) {
-    // 有数据可读
-}
-
-if status.contains(some_serial::LineStatus::TX_HOLDING_EMPTY) {
-    // 可以发送数据
-}
-
-// 查询当前配置
+// 查询当前控制配置
 let current_baudrate = uart.baudrate();
 let data_bits = uart.data_bits();
 let stop_bits = uart.stop_bits();
 let parity = uart.parity();
+
+// 查询 I/O 就绪事件
+let tx_event = tx.poll();
+let rx_event = rx.poll();
 ```
 
 ## 测试
@@ -353,7 +288,7 @@ cargo test --test test --  --show-output --uboot
 ### 添加新驱动支持
 
 1. **创建驱动模块**：在 `src/` 目录下创建新的驱动文件
-2. **实现 Serial trait**：确保实现统一的 `rdif-serial` 接口
+2. **实现 split 接口**：驱动对象实现 `InterfaceRaw`，TX/RX/IRQ handle 分别实现 `TTxQueue`、`TRxQueue`、`TIrqHandler`
 3. **添加测试**：为新驱动编写完整的测试套件
 4. **更新文档**：在 README 中添加驱动说明和使用示例
 5. **提交 PR**：详细描述新驱动的功能和使用方法
@@ -368,12 +303,36 @@ pub struct NewDriver {
     // 驱动特定的状态
 }
 
-impl Serial for NewDriver {
-    // 实现 Serial trait 的所有方法
+pub struct NewDriverTxQueue {
+    // TX 队列状态
 }
 
-impl NewDriver {
-    // 驱动特定的初始化和配置方法
+pub struct NewDriverRxQueue {
+    // RX 队列状态
+}
+
+pub struct NewDriverIrqHandler {
+    // IRQ 同步状态
+}
+
+impl InterfaceRaw for NewDriver {
+    type TxQueue = NewDriverTxQueue;
+    type RxQueue = NewDriverRxQueue;
+    type IrqHandler = NewDriverIrqHandler;
+
+    // 实现配置、开关、IRQ mask、take/set 生命周期方法
+}
+
+impl TTxQueue for NewDriverTxQueue {
+    // 实现 poll + submit_tx
+}
+
+impl TRxQueue for NewDriverRxQueue {
+    // 实现 poll + submit_rx
+}
+
+impl TIrqHandler for NewDriverIrqHandler {
+    // 实现 handle_irq
 }
 ```
 

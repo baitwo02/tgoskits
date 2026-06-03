@@ -1,8 +1,12 @@
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
+use ax_errno::AxError;
 use fdt_edit::{Fdt, NodeType, RegFixed, Status};
 use log::{info, warn};
-use rdrive::{PlatformDevice, probe::OnProbeError, register::FdtInfo};
+use rdrive::{Device, DriverGeneric, PlatformDevice, probe::OnProbeError, register::FdtInfo};
+pub use some_serial::{
+    BIrqHandler, BRxQueue, BTxQueue, Config, ConfigError, InterruptMask, SerialEvent, SetBackError,
+};
 use some_serial::{
     BSerial, ns16550,
     ns16550::rockchip_fiq::{ROCKCHIP_FIQ_RK3588_UART_CLOCK, RockchipFiqConfig, RockchipFiqSerial},
@@ -28,6 +32,162 @@ crate::model_register!(
         on_probe: probe_rockchip_fiq
     }],
 );
+
+struct PlatformSerialDevice {
+    name: String,
+    info: SerialDeviceInfo,
+    interface: Option<BSerial>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialDeviceInfo {
+    pub fdt_path: String,
+    pub alias_index: Option<usize>,
+    pub paddr: usize,
+    pub mapped_base: usize,
+    pub baudrate: u32,
+    pub irq_num: Option<usize>,
+}
+
+pub struct SerialDevice {
+    name: String,
+    info: SerialDeviceInfo,
+    interface: BSerial,
+}
+
+impl PlatformSerialDevice {
+    fn new(name: String, info: SerialDeviceInfo, interface: BSerial) -> Self {
+        Self {
+            name,
+            info,
+            interface: Some(interface),
+        }
+    }
+}
+
+impl DriverGeneric for PlatformSerialDevice {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl SerialDevice {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn info(&self) -> &SerialDeviceInfo {
+        &self.info
+    }
+
+    pub fn fdt_path(&self) -> &str {
+        &self.info.fdt_path
+    }
+
+    pub fn alias_index(&self) -> Option<usize> {
+        self.info.alias_index
+    }
+
+    pub fn paddr(&self) -> usize {
+        self.info.paddr
+    }
+
+    pub fn mapped_base(&self) -> usize {
+        self.info.mapped_base
+    }
+
+    pub fn baudrate(&self) -> u32 {
+        self.interface.baudrate()
+    }
+
+    pub fn irq_num(&self) -> Option<usize> {
+        self.info.irq_num
+    }
+
+    pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
+        self.interface.set_config(config)
+    }
+
+    pub fn set_baudrate(&mut self, baudrate: u32) -> Result<(), ConfigError> {
+        self.interface.set_config(&Config::new().baudrate(baudrate))
+    }
+
+    pub fn set_irq_mask(&mut self, mask: InterruptMask) {
+        self.interface.set_irq_mask(mask);
+    }
+
+    pub fn get_irq_mask(&self) -> InterruptMask {
+        self.interface.get_irq_mask()
+    }
+
+    pub fn enable_rx_interrupts(&mut self) {
+        let mask = self.interface.get_irq_mask() | InterruptMask::RX_AVAILABLE;
+        self.interface.set_irq_mask(mask);
+    }
+
+    pub fn disable_rx_interrupts(&mut self) {
+        let mask = self.interface.get_irq_mask() & !InterruptMask::RX_AVAILABLE;
+        self.interface.set_irq_mask(mask);
+    }
+
+    pub fn take_tx(&mut self) -> Option<BTxQueue> {
+        self.interface.take_tx()
+    }
+
+    pub fn take_rx(&mut self) -> Option<BRxQueue> {
+        self.interface.take_rx()
+    }
+
+    pub fn take_irq_handler(&mut self) -> Option<BIrqHandler> {
+        self.interface.take_irq_handler()
+    }
+
+    pub fn set_tx(&mut self, tx: BTxQueue) -> Result<(), SetBackError> {
+        self.interface.set_tx(tx)
+    }
+
+    pub fn set_rx(&mut self, rx: BRxQueue) -> Result<(), SetBackError> {
+        self.interface.set_rx(rx)
+    }
+
+    pub fn set_irq_handler(&mut self, irq: BIrqHandler) -> Result<(), SetBackError> {
+        self.interface.set_irq_handler(irq)
+    }
+}
+
+impl TryFrom<Device<PlatformSerialDevice>> for SerialDevice {
+    type Error = AxError;
+
+    fn try_from(base: Device<PlatformSerialDevice>) -> Result<Self, Self::Error> {
+        let mut dev = base.lock().map_err(|_| AxError::BadState)?;
+        let name = dev.name.clone();
+        let info = dev.info.clone();
+        let interface = dev.interface.take().ok_or(AxError::BadState)?;
+        Ok(Self {
+            name,
+            info,
+            interface,
+        })
+    }
+}
+
+pub fn take_serial_devices() -> Vec<SerialDevice> {
+    if !rdrive::is_initialized() {
+        warn!("rdrive is not initialized; no serial devices available");
+        return Vec::new();
+    }
+
+    rdrive::get_list::<PlatformSerialDevice>()
+        .into_iter()
+        .filter_map(|dev| match SerialDevice::try_from(dev) {
+            Ok(serial) => Some(serial),
+            Err(err) => {
+                warn!("failed to take serial device: {err:?}");
+                None
+            }
+        })
+        .collect()
+}
 
 fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
     info!("Probing serial device: {}", info.node.name());
@@ -59,8 +219,14 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
 
     if let Some(serial) = serial {
         let base = serial.base_addr();
+        let baudrate = serial.baudrate();
+        let device_info = serial_device_info(&info, &base_reg, base, baudrate);
         info!("Serial@{base:#x} registered successfully");
-        plat_dev.register(serial);
+        plat_dev.register(PlatformSerialDevice::new(
+            serial.name().into(),
+            device_info,
+            serial,
+        ));
     }
 
     Ok(())
@@ -89,8 +255,72 @@ fn probe_rockchip_fiq(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(),
          irq-mode={}",
         fdt_config.config.serial_id, fdt_config.config.baudrate, fdt_config.config.irq_mode_enabled
     );
-    plat_dev.register(serial);
+    plat_dev.register(PlatformSerialDevice::new(
+        serial.name().into(),
+        SerialDeviceInfo {
+            fdt_path: fdt_config.uart_path,
+            alias_index: Some(fdt_config.config.serial_id as usize),
+            paddr: fdt_config.reg.address as usize,
+            mapped_base: base,
+            baudrate: serial.baudrate(),
+            irq_num: if fdt_config.config.irq_mode_enabled {
+                decode_fdt_irq(&info.interrupts())
+            } else {
+                None
+            },
+        },
+        serial,
+    ));
     Ok(())
+}
+
+fn serial_device_info(
+    info: &FdtInfo<'_>,
+    base_reg: &RegFixed,
+    mapped_base: usize,
+    baudrate: u32,
+) -> SerialDeviceInfo {
+    let fdt_path = info.node.path();
+    let alias_index = rdrive::with_fdt(|fdt| serial_alias_index(fdt, &fdt_path)).flatten();
+    SerialDeviceInfo {
+        fdt_path,
+        alias_index,
+        paddr: base_reg.address as usize,
+        mapped_base,
+        baudrate,
+        irq_num: decode_fdt_irq(&info.interrupts()),
+    }
+}
+
+fn serial_alias_index(fdt: &Fdt, node_path: &str) -> Option<usize> {
+    let aliases = fdt.get_by_path("/aliases")?;
+    aliases
+        .as_node()
+        .properties()
+        .iter()
+        .filter_map(|prop| {
+            let index = prop.name().strip_prefix("serial")?.parse::<usize>().ok()?;
+            let path = prop.as_str()?;
+            (path == node_path).then_some(index)
+        })
+        .next()
+}
+
+pub fn decode_fdt_irq(interrupts: &[rdrive::probe::fdt::InterruptRef]) -> Option<usize> {
+    let interrupt = interrupts.first()?;
+    decode_irq_cells(&interrupt.specifier)
+}
+
+fn decode_irq_cells(specifier: &[u32]) -> Option<usize> {
+    match specifier {
+        [irq] => Some(*irq as usize),
+        [kind, irq, ..] => match *kind {
+            0 => Some(*irq as usize + 32),
+            1 => Some(*irq as usize + 16),
+            _ => Some(*irq as usize),
+        },
+        _ => None,
+    }
 }
 
 fn prop_u32(node: &fdt_edit::Node, name: &str) -> Option<u32> {
@@ -222,6 +452,41 @@ mod tests {
         let fdt = minimal_fiq_fdt(true, false);
         let fiq = fdt.get_by_path("/fiq-debugger").expect("fiq node missing");
         assert!(rockchip_fiq_fdt_config(&fdt, fiq).is_err());
+    }
+
+    #[test]
+    fn resolves_serial_alias_index_by_node_path() {
+        let fdt = minimal_serial_alias_fdt();
+
+        assert_eq!(serial_alias_index(&fdt, "/soc/uart@1000"), Some(0));
+        assert_eq!(serial_alias_index(&fdt, "/soc/uart@2000"), Some(2));
+        assert_eq!(serial_alias_index(&fdt, "/soc/uart@3000"), None);
+    }
+
+    #[test]
+    fn decodes_common_fdt_irq_cell_shapes() {
+        assert_eq!(decode_irq_cells(&[7]), Some(7));
+        assert_eq!(decode_irq_cells(&[0, 42, 4]), Some(74));
+        assert_eq!(decode_irq_cells(&[1, 3, 4]), Some(19));
+        assert_eq!(decode_irq_cells(&[9, 11, 4]), Some(11));
+        assert_eq!(decode_irq_cells(&[]), None);
+    }
+
+    fn minimal_serial_alias_fdt() -> Fdt {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        let aliases = fdt.add_node(root, Node::new("aliases"));
+        fdt.node_mut(aliases)
+            .unwrap()
+            .set_property(prop_str("serial0", "/soc/uart@1000"));
+        fdt.node_mut(aliases)
+            .unwrap()
+            .set_property(prop_str("serial2", "/soc/uart@2000"));
+
+        let soc = fdt.add_node(root, Node::new("soc"));
+        fdt.add_node(soc, Node::new("uart@1000"));
+        fdt.add_node(soc, Node::new("uart@2000"));
+        fdt
     }
 
     fn minimal_fiq_fdt(with_alias: bool, dw_apb: bool) -> Fdt {

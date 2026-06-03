@@ -9,8 +9,8 @@ mod registers;
 
 use bitflags::Flags;
 use rdif_serial::{
-    Config, ConfigError, DataBits, InterfaceRaw, InterruptMask, Parity, SetBackError, StopBits,
-    TIrqHandler, TSender, TransferError,
+    Config, ConfigError, DataBits, InterfaceRaw, InterruptMask, Parity, SerialEvent, SetBackError,
+    StopBits, TIrqHandler, TRxQueue, TTxQueue, TransBytesError, TransferError,
 };
 use registers::*;
 
@@ -26,8 +26,6 @@ pub use mmio::*;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use pio::*;
 pub use rockchip_fiq::*;
-
-use crate::{RawReciever, RawSender};
 
 pub trait Kind: Clone + Send + Sync + 'static {
     fn read_reg(&self, reg: u8) -> u8;
@@ -90,14 +88,14 @@ pub trait Kind: Clone + Send + Sync + 'static {
 pub struct Ns16550<T: Kind> {
     pub(crate) base: T,
     pub(crate) clock_freq: u32,
-    pub(crate) irq: Option<Ns16550IrqHandler<T>>,
-    pub(crate) tx: Option<crate::Sender>,
-    pub(crate) rx: Option<crate::Reciever>,
+    pub(crate) tx_taken: bool,
+    pub(crate) rx_taken: bool,
+    pub(crate) irq_taken: bool,
 }
 
 impl<T: Kind> InterfaceRaw for Ns16550<T> {
-    type Sender = crate::Sender;
-    type Reciever = crate::Reciever;
+    type TxQueue = Ns16550TxQueue<T>;
+    type RxQueue = Ns16550RxQueue<T>;
     type IrqHandler = Ns16550IrqHandler<T>;
 
     fn name(&self) -> &str {
@@ -185,17 +183,11 @@ impl<T: Kind> InterfaceRaw for Ns16550<T> {
     }
 
     fn open(&mut self) {
-        self.init_core();
+        Ns16550::open(self);
     }
 
     fn close(&mut self) {
-        // 禁用所有中断
-        self.write_flags(UART_IER, InterruptEnableFlags::empty());
-
-        // 禁用 DTR 和 RTS
-        let mut mcr: ModemControlFlags = self.read_flags(UART_MCR);
-        mcr.remove(ModemControlFlags::DATA_TERMINAL_READY | ModemControlFlags::REQUEST_TO_SEND);
-        self.write_flags(UART_MCR, mcr);
+        Ns16550::close(self);
     }
 
     fn enable_loopback(&mut self) {
@@ -216,6 +208,122 @@ impl<T: Kind> InterfaceRaw for Ns16550<T> {
     }
 
     fn set_irq_mask(&mut self, mask: InterruptMask) {
+        Ns16550::set_irq_mask(self, mask);
+    }
+
+    fn get_irq_mask(&self) -> InterruptMask {
+        Ns16550::get_irq_mask(self)
+    }
+
+    fn take_tx(&mut self) -> Option<Self::TxQueue> {
+        Ns16550::take_tx(self)
+    }
+
+    fn take_rx(&mut self) -> Option<Self::RxQueue> {
+        Ns16550::take_rx(self)
+    }
+
+    fn take_irq_handler(&mut self) -> Option<Self::IrqHandler> {
+        Ns16550::take_irq_handler(self)
+    }
+
+    fn set_tx(&mut self, tx: Self::TxQueue) -> Result<(), SetBackError> {
+        Ns16550::set_tx(self, tx)
+    }
+
+    fn set_rx(&mut self, rx: Self::RxQueue) -> Result<(), SetBackError> {
+        Ns16550::set_rx(self, rx)
+    }
+
+    fn set_irq_handler(&mut self, irq: Self::IrqHandler) -> Result<(), SetBackError> {
+        Ns16550::set_irq_handler(self, irq)
+    }
+}
+
+impl<T: Kind> Ns16550<T> {
+    // 类型安全的 bitflags 寄存器访问
+    fn read_flags<F: Flags<Bits = u8>>(&self, reg: u8) -> F {
+        F::from_bits_retain(self.base.read_reg(reg))
+    }
+
+    fn write_flags<F: Flags<Bits = u8>>(&mut self, reg: u8, val: F) {
+        self.base.write_reg(reg, val.bits());
+    }
+
+    fn submit_tx_from_base(base: &T, bytes: &[u8]) -> usize {
+        let mut written = 0;
+        for &byte in bytes {
+            let lsr: LineStatusFlags = base.read_flags(UART_LSR);
+            if !lsr.contains(LineStatusFlags::TRANSMITTER_HOLDING_EMPTY) {
+                break;
+            }
+            base.write_reg(UART_THR, byte);
+            written += 1;
+        }
+        written
+    }
+
+    fn submit_rx_from_base(base: &T, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        let mut read_count = 0;
+        for byte in bytes.iter_mut() {
+            match read_byte_from_kind(base) {
+                Some(Ok(b)) => {
+                    *byte = b;
+                    read_count += 1;
+                }
+                Some(Err(e)) => {
+                    return Err(TransBytesError {
+                        bytes_transferred: read_count,
+                        kind: e,
+                    });
+                }
+                None => break,
+            }
+        }
+        Ok(read_count)
+    }
+
+    fn handle_irq_from_base(base: &T) -> SerialEvent {
+        let iir: InterruptIdentificationFlags = base.read_flags(UART_IIR);
+        let mut event = SerialEvent::empty();
+
+        if iir.contains(InterruptIdentificationFlags::NO_INTERRUPT_PENDING) {
+            return event;
+        }
+
+        let interrupt_id = iir & InterruptIdentificationFlags::INTERRUPT_ID_MASK;
+        if interrupt_id == InterruptIdentificationFlags::RECEIVER_LINE_STATUS {
+            event |= serial_event_from_lsr(base.read_flags(UART_LSR))
+                & (SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN);
+            if event.is_empty() {
+                event |= SerialEvent::RX_ERROR;
+            }
+        } else if interrupt_id == InterruptIdentificationFlags::RECEIVED_DATA_AVAILABLE
+            || interrupt_id == InterruptIdentificationFlags::CHARACTER_TIMEOUT
+        {
+            event |= SerialEvent::RX_READY;
+            event |= serial_event_from_lsr(base.read_flags(UART_LSR))
+                & (SerialEvent::RX_ERROR | SerialEvent::OVERRUN);
+        } else if interrupt_id == InterruptIdentificationFlags::TRANSMITTER_HOLDING_EMPTY {
+            event |= SerialEvent::TX_READY;
+        }
+
+        event
+    }
+
+    pub fn open(&mut self) {
+        self.init_core();
+    }
+
+    pub fn close(&mut self) {
+        self.write_flags(UART_IER, InterruptEnableFlags::empty());
+
+        let mut mcr: ModemControlFlags = self.read_flags(UART_MCR);
+        mcr.remove(ModemControlFlags::DATA_TERMINAL_READY | ModemControlFlags::REQUEST_TO_SEND);
+        self.write_flags(UART_MCR, mcr);
+    }
+
+    pub fn set_irq_mask(&mut self, mask: InterruptMask) {
         let mut ier = InterruptEnableFlags::empty();
 
         if mask.contains(InterruptMask::RX_AVAILABLE) {
@@ -229,7 +337,7 @@ impl<T: Kind> InterfaceRaw for Ns16550<T> {
         self.write_flags(UART_IER, ier);
     }
 
-    fn get_irq_mask(&self) -> InterruptMask {
+    pub fn get_irq_mask(&self) -> InterruptMask {
         let ier: InterruptEnableFlags = self.read_flags(UART_IER);
         let mut mask = InterruptMask::empty();
 
@@ -239,105 +347,56 @@ impl<T: Kind> InterfaceRaw for Ns16550<T> {
         if ier.contains(InterruptEnableFlags::TRANSMITTER_HOLDING_EMPTY) {
             mask |= InterruptMask::TX_EMPTY;
         }
-        // 错误中断暂不映射到 InterruptMask
-        // 用户需要通过状态寄存器检查错误
 
         mask
     }
 
-    fn irq_handler(&mut self) -> Option<Self::IrqHandler> {
-        self.irq.take()
-    }
-
-    fn take_tx(&mut self) -> Option<Self::Sender> {
-        self.tx.take()
-    }
-
-    fn take_rx(&mut self) -> Option<Self::Reciever> {
-        self.rx.take()
-    }
-
-    fn set_tx(&mut self, tx: Self::Sender) -> Result<(), SetBackError> {
-        let want = self.base.get_base();
-        match tx {
-            #[cfg(target_arch = "x86_64")]
-            crate::Sender::Ns16550Sender(ref sender) => {
-                let actual = sender.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Sender::Ns16550MmioSender(ref sender) => {
-                let actual = sender.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Sender::Ns16550DwApbSender(ref sender) => {
-                let actual = sender.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Sender::Ns16550RockchipFiqSender(ref sender) => {
-                let actual = sender.base_addr();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            _ => {
-                return Err(SetBackError::new(want, 0)); // 不匹配的类型
-            }
+    pub fn take_tx(&mut self) -> Option<Ns16550TxQueue<T>> {
+        if self.tx_taken {
+            return None;
         }
-        self.tx = Some(tx);
+        self.tx_taken = true;
+        Some(Ns16550TxQueue {
+            base: self.base.clone(),
+        })
+    }
+
+    pub fn take_rx(&mut self) -> Option<Ns16550RxQueue<T>> {
+        if self.rx_taken {
+            return None;
+        }
+        self.rx_taken = true;
+        Some(Ns16550RxQueue {
+            base: self.base.clone(),
+        })
+    }
+
+    pub fn take_irq_handler(&mut self) -> Option<Ns16550IrqHandler<T>> {
+        if self.irq_taken {
+            return None;
+        }
+        self.irq_taken = true;
+        Some(Ns16550IrqHandler {
+            base: self.base.clone(),
+        })
+    }
+
+    pub fn set_tx(&mut self, tx: Ns16550TxQueue<T>) -> Result<(), SetBackError> {
+        ensure_same_base(self.base.get_base(), tx.base.get_base())?;
+        self.tx_taken = false;
         Ok(())
     }
 
-    fn set_rx(&mut self, rx: Self::Reciever) -> Result<(), SetBackError> {
-        let want = self.base.get_base();
-        match rx {
-            #[cfg(target_arch = "x86_64")]
-            crate::Reciever::Ns16550Reciever(ref reciever) => {
-                let actual = reciever.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Reciever::Ns16550MmioReciever(ref reciever) => {
-                let actual = reciever.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Reciever::Ns16550DwApbReciever(ref reciever) => {
-                let actual = reciever.base.get_base();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            crate::Reciever::Ns16550RockchipFiqReciever(ref reciever) => {
-                let actual = reciever.base_addr();
-                if actual != want {
-                    return Err(SetBackError::new(want, actual));
-                }
-            }
-            _ => {
-                return Err(SetBackError::new(want, 0)); // 不匹配的类型
-            }
-        }
-        self.rx = Some(rx);
+    pub fn set_rx(&mut self, rx: Ns16550RxQueue<T>) -> Result<(), SetBackError> {
+        ensure_same_base(self.base.get_base(), rx.base.get_base())?;
+        self.rx_taken = false;
         Ok(())
     }
-}
 
-impl<T: Kind> Ns16550<T> {
-    // 类型安全的 bitflags 寄存器访问
-    fn read_flags<F: Flags<Bits = u8>>(&self, reg: u8) -> F {
-        F::from_bits_retain(self.base.read_reg(reg))
-    }
-
-    fn write_flags<F: Flags<Bits = u8>>(&mut self, reg: u8, val: F) {
-        self.base.write_reg(reg, val.bits());
+    pub fn set_irq_handler(&mut self, irq: Ns16550IrqHandler<T>) -> Result<(), SetBackError> {
+        ensure_same_base(self.base.get_base(), irq.base.get_base())?;
+        self.irq_taken = false;
+        Ok(())
     }
 
     /// 检查是否为 16550+（支持 FIFO）
@@ -469,50 +528,68 @@ impl<T: Kind> Ns16550<T> {
     }
 }
 
-pub struct Ns16550Sender<T: Kind> {
+pub struct Ns16550TxQueue<T: Kind> {
     pub(crate) base: T,
 }
 
-impl<T: Kind> TSender for Ns16550Sender<T> {
-    fn write_byte(&mut self, byte: u8) -> bool {
-        RawSender::write_byte(self, byte)
+impl<T: Kind> Ns16550TxQueue<T> {
+    pub fn base_addr(&self) -> usize {
+        self.base.get_base()
+    }
+
+    pub fn poll(&mut self) -> SerialEvent {
+        serial_event_from_lsr(self.base.read_flags(UART_LSR)) & SerialEvent::TX_READY
+    }
+
+    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        Ns16550::<T>::submit_tx_from_base(&self.base, bytes)
     }
 }
 
-pub struct Ns16550Reciever<T: Kind> {
+impl<T: Kind> TTxQueue for Ns16550TxQueue<T> {
+    fn base_addr(&self) -> usize {
+        Ns16550TxQueue::base_addr(self)
+    }
+
+    fn poll(&mut self) -> SerialEvent {
+        Ns16550TxQueue::poll(self)
+    }
+
+    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        Ns16550TxQueue::submit_tx(self, bytes)
+    }
+}
+
+pub struct Ns16550RxQueue<T: Kind> {
     pub(crate) base: T,
 }
 
-impl<T: Kind> RawReciever for Ns16550Reciever<T> {
-    fn read_byte(&mut self) -> Option<Result<u8, TransferError>> {
-        let lsr: LineStatusFlags = self.base.read_flags(UART_LSR);
+impl<T: Kind> Ns16550RxQueue<T> {
+    pub fn base_addr(&self) -> usize {
+        self.base.get_base()
+    }
 
-        // 按优先级检查错误（从高到低）
-        if lsr.contains(LineStatusFlags::OVERRUN_ERROR) {
-            let b = self.base.read_reg(UART_RBR);
-            return Some(Err(TransferError::Overrun(b)));
-        }
+    pub fn poll(&mut self) -> SerialEvent {
+        serial_event_from_lsr(self.base.read_flags(UART_LSR))
+            & (SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN)
+    }
 
-        if lsr.contains(LineStatusFlags::PARITY_ERROR) {
-            let _b = self.base.read_reg(UART_RBR);
-            return Some(Err(TransferError::Parity));
-        }
+    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        Ns16550::<T>::submit_rx_from_base(&self.base, bytes)
+    }
+}
 
-        if lsr.contains(LineStatusFlags::FRAMING_ERROR) {
-            let _b = self.base.read_reg(UART_RBR);
-            return Some(Err(TransferError::Framing));
-        }
+impl<T: Kind> TRxQueue for Ns16550RxQueue<T> {
+    fn base_addr(&self) -> usize {
+        Ns16550RxQueue::base_addr(self)
+    }
 
-        if lsr.contains(LineStatusFlags::BREAK_INTERRUPT) {
-            let _b = self.base.read_reg(UART_RBR);
-            return Some(Err(TransferError::Break));
-        }
+    fn poll(&mut self) -> SerialEvent {
+        Ns16550RxQueue::poll(self)
+    }
 
-        if lsr.contains(LineStatusFlags::DATA_READY) {
-            let b = self.base.read_reg(UART_RBR);
-            return Some(Ok(b));
-        }
-        None
+    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        Ns16550RxQueue::submit_rx(self, bytes)
     }
 }
 
@@ -520,45 +597,78 @@ pub struct Ns16550IrqHandler<T: Kind> {
     pub(crate) base: T,
 }
 
-impl<T: Kind> TIrqHandler for Ns16550IrqHandler<T> {
-    fn clean_interrupt_status(&self) -> InterruptMask {
-        let iir: InterruptIdentificationFlags = self.base.read_flags(UART_IIR);
-        let mut mask = InterruptMask::empty();
+unsafe impl<T: Kind> Sync for Ns16550IrqHandler<T> {}
 
-        // 检查是否有中断挂起
-        if iir.contains(InterruptIdentificationFlags::NO_INTERRUPT_PENDING) {
-            return mask;
-        }
+impl<T: Kind> Ns16550IrqHandler<T> {
+    pub fn base_addr(&self) -> usize {
+        self.base.get_base()
+    }
 
-        // 获取中断ID（需要提取bit 1-3）
-        let interrupt_id = iir & InterruptIdentificationFlags::INTERRUPT_ID_MASK;
-
-        // 使用精确匹配而不是 contains
-        if interrupt_id == InterruptIdentificationFlags::RECEIVER_LINE_STATUS
-            || interrupt_id == InterruptIdentificationFlags::RECEIVED_DATA_AVAILABLE
-            || interrupt_id == InterruptIdentificationFlags::CHARACTER_TIMEOUT
-        {
-            // 接收数据可用中断或字符超时中断
-            mask |= InterruptMask::RX_AVAILABLE;
-        } else if interrupt_id == InterruptIdentificationFlags::TRANSMITTER_HOLDING_EMPTY {
-            // 发送保持寄存器空中断
-            mask |= InterruptMask::TX_EMPTY;
-        } else if interrupt_id == InterruptIdentificationFlags::MODEM_STATUS {
-            // Modem 状态中断
-        }
-
-        mask
+    pub fn handle_irq(&self) -> SerialEvent {
+        Ns16550::<T>::handle_irq_from_base(&self.base)
     }
 }
 
-impl<T: Kind> RawSender for Ns16550Sender<T> {
-    fn write_byte(&mut self, byte: u8) -> bool {
-        let lsr: LineStatusFlags = self.base.read_flags(UART_LSR);
-        if lsr.contains(LineStatusFlags::TRANSMITTER_HOLDING_EMPTY) {
-            self.base.write_reg(UART_THR, byte);
-            true
-        } else {
-            false
-        }
+impl<T: Kind> TIrqHandler for Ns16550IrqHandler<T> {
+    fn base_addr(&self) -> usize {
+        Ns16550IrqHandler::base_addr(self)
+    }
+
+    fn handle_irq(&self) -> SerialEvent {
+        Ns16550IrqHandler::handle_irq(self)
+    }
+}
+
+fn serial_event_from_lsr(lsr: LineStatusFlags) -> SerialEvent {
+    let mut event = SerialEvent::empty();
+    if lsr.contains(LineStatusFlags::DATA_READY) {
+        event |= SerialEvent::RX_READY;
+    }
+    if lsr.intersects(
+        LineStatusFlags::PARITY_ERROR
+            | LineStatusFlags::FRAMING_ERROR
+            | LineStatusFlags::BREAK_INTERRUPT,
+    ) {
+        event |= SerialEvent::RX_ERROR;
+    }
+    if lsr.contains(LineStatusFlags::OVERRUN_ERROR) {
+        event |= SerialEvent::RX_ERROR | SerialEvent::OVERRUN;
+    }
+    if lsr.contains(LineStatusFlags::TRANSMITTER_HOLDING_EMPTY) {
+        event |= SerialEvent::TX_READY;
+    }
+    event
+}
+
+fn read_byte_from_kind<T: Kind>(base: &T) -> Option<Result<u8, TransferError>> {
+    let lsr: LineStatusFlags = base.read_flags(UART_LSR);
+
+    if lsr.contains(LineStatusFlags::OVERRUN_ERROR) {
+        let b = base.read_reg(UART_RBR);
+        return Some(Err(TransferError::Overrun(b)));
+    }
+    if lsr.contains(LineStatusFlags::PARITY_ERROR) {
+        let _ = base.read_reg(UART_RBR);
+        return Some(Err(TransferError::Parity));
+    }
+    if lsr.contains(LineStatusFlags::FRAMING_ERROR) {
+        let _ = base.read_reg(UART_RBR);
+        return Some(Err(TransferError::Framing));
+    }
+    if lsr.contains(LineStatusFlags::BREAK_INTERRUPT) {
+        let _ = base.read_reg(UART_RBR);
+        return Some(Err(TransferError::Break));
+    }
+    if lsr.contains(LineStatusFlags::DATA_READY) {
+        return Some(Ok(base.read_reg(UART_RBR)));
+    }
+    None
+}
+
+fn ensure_same_base(want: usize, actual: usize) -> Result<(), SetBackError> {
+    if want == actual {
+        Ok(())
+    } else {
+        Err(SetBackError::new(want, actual))
     }
 }

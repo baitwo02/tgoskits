@@ -22,16 +22,14 @@ mod tests {
         },
     };
     use fdt_edit::{ClockType, Fdt, InterruptRef, NodeType};
-    use ax_kspin::SpinNoIrq as Mutex;
     use rdif_intc::Intc;
-    use rdif_serial::{BIrqHandler, BReciever, BSender, BSerial, TransferError};
+    use rdif_serial::{BRxQueue, BSerial, BTxQueue, SerialEvent, TransferError};
     use rdrive::fdt_phandle_to_device_id;
     use some_serial::{Config, DataBits, InterruptMask, Parity, StopBits};
 
     static TX_INTERRUPT_COUNT: AtomicUsize = AtomicUsize::new(0);
     static RX_INTERRUPT_COUNT: AtomicUsize = AtomicUsize::new(0);
     static IRQ_HANDLER_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static IRQ_HANDLER: Mutex<Option<BIrqHandler>> = Mutex::new(None);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DriverType {
@@ -63,9 +61,9 @@ mod tests {
     impl Drop for TestSerial {
         fn drop(&mut self) {
             self.serial
-                .disable_interrupts(InterruptMask::TX_EMPTY | InterruptMask::RX_AVAILABLE);
+                .set_irq_mask(self.serial.get_irq_mask()
+                    & !(InterruptMask::TX_EMPTY | InterruptMask::RX_AVAILABLE));
             self.serial.disable_loopback();
-            *IRQ_HANDLER.lock() = None;
             if let TestMmio::Owned(mmio) = &self.mmio {
                 kernel_mmio_op().iounmap(mmio);
             }
@@ -84,8 +82,8 @@ mod tests {
             .parity(Parity::None);
         serial.set_config(&config).expect("failed to set config");
 
-        let mut tx = serial.take_tx().expect("missing tx");
-        let mut rx = serial.take_rx().expect("missing rx");
+        let mut tx = serial.take_tx().expect("missing TX queue");
+        let mut rx = serial.take_rx().expect("missing RX queue");
         clean_rx(&mut rx);
 
         test_serial_tx_rx_one(serial, &mut tx, &mut rx, b"Hello\n").expect("loopback failed");
@@ -127,26 +125,27 @@ mod tests {
 
         reset_interrupt_counters();
 
-        serial.enable_interrupts(InterruptMask::TX_EMPTY);
+        serial.set_irq_mask(serial.get_irq_mask() | InterruptMask::TX_EMPTY);
         assert_eq!(
-            serial.get_enabled_interrupts().bits(),
+            serial.get_irq_mask().bits(),
             InterruptMask::TX_EMPTY.bits()
         );
 
-        serial.enable_interrupts(InterruptMask::RX_AVAILABLE);
+        serial.set_irq_mask(serial.get_irq_mask() | InterruptMask::RX_AVAILABLE);
         assert_eq!(
-            serial.get_enabled_interrupts().bits(),
+            serial.get_irq_mask().bits(),
             (InterruptMask::TX_EMPTY | InterruptMask::RX_AVAILABLE).bits()
         );
 
-        serial.disable_interrupts(InterruptMask::TX_EMPTY);
+        serial.set_irq_mask(serial.get_irq_mask() & !InterruptMask::TX_EMPTY);
         assert_eq!(
-            serial.get_enabled_interrupts().bits(),
+            serial.get_irq_mask().bits(),
             InterruptMask::RX_AVAILABLE.bits()
         );
 
-        let mut tx = serial.take_tx().expect("missing tx");
-        let mut rx = serial.take_rx().expect("missing rx");
+        let mut tx = serial.take_tx().expect("missing TX queue");
+        let mut rx = serial.take_rx().expect("missing RX queue");
+        let irq_handler = serial.take_irq_handler().expect("missing IRQ handler");
 
         clean_rx(&mut rx);
         serial.enable_loopback();
@@ -154,8 +153,11 @@ mod tests {
         let payload = b"irq-loopback";
         let mut remaining = payload.as_slice();
         while !remaining.is_empty() {
-            let written = tx.write_bytes(remaining);
-            assert!(written > 0, "failed to write test payload");
+            let written = tx.submit_tx(remaining);
+            if written == 0 {
+                core::hint::spin_loop();
+                continue;
+            }
             remaining = &remaining[written..];
         }
 
@@ -170,14 +172,28 @@ mod tests {
             "IRQ handler was never invoked"
         );
 
+        let status = irq_handler.handle_irq();
+        if status.tx_ready() {
+            TX_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        if status.intersects(SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN)
+        {
+            RX_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(
+            status.intersects(SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN),
+            "serial IRQ did not report RX activity: {status:?}"
+        );
+
         let mut buffer = [0u8; 32];
-        let received = rx.read_bytes(&mut buffer).expect("failed to read loopback");
+        let received = rx.submit_rx(&mut buffer).expect("failed to read loopback");
         assert_eq!(&buffer[..received], payload);
 
         serial.disable_loopback();
-        serial.disable_interrupts(InterruptMask::TX_EMPTY | InterruptMask::RX_AVAILABLE);
+        serial.set_irq_mask(serial.get_irq_mask()
+            & !(InterruptMask::TX_EMPTY | InterruptMask::RX_AVAILABLE));
         assert_eq!(
-            serial.get_enabled_interrupts().bits(),
+            serial.get_irq_mask().bits(),
             InterruptMask::empty().bits()
         );
     }
@@ -212,8 +228,7 @@ mod tests {
             }
         };
 
-        let irq_handler = serial.irq_handler().expect("missing irq handler");
-        let irq = register_uart_irq(&irq_ref, irq_handler);
+        let irq = register_uart_irq(&irq_ref);
 
         TestSerial {
             serial,
@@ -291,31 +306,14 @@ mod tests {
             })
     }
 
-    fn register_uart_irq(interrupt: &InterruptRef, handler: BIrqHandler) -> rdrive::IrqId {
+    fn register_uart_irq(interrupt: &InterruptRef) -> rdrive::IrqId {
         let intc_id = fdt_phandle_to_device_id(interrupt.interrupt_parent)
             .expect("interrupt parent not registered");
         let intc = rdrive::get::<Intc>(intc_id).expect("failed to fetch interrupt controller");
         let irq = intc.lock().unwrap().setup_irq_by_fdt(&interrupt.specifier);
 
-        *IRQ_HANDLER.lock() = Some(handler);
-
         register_handler(irq.raw().into(), || {
             IRQ_HANDLER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-
-            let status = {
-                let guard = IRQ_HANDLER.lock();
-                let Some(handler) = guard.as_ref() else {
-                    return;
-                };
-                handler.clean_interrupt_status()
-            };
-
-            if status.contains(InterruptMask::TX_EMPTY) {
-                TX_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-            if status.contains(InterruptMask::RX_AVAILABLE) {
-                RX_INTERRUPT_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
         });
 
         irq
@@ -337,10 +335,10 @@ mod tests {
         false
     }
 
-    fn clean_rx(rx: &mut BReciever) {
+    fn clean_rx(rx: &mut BRxQueue) {
         let mut buffer = [0u8; 64];
         loop {
-            match rx.read_bytes(&mut buffer) {
+            match rx.submit_rx(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -349,8 +347,8 @@ mod tests {
 
     fn test_serial_tx_rx_one(
         serial: &mut BSerial,
-        tx: &mut BSender,
-        rx: &mut BReciever,
+        tx: &mut BTxQueue,
+        rx: &mut BRxQueue,
         expected: &[u8],
     ) -> Result<(), TransferError> {
         serial.enable_loopback();
@@ -362,12 +360,12 @@ mod tests {
         for &byte in expected {
             let mut written = 0usize;
             while written == 0 {
-                written = tx.write_bytes(&[byte]);
+                written = tx.submit_tx(&[byte]);
                 core::hint::spin_loop();
             }
 
             loop {
-                match rx.read_bytes(&mut received[total..total + 1]) {
+                match rx.submit_rx(&mut received[total..total + 1]) {
                     Ok(1) => {
                         total += 1;
                         break;

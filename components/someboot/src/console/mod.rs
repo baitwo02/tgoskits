@@ -2,7 +2,12 @@ use core::{cell::UnsafeCell, fmt::Write, ptr::NonNull};
 
 use byte_unit::{Byte, UnitType};
 use kernutil::memory::{MemoryDescriptor, MemoryType};
-use some_serial::*;
+#[cfg(target_arch = "x86_64")]
+use some_serial::ns16550::Port;
+use some_serial::{
+    ns16550::{self, Mmio, Ns16550RxQueue, Ns16550TxQueue},
+    pl011::{self, Pl011RxQueue, Pl011TxQueue},
+};
 
 use crate::{
     cmdline::EarlyconConfig,
@@ -155,16 +160,65 @@ pub(crate) unsafe fn set_out(v: &'static dyn Con) {
     }
 }
 
-pub fn set_earlycon_sender(sender: Sender) {
-    unsafe {
-        *EARLYCON_SENDER.0.get() = Some(sender);
-        set_out(&EARLYCON_SENDER);
+pub enum EarlySerialTx {
+    Ns16550Mmio(Ns16550TxQueue<Mmio>),
+    #[cfg(target_arch = "x86_64")]
+    Ns16550Port(Ns16550TxQueue<Port>),
+    Pl011(Pl011TxQueue),
+}
+
+impl EarlySerialTx {
+    pub fn poll(&mut self) -> some_serial::SerialEvent {
+        match self {
+            Self::Ns16550Mmio(tx) => tx.poll(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Ns16550Port(tx) => tx.poll(),
+            Self::Pl011(tx) => tx.poll(),
+        }
+    }
+
+    pub fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        match self {
+            Self::Ns16550Mmio(tx) => tx.submit_tx(bytes),
+            #[cfg(target_arch = "x86_64")]
+            Self::Ns16550Port(tx) => tx.submit_tx(bytes),
+            Self::Pl011(tx) => tx.submit_tx(bytes),
+        }
     }
 }
 
-pub fn set_earlycon_reciever(reciever: Reciever) {
+pub enum EarlySerialRx {
+    Ns16550Mmio(Ns16550RxQueue<Mmio>),
+    #[cfg(target_arch = "x86_64")]
+    Ns16550Port(Ns16550RxQueue<Port>),
+    Pl011(Pl011RxQueue),
+}
+
+impl EarlySerialRx {
+    pub fn poll(&mut self) -> some_serial::SerialEvent {
+        match self {
+            Self::Ns16550Mmio(rx) => rx.poll(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Ns16550Port(rx) => rx.poll(),
+            Self::Pl011(rx) => rx.poll(),
+        }
+    }
+
+    pub fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, some_serial::TransBytesError> {
+        match self {
+            Self::Ns16550Mmio(rx) => rx.submit_rx(bytes),
+            #[cfg(target_arch = "x86_64")]
+            Self::Ns16550Port(rx) => rx.submit_rx(bytes),
+            Self::Pl011(rx) => rx.submit_rx(bytes),
+        }
+    }
+}
+
+pub fn set_earlycon_serial(tx: EarlySerialTx, rx: EarlySerialRx) {
     unsafe {
-        *EARLYCON_RECIEVER.0.get() = Some(reciever);
+        *EARLYCON_TX.0.get() = Some(tx);
+        *EARLYCON_RX.0.get() = Some(rx);
+        set_out(&EARLYCON_TX);
     }
 }
 
@@ -174,9 +228,13 @@ pub fn read_byte() -> Option<u8> {
     }
 
     unsafe {
-        if let Some(ref mut reciever) = *EARLYCON_RECIEVER.0.get() {
-            match reciever.read_byte() {
-                Some(Ok(byte)) => Some(byte),
+        if let Some(ref mut rx) = *EARLYCON_RX.0.get() {
+            if !rx.poll().rx_ready() {
+                return None;
+            }
+            let mut byte = [0];
+            match rx.submit_rx(&mut byte) {
+                Ok(1) => Some(byte[0]),
                 _ => None,
             }
         } else {
@@ -185,17 +243,33 @@ pub fn read_byte() -> Option<u8> {
     }
 }
 
-static EARLYCON_SENDER: EarlyconSenderCell = EarlyconSenderCell(UnsafeCell::new(None));
+static EARLYCON_TX: EarlyconTxCell = EarlyconTxCell(UnsafeCell::new(None));
+static EARLYCON_RX: EarlyconRxCell = EarlyconRxCell(UnsafeCell::new(None));
 
-struct EarlyconSenderCell(UnsafeCell<Option<Sender>>);
+struct EarlyconTxCell(UnsafeCell<Option<EarlySerialTx>>);
+struct EarlyconRxCell(UnsafeCell<Option<EarlySerialRx>>);
 
-unsafe impl Sync for EarlyconSenderCell {}
+unsafe impl Sync for EarlyconTxCell {}
+unsafe impl Sync for EarlyconRxCell {}
 
-impl Con for EarlyconSenderCell {
+impl Con for EarlyconTxCell {
     fn write_bytes(&self, bytes: &[u8]) -> usize {
         unsafe {
-            if let Some(ref mut sender) = *self.0.get() {
-                sender.write_bytes(bytes)
+            if let Some(ref mut tx) = *self.0.get() {
+                let mut written = 0;
+                while written < bytes.len() {
+                    if !tx.poll().tx_ready() {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    let n = tx.submit_tx(&bytes[written..]);
+                    if n == 0 {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    written += n;
+                }
+                written
             } else {
                 // No sender available, simply return the length of bytes to indicate all bytes "written"
                 bytes.len()
@@ -203,13 +277,6 @@ impl Con for EarlyconSenderCell {
         }
     }
 }
-
-static EARLYCON_RECIEVER: EarlyconRecieverCell = EarlyconRecieverCell(UnsafeCell::new(None));
-
-#[allow(dead_code)]
-struct EarlyconRecieverCell(UnsafeCell<Option<Reciever>>);
-
-unsafe impl Sync for EarlyconRecieverCell {}
 
 pub fn set_earlycon_by_cmdline() -> Result<(), &'static str> {
     let config = crate::cmdline::earlycon().ok_or("No earlycon parameter found")?;
@@ -220,10 +287,13 @@ pub fn set_earlycon_by_cmdline() -> Result<(), &'static str> {
                 {
                     let base = config.base_addr.ok_or("missing io base address")? as u16;
                     let mut uart = some_serial::ns16550::Ns16550::new_port(base, 1_843_200);
-                    let tx = uart.take_tx().ok_or("failed to take io sender")?;
-                    let rx = uart.take_rx().ok_or("failed to take io receiver")?;
-                    set_earlycon_sender(tx);
-                    set_earlycon_reciever(rx);
+                    uart.open();
+                    let tx = uart.take_tx().ok_or("failed to take io tx queue")?;
+                    let rx = uart.take_rx().ok_or("failed to take io rx queue")?;
+                    set_earlycon_serial(
+                        EarlySerialTx::Ns16550Port(tx),
+                        EarlySerialRx::Ns16550Port(rx),
+                    );
                     false
                 }
                 #[cfg(not(target_arch = "x86_64"))]
@@ -259,11 +329,10 @@ fn set_pl011(config: &EarlyconConfig) -> Result<(), &'static str> {
         NonNull::new(_fixmap_io(base_addr)).ok_or("Invalid base address for pl011 earlycon")?;
 
     let mut serial = pl011::Pl011::new(base_addr, 0);
-    let tx = serial.take_tx().ok_or("no tx")?;
-    let rx = serial.take_rx().ok_or("no rx")?;
-
-    set_earlycon_sender(tx);
-    set_earlycon_reciever(rx);
+    serial.open();
+    let tx = serial.take_tx().ok_or("failed to take pl011 tx queue")?;
+    let rx = serial.take_rx().ok_or("failed to take pl011 rx queue")?;
+    set_earlycon_serial(EarlySerialTx::Pl011(tx), EarlySerialRx::Pl011(rx));
 
     Ok(())
 }
@@ -282,11 +351,13 @@ fn set_16550_mmio(config: &EarlyconConfig) -> Result<(), &'static str> {
     };
 
     let mut serial = ns16550::Ns16550::new_mmio(base_addr, 0, width);
-    let tx = serial.take_tx().ok_or("no tx")?;
-    let rx = serial.take_rx().ok_or("no rx")?;
-
-    set_earlycon_sender(tx);
-    set_earlycon_reciever(rx);
+    serial.open();
+    let tx = serial.take_tx().ok_or("failed to take ns16550 tx queue")?;
+    let rx = serial.take_rx().ok_or("failed to take ns16550 rx queue")?;
+    set_earlycon_serial(
+        EarlySerialTx::Ns16550Mmio(tx),
+        EarlySerialRx::Ns16550Mmio(rx),
+    );
 
     Ok(())
 }

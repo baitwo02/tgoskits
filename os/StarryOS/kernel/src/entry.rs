@@ -12,7 +12,7 @@ use starry_process::{Pid, Process};
 use crate::{
     file::FD_TABLE,
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
-    pseudofs::{self, dev::tty::N_TTY},
+    pseudofs::{self, dev::tty},
     task::{ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task, spawn_alarm_task},
     tracepoint::tracepoint_init,
 };
@@ -68,7 +68,7 @@ pub fn init(args: &[String], envs: &[String]) {
     let proc = Process::new_init(pid);
     proc.add_thread(pid);
 
-    N_TTY.bind_to(&proc).expect("Failed to bind ntty");
+    tty::bind_console_to(&proc).expect("Failed to bind console tty");
 
     let proc = ProcessData::new(
         proc,

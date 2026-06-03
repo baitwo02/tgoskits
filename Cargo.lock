@@ -7768,7 +7768,6 @@ version = "0.5.0"
 dependencies = [
  "ax-kspin",
  "bitflags 2.11.1",
- "enum_dispatch",
  "fdt-edit",
  "heapless 0.9.3",
  "log",

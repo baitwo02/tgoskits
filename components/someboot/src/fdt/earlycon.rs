@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use some_serial::*;
+use some_serial::{ns16550, pl011};
 
 use crate::{
     console::{DEBUG_BASE, DEBUG_IS_MMIO},
@@ -53,9 +53,10 @@ fn set_by_stdout() -> Option<()> {
                 serial.open();
                 let tx = serial.take_tx()?;
                 let rx = serial.take_rx()?;
-
-                crate::console::set_earlycon_sender(tx);
-                crate::console::set_earlycon_reciever(rx);
+                crate::console::set_earlycon_serial(
+                    crate::console::EarlySerialTx::Pl011(tx),
+                    crate::console::EarlySerialRx::Pl011(rx),
+                );
                 installed = true;
                 break;
             }
@@ -64,9 +65,10 @@ fn set_by_stdout() -> Option<()> {
                 serial.open();
                 let tx = serial.take_tx()?;
                 let rx = serial.take_rx()?;
-
-                crate::console::set_earlycon_sender(tx);
-                crate::console::set_earlycon_reciever(rx);
+                crate::console::set_earlycon_serial(
+                    crate::console::EarlySerialTx::Ns16550Mmio(tx),
+                    crate::console::EarlySerialRx::Ns16550Mmio(rx),
+                );
                 installed = true;
                 break;
             }

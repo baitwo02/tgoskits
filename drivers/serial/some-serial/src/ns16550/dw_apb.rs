@@ -2,10 +2,7 @@
 
 use rdif_serial::InterfaceRaw;
 
-use super::{
-    Config, DataBits, Kind, Ns16550, Ns16550IrqHandler, Ns16550Reciever, Ns16550Sender, Parity,
-    StopBits, registers::*,
-};
+use super::{Config, DataBits, Kind, Ns16550, Parity, StopBits, registers::*};
 
 /// Default UART source clock used by SG2002 / CV181x boards.
 pub const SG2002_UART_CLOCK: u32 = 25_000_000;
@@ -133,15 +130,9 @@ impl Ns16550<DwApb> {
         Ns16550 {
             base: DwApb::new(base),
             clock_freq,
-            irq: Some(Ns16550IrqHandler {
-                base: DwApb::new(base),
-            }),
-            tx: Some(crate::Sender::Ns16550DwApbSender(Ns16550Sender {
-                base: DwApb::new(base),
-            })),
-            rx: Some(crate::Reciever::Ns16550DwApbReciever(Ns16550Reciever {
-                base: DwApb::new(base),
-            })),
+            tx_taken: false,
+            rx_taken: false,
+            irq_taken: false,
         }
     }
 
@@ -187,29 +178,6 @@ impl Ns16550<DwApb> {
     /// Initializes the UART with an explicit source clock and baud rate.
     pub fn ns16550_init(&mut self, clk_hz: u32, baud: u32) {
         self.init_with_baud_clk(baud, clk_hz);
-    }
-
-    /// Writes one byte, blocking until the transmitter is empty.
-    pub fn putchar(&mut self, c: u8) {
-        while self.base.line_status() & UART_LSR_TEMT == 0 {
-            core::hint::spin_loop();
-        }
-        self.base.write_reg(UART_THR, c);
-    }
-
-    /// Reads one byte if data is ready.
-    pub fn getchar(&mut self) -> Option<u8> {
-        if self.base.line_status() & UART_LSR_DR != 0 {
-            Some(self.base.read_reg(UART_RBR))
-        } else {
-            None
-        }
-    }
-
-    /// Enables or disables receive-data interrupts.
-    pub fn set_ier(&mut self, enabled: bool) {
-        self.base
-            .write_reg(UART_IER, if enabled { UART_IER_RDI } else { 0 });
     }
 
     /// Reads the line status register.

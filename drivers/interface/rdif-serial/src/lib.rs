@@ -13,8 +13,8 @@ use bitflags::bitflags;
 pub use rdif_base::{DriverGeneric, KError};
 
 pub type BIrqHandler = Box<dyn TIrqHandler>;
-pub type BSender = Box<dyn TSender>;
-pub type BReciever = Box<dyn TReciever>;
+pub type BTxQueue = Box<dyn TTxQueue>;
+pub type BRxQueue = Box<dyn TRxQueue>;
 pub type BSerial = Box<dyn Interface>;
 
 impl DriverGeneric for Box<dyn Interface> {
@@ -111,7 +111,7 @@ pub enum Parity {
 
 bitflags! {
     /// 中断状态标志
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct InterruptMask: u32 {
         /// received data, including error data
         const RX_AVAILABLE = 0x01;
@@ -126,6 +126,32 @@ impl InterruptMask {
 
     pub fn tx_empty(&self) -> bool {
         self.contains(InterruptMask::TX_EMPTY)
+    }
+}
+
+bitflags! {
+    /// Stable serial events returned by poll and IRQ paths.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SerialEvent: u32 {
+        const RX_READY = 0x01;
+        const TX_READY = 0x02;
+        const RX_ERROR = 0x04;
+        const TX_ERROR = 0x08;
+        const OVERRUN = 0x10;
+    }
+}
+
+impl SerialEvent {
+    pub fn rx_ready(&self) -> bool {
+        self.contains(SerialEvent::RX_READY)
+    }
+
+    pub fn tx_ready(&self) -> bool {
+        self.contains(SerialEvent::TX_READY)
+    }
+
+    pub fn rx_error(&self) -> bool {
+        self.intersects(SerialEvent::RX_ERROR | SerialEvent::OVERRUN)
     }
 }
 
@@ -164,9 +190,9 @@ impl Config {
 }
 
 pub trait InterfaceRaw: Send + Any + 'static {
+    type TxQueue: TTxQueue;
+    type RxQueue: TRxQueue;
     type IrqHandler: TIrqHandler;
-    type Sender: TSender;
-    type Reciever: TReciever;
 
     fn name(&self) -> &str;
 
@@ -198,12 +224,13 @@ pub trait InterfaceRaw: Send + Any + 'static {
     /// 获取当前中断使能掩码
     fn get_irq_mask(&self) -> InterruptMask;
 
-    fn irq_handler(&mut self) -> Option<Self::IrqHandler>;
-    fn take_tx(&mut self) -> Option<Self::Sender>;
-    fn take_rx(&mut self) -> Option<Self::Reciever>;
+    fn take_tx(&mut self) -> Option<Self::TxQueue>;
+    fn take_rx(&mut self) -> Option<Self::RxQueue>;
+    fn take_irq_handler(&mut self) -> Option<Self::IrqHandler>;
 
-    fn set_tx(&mut self, tx: Self::Sender) -> Result<(), SetBackError>;
-    fn set_rx(&mut self, rx: Self::Reciever) -> Result<(), SetBackError>;
+    fn set_tx(&mut self, tx: Self::TxQueue) -> Result<(), SetBackError>;
+    fn set_rx(&mut self, rx: Self::RxQueue) -> Result<(), SetBackError>;
+    fn set_irq_handler(&mut self, irq: Self::IrqHandler) -> Result<(), SetBackError>;
 }
 
 #[derive(Clone, Copy)]
@@ -213,13 +240,16 @@ pub struct SetBackError {
 }
 
 impl SetBackError {
-    /// Create a new SetBackError
-    /// # Safety
     pub fn new(want: usize, actual: usize) -> Self {
-        Self {
-            want: want as _,
-            actual: actual as _,
-        }
+        Self { want, actual }
+    }
+
+    pub fn want(&self) -> usize {
+        self.want
+    }
+
+    pub fn actual(&self) -> usize {
+        self.actual
     }
 }
 
@@ -229,7 +259,7 @@ impl Debug for SetBackError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "Failed to set back, base address not eq  {:#x} != {:#x}",
+            "failed to restore serial handle: base address mismatch {:#x} != {:#x}",
             self.want, self.actual
         )
     }
@@ -242,9 +272,6 @@ impl Display for SetBackError {
 }
 
 pub trait Interface: DriverGeneric {
-    fn irq_handler(&mut self) -> Option<Box<dyn TIrqHandler>>;
-    fn take_tx(&mut self) -> Option<Box<dyn TSender>>;
-    fn take_rx(&mut self) -> Option<Box<dyn TReciever>>;
     /// Base address of the serial port
     fn base_addr(&self) -> usize;
 
@@ -256,57 +283,52 @@ pub trait Interface: DriverGeneric {
     fn parity(&self) -> Parity;
     fn clock_freq(&self) -> Option<NonZeroU32>;
 
+    fn open(&mut self);
+    fn close(&mut self);
+
     fn enable_loopback(&mut self);
     fn disable_loopback(&mut self);
     fn is_loopback_enabled(&self) -> bool;
 
-    fn enable_interrupts(&mut self, mask: InterruptMask);
-    fn disable_interrupts(&mut self, mask: InterruptMask);
-    fn get_enabled_interrupts(&self) -> InterruptMask;
+    fn set_irq_mask(&mut self, mask: InterruptMask);
+    fn get_irq_mask(&self) -> InterruptMask;
+
+    fn take_tx(&mut self) -> Option<BTxQueue>;
+    fn take_rx(&mut self) -> Option<BRxQueue>;
+    fn take_irq_handler(&mut self) -> Option<BIrqHandler>;
+
+    fn set_tx(&mut self, tx: BTxQueue) -> Result<(), SetBackError>;
+    fn set_rx(&mut self, rx: BRxQueue) -> Result<(), SetBackError>;
+    fn set_irq_handler(&mut self, irq: BIrqHandler) -> Result<(), SetBackError>;
+}
+
+pub trait TTxQueue: Send + 'static {
+    fn base_addr(&self) -> usize;
+    fn poll(&mut self) -> SerialEvent;
+    fn submit_tx(&mut self, bytes: &[u8]) -> usize;
+}
+
+pub trait TRxQueue: Send + 'static {
+    fn base_addr(&self) -> usize;
+    fn poll(&mut self) -> SerialEvent;
+    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError>;
 }
 
 pub trait TIrqHandler: Send + Sync + 'static {
-    fn clean_interrupt_status(&self) -> InterruptMask;
+    fn base_addr(&self) -> usize;
+    fn handle_irq(&self) -> SerialEvent;
 }
 
-pub trait TSender: Send + 'static {
-    fn write_byte(&mut self, byte: u8) -> bool;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> usize {
-        let mut written = 0;
-        for &byte in bytes.iter() {
-            if !self.write_byte(byte) {
-                break;
-            }
-            written += 1;
-        }
-        written
-    }
-}
+    #[test]
+    fn serial_event_reports_readiness_and_errors() {
+        let event = SerialEvent::RX_READY | SerialEvent::OVERRUN;
 
-pub trait TReciever: Send + 'static {
-    fn read_byte(&mut self) -> Option<Result<u8, TransferError>>;
-
-    /// Recv data into buf, return recv bytes. If return bytes is less than buf.len(), it means no more data.
-    fn read_bytes(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        let mut read_count = 0;
-        for byte in bytes.iter_mut() {
-            match self.read_byte() {
-                Some(Ok(b)) => {
-                    *byte = b;
-                }
-                Some(Err(e)) => {
-                    return Err(TransBytesError {
-                        bytes_transferred: read_count,
-                        kind: e,
-                    });
-                }
-                None => break,
-            }
-
-            read_count += 1;
-        }
-
-        Ok(read_count)
+        assert!(event.rx_ready());
+        assert!(!event.tx_ready());
+        assert!(event.rx_error());
     }
 }

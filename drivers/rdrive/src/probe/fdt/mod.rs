@@ -1,5 +1,6 @@
 use alloc::{
     collections::{BTreeMap, btree_set::BTreeSet},
+    string::String,
     vec::Vec,
 };
 use core::ptr::NonNull;
@@ -85,7 +86,7 @@ pub type FnOnProbe = fn(fdt: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<()
 pub struct System {
     fdt: Fdt,
     phandle_2_device_id: BTreeMap<Phandle, DeviceId>,
-    probed_names: Mutex<BTreeSet<&'static str>>,
+    probed_keys: Mutex<BTreeSet<ProbeKey>>,
 }
 
 unsafe impl Send for System {}
@@ -119,7 +120,7 @@ impl System {
         Ok(Self {
             fdt,
             phandle_2_device_id,
-            probed_names: Mutex::new(BTreeSet::new()),
+            probed_keys: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -170,7 +171,8 @@ impl System {
         let node_ls = self.get_fdt_match_nodes(register);
         let mut out = Vec::new();
         for node_info in node_ls {
-            if self.probed_names.lock().contains(node_info.name) {
+            let key = ProbeKey::new(node_info.name, &node_info.node);
+            if self.probed_keys.lock().contains(&key) {
                 continue;
             }
             let node = node_info.node;
@@ -201,13 +203,28 @@ impl System {
             );
 
             if res.is_ok() {
-                self.probed_names.lock().insert(node_info.name);
+                self.probed_keys.lock().insert(key);
             }
 
             out.push(res);
         }
 
         Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProbeKey {
+    driver_name: &'static str,
+    node_path: String,
+}
+
+impl ProbeKey {
+    fn new(driver_name: &'static str, node: &NodeType<'_>) -> Self {
+        Self {
+            driver_name,
+            node_path: node.path(),
+        }
     }
 }
 

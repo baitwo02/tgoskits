@@ -1,86 +1,41 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::{cell::UnsafeCell, num::NonZeroU32};
+use core::num::NonZeroU32;
 
-use heapless::Deque;
 use rdif_base::DriverGeneric;
 use spin::Mutex;
 
 use super::{
-    BIrqHandler, BReciever, BSender, BSerial, InterfaceRaw, InterruptMask, TransBytesError,
+    BIrqHandler, BRxQueue, BSerial, BTxQueue, InterfaceRaw, InterruptMask, SerialEvent,
+    SetBackError, TIrqHandler, TRxQueue, TTxQueue, TransBytesError,
 };
-use crate::TransferError;
 
 pub struct SerialDyn<T: InterfaceRaw> {
     inner: T,
-    tx: Arc<Mutex<Option<BSender>>>,
-
-    rx: Arc<Mutex<Option<Arc<SRecv>>>>,
-    irq_handler: Arc<Mutex<Option<BIrqHandler>>>,
-
-    rx_clone: Arc<SRecv>,
+    tx: Arc<Mutex<Option<BTxQueue>>>,
+    rx: Arc<Mutex<Option<BRxQueue>>>,
+    irq: Arc<Mutex<Option<BIrqHandler>>>,
 }
 
 impl<T: InterfaceRaw> SerialDyn<T> {
-    fn _new(mut inner: T) -> Self {
-        let tx = inner.take_tx().unwrap();
-        let tx: BSender = Box::new(tx);
-        let tx = Arc::new(Mutex::new(Some(tx)));
+    pub fn new_boxed(mut inner: T) -> BSerial {
+        let tx: BTxQueue = Box::new(inner.take_tx().expect("serial TX queue is unavailable"));
+        let rx: BRxQueue = Box::new(inner.take_rx().expect("serial RX queue is unavailable"));
+        let irq = inner
+            .take_irq_handler()
+            .map(|irq| Box::new(irq) as BIrqHandler);
 
-        let rx_inner = inner.take_rx().unwrap();
-        let rx_inner = SRecv(UnsafeCell::new(RecieverInner {
-            inner: Box::new(rx_inner),
-            fifo: RcvBuff(Deque::new()),
-        }));
-        let rx_inner = Arc::new(rx_inner);
-        let srcv = rx_inner.clone();
-        let rx = Arc::new(Mutex::new(Some(rx_inner)));
-
-        let irq_inner = inner.irq_handler().unwrap();
-
-        let irq_inner: BIrqHandler = Box::new(irq_inner);
-        let irq_handler = Arc::new(Mutex::new(Some(irq_inner)));
-        Self {
+        Box::new(Self {
             inner,
-            tx,
-            rx,
-            irq_handler,
-            rx_clone: srcv,
-        }
-    }
-
-    pub fn new_boxed(inner: T) -> BSerial {
-        Box::new(Self::_new(inner)) as _
+            tx: Arc::new(Mutex::new(Some(tx))),
+            rx: Arc::new(Mutex::new(Some(rx))),
+            irq: Arc::new(Mutex::new(irq)),
+        })
     }
 }
 
 impl<T: InterfaceRaw> super::Interface for SerialDyn<T> {
     fn base_addr(&self) -> usize {
         self.inner.base_addr()
-    }
-
-    fn take_tx(&mut self) -> Option<Box<dyn super::TSender>> {
-        let tx = self.tx.lock().take()?;
-        Some(Box::new(Sender {
-            c: self.tx.clone(),
-            inner: Some(tx),
-        }))
-    }
-
-    fn take_rx(&mut self) -> Option<Box<dyn super::TReciever>> {
-        let rx = self.rx.lock().take()?;
-        Some(Box::new(Reciever {
-            c: self.rx.clone(),
-            inner: Some(rx),
-        }))
-    }
-
-    fn irq_handler(&mut self) -> Option<Box<dyn super::TIrqHandler>> {
-        let h = self.irq_handler.lock().take()?;
-        Some(Box::new(IrqHandler {
-            c: self.irq_handler.clone(),
-            inner: Some(h),
-            rcv: self.rx_clone.clone(),
-        }))
     }
 
     fn set_config(&mut self, config: &crate::Config) -> Result<(), crate::ConfigError> {
@@ -107,6 +62,14 @@ impl<T: InterfaceRaw> super::Interface for SerialDyn<T> {
         self.inner.clock_freq()
     }
 
+    fn open(&mut self) {
+        self.inner.open();
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+
     fn enable_loopback(&mut self) {
         self.inner.enable_loopback()
     }
@@ -119,20 +82,60 @@ impl<T: InterfaceRaw> super::Interface for SerialDyn<T> {
         self.inner.is_loopback_enabled()
     }
 
-    fn enable_interrupts(&mut self, mask: InterruptMask) {
-        let mut val = self.inner.get_irq_mask();
-        val |= mask;
-        self.inner.set_irq_mask(val);
+    fn set_irq_mask(&mut self, mask: InterruptMask) {
+        self.inner.set_irq_mask(mask);
     }
 
-    fn disable_interrupts(&mut self, mask: InterruptMask) {
-        let mut val = self.inner.get_irq_mask();
-        val &= !mask;
-        self.inner.set_irq_mask(val);
-    }
-
-    fn get_enabled_interrupts(&self) -> InterruptMask {
+    fn get_irq_mask(&self) -> InterruptMask {
         self.inner.get_irq_mask()
+    }
+
+    fn take_tx(&mut self) -> Option<BTxQueue> {
+        let tx = self.tx.lock().take()?;
+        Some(Box::new(TxQueue {
+            slot: self.tx.clone(),
+            inner: Some(tx),
+        }))
+    }
+
+    fn take_rx(&mut self) -> Option<BRxQueue> {
+        let rx = self.rx.lock().take()?;
+        Some(Box::new(RxQueue {
+            slot: self.rx.clone(),
+            inner: Some(rx),
+        }))
+    }
+
+    fn take_irq_handler(&mut self) -> Option<BIrqHandler> {
+        let irq = self.irq.lock().take()?;
+        Some(Box::new(IrqHandler {
+            slot: self.irq.clone(),
+            inner: Some(irq),
+        }))
+    }
+
+    fn set_tx(&mut self, tx: BTxQueue) -> Result<(), SetBackError> {
+        if tx.base_addr() != self.base_addr() {
+            return Err(SetBackError::new(self.base_addr(), tx.base_addr()));
+        }
+        *self.tx.lock() = Some(tx);
+        Ok(())
+    }
+
+    fn set_rx(&mut self, rx: BRxQueue) -> Result<(), SetBackError> {
+        if rx.base_addr() != self.base_addr() {
+            return Err(SetBackError::new(self.base_addr(), rx.base_addr()));
+        }
+        *self.rx.lock() = Some(rx);
+        Ok(())
+    }
+
+    fn set_irq_handler(&mut self, irq: BIrqHandler) -> Result<(), SetBackError> {
+        if irq.base_addr() != self.base_addr() {
+            return Err(SetBackError::new(self.base_addr(), irq.base_addr()));
+        }
+        *self.irq.lock() = Some(irq);
+        Ok(())
     }
 }
 
@@ -150,152 +153,73 @@ impl<T: InterfaceRaw> DriverGeneric for SerialDyn<T> {
     }
 }
 
-pub struct Sender {
-    c: Arc<Mutex<Option<BSender>>>,
-    inner: Option<BSender>,
+pub struct TxQueue {
+    slot: Arc<Mutex<Option<BTxQueue>>>,
+    inner: Option<BTxQueue>,
 }
 
-impl Drop for Sender {
+impl Drop for TxQueue {
     fn drop(&mut self) {
-        let mut guard = self.c.lock();
-        guard.replace(self.inner.take().unwrap());
+        *self.slot.lock() = self.inner.take();
     }
 }
 
-impl super::TSender for Sender {
-    fn write_byte(&mut self, byte: u8) -> bool {
-        let s = self.inner.as_mut().unwrap();
-        s.write_byte(byte)
+impl TTxQueue for TxQueue {
+    fn base_addr(&self) -> usize {
+        self.inner.as_ref().unwrap().base_addr()
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> usize {
-        let s = self.inner.as_mut().unwrap();
-        s.write_bytes(bytes)
+    fn poll(&mut self) -> SerialEvent {
+        self.inner.as_mut().unwrap().poll()
     }
-}
 
-struct RecieverInner {
-    inner: BReciever,
-    fifo: RcvBuff,
-}
-
-pub struct Reciever {
-    c: Arc<Mutex<Option<Arc<SRecv>>>>,
-    inner: Option<Arc<SRecv>>,
-}
-
-impl Reciever {
-    fn inner(&self) -> &SRecv {
-        self.inner.as_ref().unwrap()
+    fn submit_tx(&mut self, bytes: &[u8]) -> usize {
+        self.inner.as_mut().unwrap().submit_tx(bytes)
     }
 }
 
-impl super::TReciever for Reciever {
-    fn read_byte(&mut self) -> Option<Result<u8, TransferError>> {
-        if let Some(b) = self.inner().fifo_pop() {
-            return Some(b);
-        }
-
-        self.inner().read_byte()
-    }
-
-    fn read_bytes(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        let recv = self.inner();
-        let mut n = 0;
-
-        // 先从 FIFO 读取尽可能多的数据
-        while n < bytes.len() {
-            match recv.fifo_pop() {
-                Some(Ok(b)) => {
-                    bytes[n] = b;
-                    n += 1;
-                }
-                Some(Err(e)) => {
-                    return Err(TransBytesError {
-                        bytes_transferred: n,
-                        kind: e,
-                    });
-                }
-                None => break,
-            }
-        }
-
-        // 如果已经填满则返回
-        if n == bytes.len() {
-            return Ok(n);
-        }
-
-        // FIFO 没有更多数据时，再批量从底层读取
-        match recv.read_bytes(&mut bytes[n..]) {
-            Ok(m) => Ok(n + m),
-            Err(e) => Err(TransBytesError {
-                bytes_transferred: n + e.bytes_transferred,
-                kind: e.kind,
-            }),
-        }
-    }
+pub struct RxQueue {
+    slot: Arc<Mutex<Option<BRxQueue>>>,
+    inner: Option<BRxQueue>,
 }
 
-impl Drop for Reciever {
+impl Drop for RxQueue {
     fn drop(&mut self) {
-        let mut guard = self.c.lock();
-        guard.replace(self.inner.take().unwrap());
+        *self.slot.lock() = self.inner.take();
+    }
+}
+
+impl TRxQueue for RxQueue {
+    fn base_addr(&self) -> usize {
+        self.inner.as_ref().unwrap().base_addr()
+    }
+
+    fn poll(&mut self) -> SerialEvent {
+        self.inner.as_mut().unwrap().poll()
+    }
+
+    fn submit_rx(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+        self.inner.as_mut().unwrap().submit_rx(bytes)
     }
 }
 
 pub struct IrqHandler {
-    c: Arc<Mutex<Option<BIrqHandler>>>,
+    slot: Arc<Mutex<Option<BIrqHandler>>>,
     inner: Option<BIrqHandler>,
-    rcv: Arc<SRecv>,
-}
-
-impl super::TIrqHandler for IrqHandler {
-    fn clean_interrupt_status(&self) -> InterruptMask {
-        let h = self.inner.as_ref().unwrap();
-        let status = h.clean_interrupt_status();
-        if status.contains(InterruptMask::RX_AVAILABLE) {
-            while let Some(b) = self.rcv.read_byte() {
-                self.rcv.fifo_push(b);
-            }
-        }
-
-        status
-    }
 }
 
 impl Drop for IrqHandler {
     fn drop(&mut self) {
-        let mut guard = self.c.lock();
-        guard.replace(self.inner.take().unwrap());
+        *self.slot.lock() = self.inner.take();
     }
 }
 
-#[repr(align(64))]
-struct RcvBuff(Deque<Result<u8, TransferError>, 64>);
-
-struct SRecv(UnsafeCell<RecieverInner>);
-
-unsafe impl Send for SRecv {}
-unsafe impl Sync for SRecv {}
-
-impl SRecv {
-    fn fifo_push(&self, byte: Result<u8, TransferError>) {
-        let inner = unsafe { &mut *self.0.get() };
-        let _ = inner.fifo.0.push_back(byte);
+impl TIrqHandler for IrqHandler {
+    fn base_addr(&self) -> usize {
+        self.inner.as_ref().unwrap().base_addr()
     }
 
-    fn fifo_pop(&self) -> Option<Result<u8, TransferError>> {
-        let inner = unsafe { &mut *self.0.get() };
-        inner.fifo.0.pop_front()
-    }
-
-    fn read_byte(&self) -> Option<Result<u8, TransferError>> {
-        let inner = unsafe { &mut *self.0.get() };
-        inner.inner.read_byte()
-    }
-
-    fn read_bytes(&self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        let inner = unsafe { &mut *self.0.get() };
-        inner.inner.read_bytes(bytes)
+    fn handle_irq(&self) -> SerialEvent {
+        self.inner.as_ref().unwrap().handle_irq()
     }
 }
