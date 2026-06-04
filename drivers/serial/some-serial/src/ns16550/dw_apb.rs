@@ -67,7 +67,12 @@ impl DwApb {
 
 impl Kind for DwApb {
     fn read_reg(&self, reg: u8) -> u8 {
-        (self.read_u32(reg as usize * REG_WIDTH) & 0xff) as u8
+        let value = (self.read_u32(reg as usize * REG_WIDTH) & 0xff) as u8;
+        if reg == UART_IIR && value & (UART_IIR_ID | UART_IIR_NO_INT) == UART_IIR_BUSY {
+            let _ = self.read_u32(UART_USR_OFFSET);
+            return UART_IIR_NO_INT;
+        }
+        value
     }
 
     fn write_reg(&self, reg: u8, val: u8) {
@@ -186,5 +191,49 @@ impl Ns16550<DwApb> {
     /// Reads the component parameter register.
     pub fn cpr(&self) -> u32 {
         self.base.cpr()
+    }
+
+    pub fn new_boxed(base: core::ptr::NonNull<u8>, clock_freq: u32) -> rdif_serial::BSerial {
+        let mut serial = Self::new_with_clock(base.as_ptr() as usize, clock_freq);
+        serial.open();
+        serial.base.write_reg(
+            UART_FCR,
+            UART_FCR_ENABLE_FIFO | UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT | UART_FCR_TRIGGER_1,
+        );
+        rdif_serial::SerialDyn::new_boxed(serial)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::boxed::Box;
+
+    use super::*;
+
+    #[test]
+    fn busy_detect_interrupt_is_cleared_by_reading_usr() {
+        let regs = Box::leak(Box::new([0u32; 0x100 / 4]));
+        regs[UART_IIR as usize] = UART_IIR_BUSY as u32;
+        regs[UART_USR_OFFSET / 4] = 0x1;
+
+        let backend = DwApb::new(regs.as_ptr() as usize);
+
+        assert_eq!(backend.read_reg(UART_IIR), UART_IIR_NO_INT);
+    }
+
+    #[test]
+    fn boxed_dw_apb_serial_enables_fifo_without_programming_baudrate() {
+        let regs = Box::leak(Box::new([0u32; 0x100 / 4]));
+        regs[UART_DLF_OFFSET / 4] = 0x33;
+
+        let base = core::ptr::NonNull::new(regs.as_mut_ptr().cast()).unwrap();
+        let serial = DwApbUart::new_boxed(base, SG2002_UART_CLOCK);
+
+        assert_eq!(
+            regs[UART_FCR as usize] as u8,
+            UART_FCR_ENABLE_FIFO | UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT | UART_FCR_TRIGGER_1
+        );
+        assert_eq!(regs[UART_DLF_OFFSET / 4], 0x33);
+        drop(serial);
     }
 }

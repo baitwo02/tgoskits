@@ -130,7 +130,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         tune_rk3588_sdmmc_sample_phase(&mut sd, reference_clock);
     }
 
-    let irq_num = decode_fdt_irq(&info.interrupts());
+    let irq_num = decode_fdt_irq(&info);
     let raw = SharedDriver::new(sd);
     let dev = SdBlockDevice {
         raw: Some(raw.clone()),

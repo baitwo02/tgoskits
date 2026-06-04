@@ -184,7 +184,7 @@ fn collect_resources(info: &FdtInfo<'_>, fdt: &Fdt) -> Result<DwcResources, OnPr
         .into_iter()
         .next()
         .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", info.node.name())))?;
-    let irq_num = decode_fdt_irq(&info.interrupts());
+    let irq_num = decode_fdt_irq(info);
     let (usb2_port, usbdp_port) = parse_phys(info.node.as_node())?;
     let usb2 = collect_usb2_phy(fdt, usb2_port)?;
     let usbdp = collect_usbdp_phy(fdt, usbdp_port)?;

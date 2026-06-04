@@ -290,18 +290,30 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
     let mmio_base = crate::mmio::iomap(base_reg.address as usize, mmio_size as usize)?;
 
     let node = info.node.as_node();
-    let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(24_000_000);
     let reg_width = prop_u32(node, "reg-io-width").unwrap_or(1) as usize;
+    let reg_shift = prop_u32(node, "reg-shift").map(|shift| 1usize << shift);
+    let ns16550_width = reg_shift.unwrap_or(reg_width);
     let mut serial: Option<BSerial> = None;
     for compatible in node.compatibles() {
         if compatible == "arm,pl011" {
+            let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(24_000_000);
             serial = Some(pl011::Pl011::new_boxed(mmio_base, clock_freq));
             break;
         }
 
-        if matches!(compatible, "snps,dw-apb-uart" | "ns16550a" | "ns16550") {
+        if compatible == "snps,dw-apb-uart" {
+            let clock_freq =
+                prop_u32(node, "clock-frequency").unwrap_or(ns16550::dw_apb::SG2002_UART_CLOCK);
+            serial = Some(ns16550::DwApbUart::new_boxed(mmio_base, clock_freq));
+            break;
+        }
+
+        if matches!(compatible, "ns16550a" | "ns16550") {
+            let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(24_000_000);
             serial = Some(ns16550::Ns16550::new_mmio_boxed(
-                mmio_base, clock_freq, reg_width,
+                mmio_base,
+                clock_freq,
+                ns16550_width,
             ));
             break;
         }
@@ -354,7 +366,7 @@ fn probe_rockchip_fiq(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(),
             mapped_base: base,
             baudrate: serial.baudrate(),
             irq_num: if fdt_config.config.irq_mode_enabled {
-                decode_fdt_irq(&info.interrupts())
+                crate::fdt_irq::decode_fdt_irq(&info)
             } else {
                 None
             },
@@ -378,7 +390,7 @@ fn serial_device_info(
         paddr: base_reg.address as usize,
         mapped_base,
         baudrate,
-        irq_num: decode_fdt_irq(&info.interrupts()),
+        irq_num: crate::fdt_irq::decode_fdt_irq(info),
     }
 }
 
@@ -394,23 +406,6 @@ fn serial_alias_index(fdt: &Fdt, node_path: &str) -> Option<usize> {
             (path == node_path).then_some(index)
         })
         .next()
-}
-
-pub fn decode_fdt_irq(interrupts: &[rdrive::probe::fdt::InterruptRef]) -> Option<usize> {
-    let interrupt = interrupts.first()?;
-    decode_irq_cells(&interrupt.specifier)
-}
-
-fn decode_irq_cells(specifier: &[u32]) -> Option<usize> {
-    match specifier {
-        [irq] => Some(*irq as usize),
-        [kind, irq, ..] => match *kind {
-            0 => Some(*irq as usize + 32),
-            1 => Some(*irq as usize + 16),
-            _ => Some(*irq as usize),
-        },
-        _ => None,
-    }
 }
 
 fn prop_u32(node: &fdt_edit::Node, name: &str) -> Option<u32> {
@@ -551,15 +546,6 @@ mod tests {
         assert_eq!(serial_alias_index(&fdt, "/soc/uart@1000"), Some(0));
         assert_eq!(serial_alias_index(&fdt, "/soc/uart@2000"), Some(2));
         assert_eq!(serial_alias_index(&fdt, "/soc/uart@3000"), None);
-    }
-
-    #[test]
-    fn decodes_common_fdt_irq_cell_shapes() {
-        assert_eq!(decode_irq_cells(&[7]), Some(7));
-        assert_eq!(decode_irq_cells(&[0, 42, 4]), Some(74));
-        assert_eq!(decode_irq_cells(&[1, 3, 4]), Some(19));
-        assert_eq!(decode_irq_cells(&[9, 11, 4]), Some(11));
-        assert_eq!(decode_irq_cells(&[]), None);
     }
 
     fn minimal_serial_alias_fdt() -> Fdt {

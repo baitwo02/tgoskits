@@ -82,7 +82,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         card_info.ext_csd.is_some()
     );
 
-    let irq_num = decode_fdt_irq(&info.interrupts());
+    let irq_num = decode_fdt_irq(&info);
     let raw = SharedDriver::new(card);
     let dev = MciBlockDevice {
         raw: Some(raw),

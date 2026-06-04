@@ -4,6 +4,7 @@ use alloc::{
 };
 
 use ax_fs::FS_CONTEXT;
+use ax_kernel_guard::NoPreemptIrqSave;
 use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_sync::Mutex;
 use ax_task::{AxTaskExt, spawn_task};
@@ -88,8 +89,13 @@ pub fn init(args: &[String], envs: &[String]) {
     let thr = Thread::new(pid, proc, None);
     *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
-    let task = spawn_task(task);
-    add_task_to_table(&task);
+    let task = {
+        let _guard = NoPreemptIrqSave::new();
+        let task = spawn_task(task);
+        add_task_to_table(&task);
+        tty::arm_console_irq();
+        task
+    };
 
     // TODO: wait for all processes to finish
     let exit_code = task.join();

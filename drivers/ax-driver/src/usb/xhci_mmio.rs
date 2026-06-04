@@ -27,7 +27,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
 
     let mmio_size = base_reg.size.unwrap_or(0x1000) as usize;
     let mmio = crate::mmio::iomap(base_reg.address as usize, mmio_size)?;
-    let irq_num = decode_fdt_irq(&info.interrupts());
+    let irq_num = decode_fdt_irq(&info);
 
     let host = crab_usb::USBHost::new_xhci(mmio, usb_kernel()).map_err(|err| {
         OnProbeError::other(format!(

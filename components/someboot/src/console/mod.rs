@@ -204,6 +204,7 @@ pub fn read_byte() -> Option<u8> {
             let mut byte = [0];
             match serial.try_read(&mut byte) {
                 Ok(1) => Some(byte[0]),
+                Err(err) if err.bytes_transferred == 1 => Some(byte[0]),
                 _ => None,
             }
         } else {

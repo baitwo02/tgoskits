@@ -385,7 +385,6 @@ impl Pl011 {
 
     pub fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
         let mut count = 0;
-        let mut overrun_data = None;
         for byte in bytes.iter_mut() {
             if !self.pending(SerialDirection::Input) {
                 break;
@@ -395,8 +394,12 @@ impl Pl011 {
                     *byte = b;
                 }
                 Some(Err(TransferError::Overrun(b))) => {
-                    overrun_data = Some(b);
                     *byte = b;
+                    count += 1;
+                    return Err(TransBytesError {
+                        bytes_transferred: count,
+                        kind: TransferError::Overrun(b),
+                    });
                 }
                 Some(Err(e)) => {
                     return Err(TransBytesError {
@@ -404,15 +407,7 @@ impl Pl011 {
                         kind: e,
                     });
                 }
-                None => {
-                    if let Some(data) = overrun_data {
-                        return Err(TransBytesError {
-                            bytes_transferred: count.saturating_sub(1),
-                            kind: TransferError::Overrun(data),
-                        });
-                    }
-                    break;
-                }
+                None => break,
             }
             count += 1;
         }
@@ -657,8 +652,9 @@ impl Pl011SharedState {
         }
     }
 
-    fn take_event(&self) -> SerialEvent {
-        SerialEvent::from_bits_retain(self.event_bits.swap(0, Ordering::AcqRel))
+    fn take_event(&self, mask: SerialEvent) -> SerialEvent {
+        let old = self.event_bits.fetch_and(!mask.bits(), Ordering::AcqRel);
+        SerialEvent::from_bits_retain(old) & mask
     }
 
     fn peek_event(&self) -> SerialEvent {
@@ -693,6 +689,7 @@ impl TTxQueue for Pl011TxQueue {
     }
 
     fn try_write(&mut self, bytes: &[u8]) -> usize {
+        let _ = self.shared.take_event(SerialEvent::TX_READY);
         let mut written = 0;
         for &byte in bytes {
             if self.registers().uartfr.is_set(UARTFR::TXFF) {
@@ -768,9 +765,10 @@ impl TRxQueue for Pl011RxQueue {
     }
 
     fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
-        let _ = self.shared.take_event();
+        let _ = self
+            .shared
+            .take_event(SerialEvent::RX_READY | SerialEvent::RX_ERROR | SerialEvent::OVERRUN);
         let mut count = 0;
-        let mut overrun_data = None;
         for byte in bytes.iter_mut() {
             if self.registers().uartfr.is_set(UARTFR::RXFE) {
                 break;
@@ -780,8 +778,12 @@ impl TRxQueue for Pl011RxQueue {
                     *byte = b;
                 }
                 Some(Err(TransferError::Overrun(b))) => {
-                    overrun_data = Some(b);
                     *byte = b;
+                    count += 1;
+                    return Err(TransBytesError {
+                        bytes_transferred: count,
+                        kind: TransferError::Overrun(b),
+                    });
                 }
                 Some(Err(e)) => {
                     return Err(TransBytesError {
@@ -789,15 +791,7 @@ impl TRxQueue for Pl011RxQueue {
                         kind: e,
                     });
                 }
-                None => {
-                    if let Some(data) = overrun_data {
-                        return Err(TransBytesError {
-                            bytes_transferred: count.saturating_sub(1),
-                            kind: TransferError::Overrun(data),
-                        });
-                    }
-                    break;
-                }
+                None => break,
             }
             count += 1;
         }
@@ -887,3 +881,49 @@ impl Pl011 {
 }
 
 // ModemStatus 现在在 lib.rs 中定义，这里只是导出
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+
+    use super::*;
+
+    fn pl011_with_overrun_data() -> (alloc::boxed::Box<Pl011Registers>, Pl011) {
+        let mut regs = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<Pl011Registers>() });
+        regs.uartdr
+            .set((UARTDR::DATA.val(0xab) + UARTDR::OE::SET).into());
+        let ptr = NonNull::from(regs.as_mut()).cast::<u8>();
+        let uart = Pl011::new(ptr, 24_000_000);
+        (regs, uart)
+    }
+
+    #[test]
+    fn raw_rx_reports_overrun_instead_of_swallowing_it() {
+        let (_regs, mut uart) = pl011_with_overrun_data();
+
+        let mut buf = [0];
+        let err = uart
+            .try_read(&mut buf)
+            .expect_err("overrun must be reported to the caller");
+
+        assert_eq!(buf[0], 0xab);
+        assert_eq!(err.bytes_transferred, 1);
+        assert_eq!(err.kind, TransferError::Overrun(0xab));
+    }
+
+    #[test]
+    fn split_rx_reports_overrun_instead_of_swallowing_it() {
+        let (_regs, uart) = pl011_with_overrun_data();
+        let shared = uart.new_shared_state();
+        let mut rx = uart.rx_queue(&shared);
+
+        let mut buf = [0];
+        let err = rx
+            .try_read(&mut buf)
+            .expect_err("overrun must be reported to the caller");
+
+        assert_eq!(buf[0], 0xab);
+        assert_eq!(err.bytes_transferred, 1);
+        assert_eq!(err.kind, TransferError::Overrun(0xab));
+    }
+}

@@ -209,21 +209,8 @@ pub(crate) fn align_up_4k(size: usize) -> usize {
     (size + MASK) & !MASK
 }
 
-pub fn decode_fdt_irq(interrupts: &[rdrive::probe::fdt::InterruptRef]) -> Option<usize> {
-    let interrupt = interrupts.first()?;
-    decode_irq_cells(&interrupt.specifier)
-}
-
-fn decode_irq_cells(specifier: &[u32]) -> Option<usize> {
-    match specifier {
-        [irq] => Some(*irq as usize),
-        [kind, irq, ..] => match *kind {
-            0 => Some(*irq as usize + 32),
-            1 => Some(*irq as usize + 16),
-            _ => Some(*irq as usize),
-        },
-        _ => None,
-    }
+pub fn decode_fdt_irq(info: &rdrive::register::FdtInfo<'_>) -> Option<usize> {
+    crate::fdt_irq::decode_fdt_irq(info)
 }
 
 #[cfg(all(feature = "xhci-pci", target_os = "none"))]

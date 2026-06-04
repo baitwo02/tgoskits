@@ -44,6 +44,8 @@ crate::model_register!(
 );
 
 pub mod error;
+#[cfg(any(feature = "serial", feature = "block", feature = "usb"))]
+mod fdt_irq;
 pub mod mmio;
 
 #[cfg(feature = "block")]

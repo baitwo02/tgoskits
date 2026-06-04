@@ -31,7 +31,9 @@ pub use self::{
     ptm::Ptmx,
     pts::PtsDir,
     pty::PtyDriver,
-    serial::{SerialTtyDriver, bind_console_to, console_device, serial_tty_entries},
+    serial::{
+        SerialTtyDriver, arm_console_irq, bind_console_to, console_device, serial_tty_entries,
+    },
 };
 use crate::{
     pseudofs::DeviceOps,
