@@ -30,7 +30,7 @@ struct PendingNeighbor {
 }
 
 struct EthernetIrqState {
-    irq_num: Option<usize>,
+    irq_source: Option<ax_hal::irq::IrqSource>,
     driver: SpinNoIrq<Box<dyn EthernetDriver>>,
     poll_ready: PollSet,
     irq_handle: spin::Once<ax_hal::irq::IrqHandle>,
@@ -76,9 +76,9 @@ impl EthernetDevice {
     const ARP_REQUEST_RETRY: Duration = Duration::from_secs(1);
 
     pub fn new(name: String, inner: Box<dyn EthernetDriver>, ip: Option<Ipv4Cidr>) -> Self {
-        let irq_num = inner.irq_num();
+        let irq_source = inner.irq_source().cloned();
         let mut inner = Arc::new(EthernetIrqState {
-            irq_num,
+            irq_source,
             driver: SpinNoIrq::new(inner),
             poll_ready: PollSet::new(),
             irq_handle: spin::Once::new(),
@@ -91,14 +91,26 @@ impl EthernetDevice {
                     * ETHERNET_MAX_PENDING_PACKETS
             ],
         );
-        if let Some(irq) = inner.irq_num {
+        if let Some(irq_source) = inner.irq_source.clone() {
             let data = NonNull::from(Arc::get_mut(&mut inner).expect("new Arc is unique")).cast();
-            match ax_hal::irq::request_shared_irq(irq, handle_ethernet_irq, data) {
+            match ax_hal::irq::request_shared_irq_source(
+                irq_source.clone(),
+                handle_ethernet_irq,
+                data,
+            ) {
                 Ok(handle) => {
                     inner.irq_handle.call_once(|| handle);
+                    info!(
+                        "registered ethernet irq source {:?} as irq {}",
+                        irq_source,
+                        handle.irq().0
+                    );
                 }
                 Err(err) => {
-                    warn!("failed to register ethernet irq handler for irq {irq}: {err:?}");
+                    warn!(
+                        "failed to register ethernet irq handler for source {:?}: {err:?}",
+                        irq_source
+                    );
                 }
             }
         }
@@ -503,7 +515,7 @@ impl Device for EthernetDevice {
     }
 
     fn register_waker(&self, waker: &Waker) {
-        if self.inner.irq_num.is_some() {
+        if self.inner.irq_source.is_some() {
             self.inner.poll_ready.register(waker);
         }
     }

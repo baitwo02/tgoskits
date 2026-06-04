@@ -8,7 +8,7 @@ use core::{
 
 use ax_kernel_guard::NoPreemptIrqSave;
 use rd_net::{DmaBuffer, Event, IRxQueue, ITxQueue, Interface, NetError, QueueConfig};
-use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError};
+use rdrive::{DriverGeneric, IrqSource, PlatformDevice, probe::OnProbeError};
 #[cfg(any(plat_static, plat_dyn))]
 use virtio_drivers::transport::DeviceType;
 use virtio_drivers::{Error as VirtIoError, device::net::VirtIONetRaw, transport::Transport};
@@ -325,18 +325,18 @@ pub fn register_transport<T: Transport + 'static>(
 pub fn register_transport_with_irq<T: Transport + 'static>(
     plat_dev: PlatformDevice,
     transport: T,
-    irq_num: Option<usize>,
+    irq_source: Option<IrqSource>,
 ) -> Result<(), OnProbeError> {
     let mut net = VirtIoNetDevice::new(transport).map_err(|err| {
         OnProbeError::other(format!(
             "failed to initialize static VirtIO net device: {err:?}"
         ))
     })?;
-    if irq_num.is_some() {
+    if irq_source.is_some() {
         net.enable_irq();
     }
-    plat_dev.register_net("virtio-net", net, irq_num);
-    log::info!("registered virtio network device irq={irq_num:?}");
+    plat_dev.register_net("virtio-net", net, irq_source.clone());
+    log::info!("registered virtio network device irq={irq_source:?}");
     Ok(())
 }
 

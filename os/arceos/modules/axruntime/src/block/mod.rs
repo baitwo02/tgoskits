@@ -34,7 +34,7 @@ pub(crate) mod volume;
 ))]
 struct BlockIrqState {
     handler: ax_driver::block::BlockIrqHandler,
-    irq_handle: spin::Once<axklib::irq::IrqHandle>,
+    irq_handle: spin::Once<ax_hal::irq::IrqHandle>,
 }
 
 #[cfg(all(
@@ -77,12 +77,12 @@ pub(crate) type BlockIrqRegistration = ();
     )
 ))]
 unsafe fn handle_block_irq(
-    _ctx: axklib::irq::IrqContext,
+    _ctx: ax_hal::irq::IrqContext,
     data: NonNull<()>,
-) -> axklib::irq::IrqReturn {
+) -> ax_hal::irq::IrqReturn {
     let state = unsafe { data.cast::<BlockIrqState>().as_ref() };
     let _event = state.handler.handle();
-    axklib::irq::IrqReturn::Handled
+    ax_hal::irq::IrqReturn::Handled
 }
 
 #[cfg(all(
@@ -99,7 +99,7 @@ unsafe fn handle_block_irq(
 impl Drop for BlockIrqState {
     fn drop(&mut self) {
         if let Some(handle) = self.irq_handle.get().copied()
-            && let Err(err) = axklib::irq::free(handle)
+            && let Err(err) = ax_hal::irq::free_irq(handle)
         {
             warn!("failed to free block irq handler: {err:?}");
         }
@@ -161,20 +161,23 @@ pub(crate) fn register_irq_handler(
     #[cfg(feature = "irq")]
     {
         let name = alloc::string::String::from(block.name());
-        let (irq_num, handler) = block.take_irq_handler()?;
+        let (irq_source, handler) = block.take_irq_handler()?;
         let mut state = alloc::boxed::Box::new(BlockIrqState {
             handler,
             irq_handle: spin::Once::new(),
         });
         let data = NonNull::from(state.as_mut()).cast();
-        match axklib::irq::request_shared(irq_num, handle_block_irq, data) {
+        match ax_hal::irq::request_shared_irq_source(irq_source.clone(), handle_block_irq, data) {
             Ok(handle) => {
                 state.irq_handle.call_once(|| handle);
                 block.enable_irq();
                 Some(BlockIrqRegistration { _state: state })
             }
             Err(err) => {
-                warn!("failed to register block irq handler for {name} irq {irq_num}: {err:?}");
+                warn!(
+                    "failed to register block irq handler for {name} source {:?}: {err:?}",
+                    irq_source
+                );
                 block.disable_irq();
                 None
             }

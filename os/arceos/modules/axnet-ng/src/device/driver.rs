@@ -1,5 +1,6 @@
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
+use ax_hal::irq::IrqSource;
 use ax_sync::spin::SpinNoIrq;
 use rd_net::{Net, NetError, RxQueue, TxQueue};
 
@@ -69,7 +70,7 @@ pub trait NetTxBuffer: Send {
 
 pub trait EthernetDriver: Send + Sync {
     fn device_name(&self) -> &str;
-    fn irq_num(&self) -> Option<usize>;
+    fn irq_source(&self) -> Option<&IrqSource>;
     fn mac_address(&self) -> [u8; 6];
     fn alloc_tx_buffer(&mut self, size: usize) -> NetDeviceResult<Box<dyn NetTxBuffer>>;
     fn recycle_tx_buffers(&mut self) -> NetDeviceResult;
@@ -126,7 +127,7 @@ struct RdNetState {
 pub struct RdNetDriver {
     name: String,
     mac: [u8; 6],
-    irq_num: Option<usize>,
+    irq_source: Option<IrqSource>,
     irq_handler: Option<rd_net::IrqHandler>,
     state: SpinNoIrq<RdNetState>,
 }
@@ -135,17 +136,17 @@ impl RdNetDriver {
     pub fn new(
         name: impl Into<String>,
         mut net: Net,
-        irq_num: Option<usize>,
+        irq_source: Option<IrqSource>,
     ) -> NetDeviceResult<Self> {
         let mac = net.mac_address();
         let tx_queue = net.create_tx_queue().map_err(map_net_error)?;
         let rx_queue = net.create_rx_queue().map_err(map_net_error)?;
-        let irq_handler = irq_num.map(|_| net.irq_handler());
+        let irq_handler = irq_source.as_ref().map(|_| net.irq_handler());
 
         Ok(Self {
             name: name.into(),
             mac,
-            irq_num,
+            irq_source,
             irq_handler,
             state: SpinNoIrq::new(RdNetState {
                 tx_queue,
@@ -173,8 +174,8 @@ impl EthernetDriver for RdNetDriver {
         &self.name
     }
 
-    fn irq_num(&self) -> Option<usize> {
-        self.irq_num
+    fn irq_source(&self) -> Option<&IrqSource> {
+        self.irq_source.as_ref()
     }
 
     fn mac_address(&self) -> [u8; 6] {

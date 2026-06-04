@@ -17,12 +17,14 @@ static USBFS_IRQ_REGISTRY: LazyInit<UsbIrqRegistry> = LazyInit::new();
 
 pub(super) struct PendingUsbIrqSlot {
     pub(super) irq_num: usize,
+    pub(super) irq_source: ax_runtime::hal::irq::IrqSource,
     pub(super) device_id: RDriveDeviceId,
     pub(super) bus_num: u8,
     pub(super) handler: EventHandler,
 }
 
 pub(super) struct UsbIrqSlot {
+    irq_source: ax_runtime::hal::irq::IrqSource,
     device_id: RDriveDeviceId,
     bus_num: u8,
     handler: EventHandler,
@@ -54,6 +56,7 @@ impl UsbIrqRegistry {
                 continue;
             }
             slots[slot.irq_num] = Some(UsbIrqSlot {
+                irq_source: slot.irq_source,
                 device_id: slot.device_id,
                 bus_num: slot.bus_num,
                 handler: slot.handler,
@@ -90,21 +93,20 @@ pub(super) fn init_globals(manager: Arc<UsbFsManager>, pending_slots: Vec<Pendin
 
     if let Some(registry) = USBFS_IRQ_REGISTRY.get() {
         for irq_num in registry.iter_irqs() {
-            if let Some(slot) = registry.slot(irq_num) {
-                info!(
-                    "usbfs: registering IRQ callback for IRQ {} (bus {}, host {:?})",
-                    irq_num, slot.bus_num, slot.device_id
-                );
-            }
-            match ax_runtime::hal::irq::request_shared_irq(
-                irq_num,
+            let Some(slot) = registry.slot(irq_num) else {
+                continue;
+            };
+            info!(
+                "usbfs: registering IRQ callback for IRQ {} (bus {}, host {:?})",
+                irq_num, slot.bus_num, slot.device_id
+            );
+            match ax_runtime::hal::irq::request_shared_irq_source(
+                slot.irq_source.clone(),
                 usbfs_raw_irq_handler,
                 NonNull::dangling(),
             ) {
                 Ok(handle) => {
-                    if let Some(slot) = registry.slot(irq_num) {
-                        *slot.handle.lock() = Some(handle);
-                    }
+                    *slot.handle.lock() = Some(handle);
                 }
                 Err(err) => {
                     warn!("usbfs: failed to register IRQ callback for IRQ {irq_num}: {err:?}");

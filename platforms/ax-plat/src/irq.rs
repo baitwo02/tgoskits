@@ -1,5 +1,6 @@
 //! Interrupt request (IRQ) handling.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ax_kernel_guard::BaseGuard;
@@ -7,7 +8,8 @@ pub use irq_framework::{
     AutoEnable, CpuId, CpuMask, IrqContext, IrqError, IrqHandle, IrqNumber, IrqOps, IrqOutcome,
     IrqRequest, IrqReturn, IrqScope, IrqStatus, RawIrqHandler, Registry, ShareMode,
 };
-use spin::Once;
+pub use rdrive::{FdtIrqSource, IrqSource};
+use spin::{Mutex, Once};
 
 /// Raw synchronous cross-CPU call used by the IRQ registry.
 pub type RunOnCpuSync = unsafe fn(usize, unsafe fn(*mut ()), *mut ()) -> Result<(), IrqError>;
@@ -94,6 +96,8 @@ impl IrqOps for PlatIrqOps {
 
 static IRQ_REGISTRY: Once<Registry<PlatIrqOps>> = Once::new();
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
+static IRQ_SOURCE_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
+static IRQ_SOURCE_CACHE: Mutex<Vec<IrqSourceCacheEntry>> = Mutex::new(Vec::new());
 
 #[ax_percpu::def_percpu]
 static IN_IRQ_CONTEXT: bool = false;
@@ -102,9 +106,70 @@ fn registry() -> &'static Registry<PlatIrqOps> {
     IRQ_REGISTRY.call_once(|| Registry::new(PlatIrqOps))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IrqSourceCacheKey {
+    interrupt_parent: rdrive::DeviceId,
+    specifier: Vec<u32>,
+}
+
+impl From<&FdtIrqSource> for IrqSourceCacheKey {
+    fn from(source: &FdtIrqSource) -> Self {
+        Self {
+            interrupt_parent: source.interrupt_parent,
+            specifier: source.specifier.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IrqSourceCacheEntry {
+    key: IrqSourceCacheKey,
+    irq: usize,
+}
+
+/// Resolves an IRQ source into a platform IRQ number.
+pub fn resolve_irq_source(source: &IrqSource) -> Result<usize, IrqError> {
+    match source {
+        IrqSource::Number(irq) => Ok(*irq),
+        IrqSource::Fdt(source) => resolve_fdt_irq_source(source),
+    }
+}
+
+fn resolve_fdt_irq_source(source: &FdtIrqSource) -> Result<usize, IrqError> {
+    let _resolve_guard = IRQ_SOURCE_RESOLVE_LOCK.lock();
+    let key = IrqSourceCacheKey::from(source);
+    if let Some(irq) = IRQ_SOURCE_CACHE
+        .lock()
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.irq)
+    {
+        return Ok(irq);
+    }
+
+    let intc = rdrive::get::<rdif_intc::Intc>(source.interrupt_parent)
+        .map_err(|_| IrqError::Controller)?;
+    let irq: usize = intc
+        .lock()
+        .map_err(|_| IrqError::Controller)?
+        .setup_irq_by_fdt(&source.specifier)
+        .into();
+
+    IRQ_SOURCE_CACHE
+        .lock()
+        .push(IrqSourceCacheEntry { key, irq });
+    Ok(irq)
+}
+
 /// Requests an IRQ action through the dynamic IRQ framework.
 pub fn request_irq(irq: usize, request: IrqRequest) -> Result<IrqHandle, IrqError> {
     registry().request(IrqNumber(irq), request)
+}
+
+/// Requests an IRQ action from an IRQ source.
+pub fn request_irq_source(source: IrqSource, request: IrqRequest) -> Result<IrqHandle, IrqError> {
+    let irq = resolve_irq_source(&source)?;
+    request_irq(irq, request)
 }
 
 /// Requests a shared IRQ action.
@@ -119,6 +184,18 @@ pub fn request_shared_irq(
     )
 }
 
+/// Requests a shared IRQ action from an IRQ source.
+pub fn request_shared_irq_source(
+    source: IrqSource,
+    handler: RawIrqHandler,
+    data: core::ptr::NonNull<()>,
+) -> Result<IrqHandle, IrqError> {
+    request_irq_source(
+        source,
+        IrqRequest::new(handler, data).share_mode(ShareMode::Shared),
+    )
+}
+
 /// Requests a per-CPU IRQ action.
 pub fn request_percpu_irq(
     irq: usize,
@@ -128,6 +205,19 @@ pub fn request_percpu_irq(
 ) -> Result<IrqHandle, IrqError> {
     request_irq(
         irq,
+        IrqRequest::new(handler, data).scope(IrqScope::PerCpu { cpus }),
+    )
+}
+
+/// Requests a per-CPU IRQ action from an IRQ source.
+pub fn request_percpu_irq_source(
+    source: IrqSource,
+    cpus: CpuMask,
+    handler: RawIrqHandler,
+    data: core::ptr::NonNull<()>,
+) -> Result<IrqHandle, IrqError> {
+    request_irq_source(
+        source,
         IrqRequest::new(handler, data).scope(IrqScope::PerCpu { cpus }),
     )
 }
@@ -214,4 +304,41 @@ pub trait IrqIf {
 
     /// Sends an inter-processor interrupt (IPI) to the specified target CPU or all CPUs.
     fn send_ipi(irq_num: usize, target: IpiTarget);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_irq_source_resolves_without_controller() {
+        assert_eq!(resolve_irq_source(&IrqSource::Number(7)), Ok(7));
+    }
+
+    #[test]
+    fn source_cache_key_ignores_log_metadata() {
+        let first = FdtIrqSource::new(
+            rdrive::DeviceId::from(1),
+            rdrive::Phandle::from(2),
+            2,
+            vec![44, 4],
+            Some(alloc::string::String::from("rx")),
+            Some(alloc::string::String::from("/serial@04140000")),
+        );
+        let second = FdtIrqSource::new(
+            rdrive::DeviceId::from(1),
+            rdrive::Phandle::from(2),
+            2,
+            vec![44, 4],
+            Some(alloc::string::String::from("tx")),
+            Some(alloc::string::String::from("/uart0")),
+        );
+        let entry = IrqSourceCacheEntry {
+            key: IrqSourceCacheKey::from(&first),
+            irq: 44,
+        };
+
+        assert_eq!(entry.key, IrqSourceCacheKey::from(&second));
+        assert_eq!(entry.irq, 44);
+    }
 }

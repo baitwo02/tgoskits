@@ -15,6 +15,7 @@ mod descriptor;
 pub mod driver;
 pub mod error;
 mod id;
+pub mod irq;
 mod lock;
 mod manager;
 mod osal;
@@ -24,6 +25,9 @@ pub mod register;
 
 pub use descriptor::*;
 pub use driver::PlatformDevice;
+pub use irq::{
+    FdtIrqSource, IrqSource, fdt_irq_source, first_fdt_irq_source, named_fdt_irq_source,
+};
 pub use lock::*;
 pub use manager::*;
 pub use osal::*;

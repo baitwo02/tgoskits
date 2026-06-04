@@ -1329,6 +1329,7 @@ dependencies = [
  "bitflags 2.11.1",
  "const-str",
  "irq-framework",
+ "rdif-intc",
  "rdrive",
  "spin 0.12.0",
 ]

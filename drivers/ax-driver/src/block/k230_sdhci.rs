@@ -31,7 +31,7 @@ use sdmmc_protocol::{
 };
 
 use crate::{
-    block::{PlatformDeviceBlock, SharedDriver, decode_fdt_irq},
+    block::{PlatformDeviceBlock, SharedDriver, fdt_irq_source},
     mmio::iomap,
 };
 
@@ -96,7 +96,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         card_info.ext_csd.is_some()
     );
 
-    let irq_num = decode_fdt_irq(&info.interrupts());
+    let irq_source = fdt_irq_source(&info);
     let raw = SharedDriver::new(card);
     let dev = BlockDevice {
         raw: Some(raw.clone()),
@@ -105,8 +105,8 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         queue_created: false,
         irq_handler_taken: false,
     };
-    plat_dev.register_block_with_irq(dev, irq_num);
-    info!("k230-sdhci block device registered irq={:?}", irq_num);
+    plat_dev.register_block_with_irq(dev, irq_source.clone());
+    info!("k230-sdhci block device registered irq={:?}", irq_source);
     Ok(())
 }
 

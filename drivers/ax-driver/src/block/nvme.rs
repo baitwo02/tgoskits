@@ -6,7 +6,7 @@ use log::info;
 use nvme_driver::{Config, Nvme, NvmeBlockDriver};
 use pcie::{CommandRegister, DeviceType};
 use rdrive::{
-    PlatformDevice,
+    IrqSource, PlatformDevice,
     probe::{
         OnProbeError,
         pci::{EndpointRc, FnOnProbe},
@@ -44,7 +44,7 @@ fn probe_pci(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), 
     });
 
     let address = endpoint.address();
-    let irq = crate::pci::endpoint_legacy_irq(endpoint);
+    let irq = crate::pci::endpoint_legacy_irq(endpoint).map(IrqSource::Number);
     info!(
         "NVMe PCI endpoint {address}: BAR0={:#x}..{:#x}, irq={:?}, int_pin={}, int_line={}",
         bar.start,

@@ -47,7 +47,7 @@ fn probe(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnPr
         return Err(OnProbeError::NotMatch);
     };
     info!(
-        "RTL8125 PCI endpoint {address}: BAR{bar_index}={:#x}..{:#x}, irq={irq}, int_pin={}, \
+        "RTL8125 PCI endpoint {address}: BAR{bar_index}={:#x}..{:#x}, irq={irq:?}, int_pin={}, \
          int_line={}, command={:?}, status={:?}",
         bar.start,
         bar.end,
@@ -89,8 +89,8 @@ fn probe(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnPr
         return Err(OnProbeError::NotMatch);
     }
 
-    plat_dev.register_net(DRIVER_NAME, dev, Some(irq));
-    debug!("RTL8125 PCI network device registered at {address} with irq {irq:#x}");
+    plat_dev.register_net(DRIVER_NAME, dev, Some(irq.clone()));
+    debug!("RTL8125 PCI network device registered at {address} with irq {irq:?}");
     Ok(())
 }
 

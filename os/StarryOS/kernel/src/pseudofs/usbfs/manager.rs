@@ -1336,14 +1336,28 @@ pub(super) fn discover_hosts() -> (Vec<UsbHostState>, Vec<PendingUsbIrqSlot>) {
                 }
             };
 
-            let irq_num = guard.irq_num();
+            let irq_source = guard.irq_source().cloned();
+            let irq_num =
+                irq_source.as_ref().and_then(
+                    |source| match ax_runtime::hal::irq::resolve_irq_source(source) {
+                        Ok(irq) => Some(irq),
+                        Err(err) => {
+                            warn!(
+                                "usbfs: failed to resolve IRQ source {:?} for host {:?}: {err:?}",
+                                source, device_id
+                            );
+                            None
+                        }
+                    },
+                );
             info!("usbfs: creating event handler for bus {}", bus_num);
             let event_handler: EventHandler = guard.host_mut().create_event_handler();
             drop(guard);
 
-            if let Some(irq_num) = irq_num {
+            if let (Some(irq_num), Some(irq_source)) = (irq_num, irq_source.clone()) {
                 irq_slots.push(PendingUsbIrqSlot {
                     irq_num,
+                    irq_source,
                     device_id,
                     bus_num,
                     handler: event_handler,

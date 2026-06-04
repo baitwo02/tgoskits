@@ -3,31 +3,31 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use rd_net::{Interface, NetError};
-use rdrive::{Device, DriverGeneric, probe::pci::EndpointRc};
+use rdrive::{Device, DriverGeneric, IrqSource, probe::pci::EndpointRc};
 
 pub struct PlatformNetDevice {
     name: &'static str,
-    irq_num: Option<usize>,
+    irq_source: Option<IrqSource>,
     net: Option<rd_net::Net>,
 }
 
 impl PlatformNetDevice {
-    fn new(name: &'static str, net: rd_net::Net, irq_num: Option<usize>) -> Self {
+    fn new(name: &'static str, net: rd_net::Net, irq_source: Option<IrqSource>) -> Self {
         Self {
             name,
-            irq_num,
+            irq_source,
             net: Some(net),
         }
     }
 
-    pub fn take_net(&mut self) -> Option<(rd_net::Net, &'static str, Option<usize>)> {
-        Some((self.net.take()?, self.name, self.irq_num))
+    pub fn take_net(&mut self) -> Option<(rd_net::Net, &'static str, Option<IrqSource>)> {
+        Some((self.net.take()?, self.name, self.irq_source.clone()))
     }
 }
 
 pub fn take_rd_net_device(
     device: Device<PlatformNetDevice>,
-) -> Result<(rd_net::Net, &'static str, Option<usize>), NetError> {
+) -> Result<(rd_net::Net, &'static str, Option<IrqSource>), NetError> {
     let mut dev = device
         .lock()
         .map_err(|_| NetError::Other(Box::new(rd_net::KError::Unknown("device locked"))))?;
@@ -41,11 +41,15 @@ impl DriverGeneric for PlatformNetDevice {
     }
 }
 
-pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<usize> {
+pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<IrqSource> {
+    let address = endpoint.address();
+    let interrupt_pin = endpoint.interrupt_pin();
+    let interrupt_line = endpoint.interrupt_line();
+
     pci_irq_candidates(
-        endpoint.address(),
-        endpoint.interrupt_pin(),
-        endpoint.interrupt_line(),
+        address,
+        interrupt_pin,
+        interrupt_line,
         || {
             #[cfg(all(
                 plat_dyn,
@@ -59,14 +63,13 @@ pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<usize> {
                 )
             ))]
             {
-                let interrupt_pin = endpoint.interrupt_pin();
                 if interrupt_pin != 0 {
-                    match crate::pci::acpi_irq_for_endpoint(endpoint.address(), interrupt_pin) {
+                    match crate::pci::acpi_irq_for_endpoint(address, interrupt_pin) {
                         Ok(Some(irq)) => return Some(irq),
                         Ok(None) => {}
                         Err(err) => log::warn!(
                             "failed to resolve ACPI IRQ for net endpoint {}: {err}",
-                            endpoint.address()
+                            address
                         ),
                     }
                 }
@@ -86,14 +89,13 @@ pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<usize> {
                 )
             ))]
             {
-                let interrupt_pin = endpoint.interrupt_pin();
                 if interrupt_pin != 0 {
-                    match crate::pci::fdt_irq_for_endpoint(endpoint.address(), interrupt_pin) {
+                    match crate::pci::fdt_irq_for_endpoint(address, interrupt_pin) {
                         Ok(Some(irq)) => return Some(irq),
                         Ok(None) => {}
                         Err(err) => log::warn!(
                             "failed to resolve FDT IRQ for net endpoint {}: {err}",
-                            endpoint.address()
+                            address
                         ),
                     }
                 }
@@ -101,6 +103,7 @@ pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<usize> {
             None
         },
     )
+    .map(IrqSource::Number)
 }
 
 fn pci_irq_candidates(
@@ -158,17 +161,17 @@ mod tests {
 }
 
 pub trait PlatformDeviceNet {
-    fn register_net<T>(self, name: &'static str, dev: T, irq_num: Option<usize>)
+    fn register_net<T>(self, name: &'static str, dev: T, irq_source: Option<IrqSource>)
     where
         T: Interface + 'static;
 }
 
 impl PlatformDeviceNet for rdrive::PlatformDevice {
-    fn register_net<T>(self, name: &'static str, dev: T, irq_num: Option<usize>)
+    fn register_net<T>(self, name: &'static str, dev: T, irq_source: Option<IrqSource>)
     where
         T: Interface + 'static,
     {
         let net = rd_net::Net::new(dev, axklib::dma::op());
-        self.register(PlatformNetDevice::new(name, net, irq_num));
+        self.register(PlatformNetDevice::new(name, net, irq_source));
     }
 }

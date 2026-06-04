@@ -41,7 +41,7 @@ fn probe(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnPr
     });
 
     let mmio = crate::mmio::iomap(bar.start, align_up_4k(bar.count().max(1)))?;
-    let irq_num = Some(pci_irq_or_error(endpoint)?);
+    let irq_source = Some(pci_irq_or_error(endpoint)?);
     let host = crab_usb::USBHost::new_xhci(mmio, usb_kernel()).map_err(|err| {
         OnProbeError::other(format!(
             "failed to create xHCI host for PCI endpoint {}: {err}",
@@ -49,11 +49,11 @@ fn probe(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnPr
         ))
     })?;
 
-    plat_dev.register_usb_host(DRIVER_NAME, host, irq_num);
+    plat_dev.register_usb_host(DRIVER_NAME, host, irq_source.clone());
     info!(
         "xHCI PCI host registered successfully at {} with irq {:?}",
         endpoint.address(),
-        irq_num
+        irq_source
     );
     Ok(())
 }
