@@ -184,7 +184,31 @@ pub struct AcpiInfo<'a> {
     pub path: &'a str,
 }
 
-pub type FnOnProbe = fn(AcpiInfo<'_>, PlatformDevice) -> Result<(), OnProbeError>;
+pub struct ProbeAcpi<'a> {
+    info: AcpiInfo<'a>,
+    platform: PlatformDevice,
+}
+
+impl<'a> ProbeAcpi<'a> {
+    #[allow(dead_code)]
+    pub(crate) fn new(info: AcpiInfo<'a>, platform: PlatformDevice) -> Self {
+        Self { info, platform }
+    }
+
+    pub const fn info(&self) -> &AcpiInfo<'a> {
+        &self.info
+    }
+
+    pub fn into_platform_device(self) -> PlatformDevice {
+        self.platform
+    }
+
+    pub fn into_parts(self) -> (AcpiInfo<'a>, PlatformDevice) {
+        (self.info, self.platform)
+    }
+}
+
+pub type FnOnProbe = for<'a> fn(ProbeAcpi<'a>) -> Result<(), OnProbeError>;
 
 pub fn check_root(root: AcpiRoot) -> Result<(), DriverError> {
     if root.rsdp == 0 {

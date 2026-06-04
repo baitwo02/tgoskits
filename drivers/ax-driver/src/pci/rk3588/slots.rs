@@ -13,8 +13,8 @@ mod rk3588_pcie_slot0 {
         ],
     );
 
-    fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        probe_rk3588(info, plat_dev)
+    fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+        probe_rk3588(probe)
     }
 }
 
@@ -33,8 +33,8 @@ mod rk3588_pcie_slot1 {
         ],
     );
 
-    fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        probe_rk3588(info, plat_dev)
+    fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+        probe_rk3588(probe)
     }
 }
 
@@ -53,8 +53,8 @@ mod rk3588_pcie_slot2 {
         ],
     );
 
-    fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        probe_rk3588(info, plat_dev)
+    fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+        probe_rk3588(probe)
     }
 }
 
@@ -73,8 +73,8 @@ mod rk3588_pcie_slot3 {
         ],
     );
 
-    fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        probe_rk3588(info, plat_dev)
+    fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+        probe_rk3588(probe)
     }
 }
 
@@ -93,7 +93,7 @@ mod rk3588_pcie_slot4 {
         ],
     );
 
-    fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        probe_rk3588(info, plat_dev)
+    fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+        probe_rk3588(probe)
     }
 }

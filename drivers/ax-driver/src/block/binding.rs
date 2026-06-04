@@ -13,7 +13,7 @@ use rdif_block::{
     BlkError, Buffer, IQueue, Interface, QueueInfo, Request, RequestFlags, RequestId, RequestOp,
     RequestStatus, TransferChunk, TransferPlan, TransferPlanner, TransferRuntimeCaps,
 };
-use rdrive::{Device, IrqSource, register::FdtInfo};
+use rdrive::{Device, IrqSource, probe::OnProbeError};
 
 use crate::BindingInfo;
 
@@ -294,8 +294,6 @@ impl TryFrom<Device<PlatformBlockDevice>> for Block {
 
 pub trait PlatformDeviceBlock {
     fn register_block<T: Interface>(self, dev: T) -> Option<IrqSource>;
-    fn register_block_from_fdt<T: Interface>(self, dev: T, info: &FdtInfo<'_>)
-    -> Option<IrqSource>;
     fn register_block_with_irq<T: Interface>(
         self,
         dev: T,
@@ -308,20 +306,51 @@ impl PlatformDeviceBlock for rdrive::PlatformDevice {
         register_block_with_info(self, dev, BindingInfo::empty())
     }
 
-    fn register_block_from_fdt<T: Interface>(
-        self,
-        dev: T,
-        info: &FdtInfo<'_>,
-    ) -> Option<IrqSource> {
-        register_block_with_info(self, dev, BindingInfo::from_fdt(info))
-    }
-
     fn register_block_with_irq<T: Interface>(
         self,
         dev: T,
         irq_source: Option<IrqSource>,
     ) -> Option<IrqSource> {
         register_block_with_info(self, dev, BindingInfo::with_irq_source(irq_source))
+    }
+}
+
+pub trait ProbeFdtBlock {
+    fn register_block<T: Interface>(self, dev: T) -> Option<IrqSource>;
+}
+
+impl ProbeFdtBlock for rdrive::probe::fdt::ProbeFdt<'_> {
+    fn register_block<T: Interface>(self, dev: T) -> Option<IrqSource> {
+        let info = BindingInfo::from_fdt(self.info());
+        register_block_with_info(self.into_platform_device(), dev, info)
+    }
+}
+
+pub trait ProbePciBlock {
+    fn register_block_optional_irq<T: Interface>(self, dev: T) -> Option<IrqSource>;
+
+    fn register_block_required_irq<T: Interface>(
+        self,
+        dev: T,
+    ) -> Result<Option<IrqSource>, OnProbeError>;
+}
+
+impl ProbePciBlock for rdrive::probe::pci::ProbePci<'_> {
+    fn register_block_optional_irq<T: Interface>(self, dev: T) -> Option<IrqSource> {
+        let info = BindingInfo::from_pci_optional(self.info());
+        register_block_with_info(self.into_platform_device(), dev, info)
+    }
+
+    fn register_block_required_irq<T: Interface>(
+        self,
+        dev: T,
+    ) -> Result<Option<IrqSource>, OnProbeError> {
+        let info = BindingInfo::from_pci_required(self.info())?;
+        Ok(register_block_with_info(
+            self.into_platform_device(),
+            dev,
+            info,
+        ))
     }
 }
 

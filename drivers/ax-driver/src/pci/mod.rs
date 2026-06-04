@@ -33,29 +33,9 @@ use crate::virtio::VirtIoHalImpl;
 mod acpi;
 #[cfg(plat_dyn)]
 mod fdt;
-#[cfg(all(
-    plat_dyn,
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 pub(crate) use acpi::acpi_irq_for_endpoint;
-#[cfg(all(
-    plat_dyn,
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 pub(crate) use fdt::fdt_irq_for_endpoint;
 
 const MAX_PCIE_LEGACY_IRQS: usize = 8;
@@ -266,7 +246,6 @@ mod tests {
         assert_eq!(legacy_line_to_irq_for_platform(9, false, true), 9);
     }
 }
-
 pub fn register_legacy_irq_route(bus_start: u8, bus_end: u8, irq: usize) {
     register_legacy_irq_routes(bus_start, bus_end, &[irq]);
 }

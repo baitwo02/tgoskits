@@ -15,7 +15,7 @@ use crate::{
 
 static PCIE: Once<Mutex<Vec<PcieEnumterator>>> = Once::new();
 
-pub type FnOnProbe = fn(ep: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnProbeError>;
+pub type FnOnProbe = fn(ProbePci<'_>) -> Result<(), OnProbeError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Id {
@@ -66,6 +66,67 @@ impl EndpointRc {
 
     pub fn take(&mut self) -> Endpoint {
         self.0.take().unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciInfo {
+    pub address: PciAddress,
+    pub interrupt_pin: u8,
+    pub interrupt_line: u8,
+}
+
+impl PciInfo {
+    fn from_endpoint(endpoint: &EndpointRc) -> Self {
+        Self {
+            address: endpoint.address(),
+            interrupt_pin: endpoint.interrupt_pin(),
+            interrupt_line: endpoint.interrupt_line(),
+        }
+    }
+}
+
+pub struct ProbePci<'a> {
+    info: PciInfo,
+    endpoint: &'a mut EndpointRc,
+    platform: PlatformDevice,
+}
+
+impl<'a> ProbePci<'a> {
+    pub(crate) fn new(
+        info: PciInfo,
+        endpoint: &'a mut EndpointRc,
+        platform: PlatformDevice,
+    ) -> Self {
+        Self {
+            info,
+            endpoint,
+            platform,
+        }
+    }
+
+    pub const fn info(&self) -> PciInfo {
+        self.info
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        self.endpoint
+    }
+
+    pub fn endpoint_mut(&mut self) -> &mut EndpointRc {
+        self.endpoint
+    }
+
+    pub fn take_endpoint(&mut self) -> Endpoint {
+        self.endpoint.take()
+    }
+
+    pub fn into_platform_device(self) -> PlatformDevice {
+        self.platform
+    }
+
+    pub fn into_parts(self) -> (PciInfo, &'a mut EndpointRc, PlatformDevice) {
+        (self.info, self.endpoint, self.platform)
     }
 }
 
@@ -143,8 +204,9 @@ impl PcieEnumterator {
             desc.name = register.name;
             desc.irq_parent = self.ctrl.descriptor().irq_parent;
 
+            let info = PciInfo::from_endpoint(&endpoint);
             let plat_dev = PlatformDevice::new(desc);
-            match (pci_probe)(&mut endpoint, plat_dev) {
+            match (pci_probe)(ProbePci::new(info, &mut endpoint, plat_dev)) {
                 Ok(_) => {
                     self.probed.insert(id);
                     return Ok(());

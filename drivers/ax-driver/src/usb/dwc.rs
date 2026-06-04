@@ -13,10 +13,13 @@ use crab_usb::{
 };
 use fdt_edit::{ClockRef, Fdt, Node, NodeType, Phandle, RegFixed};
 use log::{debug, info, warn};
-use rdrive::{PlatformDevice, probe::OnProbeError, register::FdtInfo};
+use rdrive::{
+    probe::OnProbeError,
+    register::{FdtInfo, ProbeFdt},
+};
 use rockchip_pm::{PowerDomain, RockchipPM};
 
-use super::{PlatformDeviceUsbHost, usb_kernel};
+use super::{ProbeFdtUsbHost, usb_kernel};
 use crate::{
     mmio::iomap,
     soc::{RockchipPinCtrl, rk3588_enable_clock, rk3588_reset_assert, rk3588_reset_deassert},
@@ -95,7 +98,8 @@ struct DwcResources {
     params: DwcParams,
 }
 
-fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let info = probe.info();
     match prop_str(info.node.as_node(), "dr_mode") {
         Some("host") => {}
         Some(mode) => {
@@ -112,7 +116,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
     }
 
     let fdt = live_fdt()?;
-    let resources = collect_resources(&info, &fdt)?;
+    let resources = collect_resources(info, &fdt)?;
 
     enable_power_domains(&resources.power_domains)?;
     enable_clocks(&resources.clocks);
@@ -167,11 +171,11 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         ))
     })?;
 
-    let irq_source = plat_dev.register_usb_host_from_fdt(DRIVER_NAME, host, &info);
+    let node_name = probe.info().node.name().to_string();
+    let irq_source = probe.register_usb_host(DRIVER_NAME, host);
     info!(
         "DWC xHCI driver initialized successfully for {} with irq {:?}",
-        info.node.name(),
-        irq_source
+        node_name, irq_source
     );
     Ok(())
 }

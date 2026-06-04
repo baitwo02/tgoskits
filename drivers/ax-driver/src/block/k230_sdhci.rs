@@ -22,7 +22,11 @@ use core::{
 
 use dma_api::DeviceDma;
 use log::{info, warn};
-use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError, register::FdtInfo};
+use rdrive::{
+    DriverGeneric,
+    probe::OnProbeError,
+    register::{FdtInfo, ProbeFdt},
+};
 use sdhci_host::{BlockRequest, BlockRequestSlot, RequestId, Sdhci};
 use sdmmc_protocol::{
     BlockPoll, BlockTransferMode, Error, OperationPoll,
@@ -31,7 +35,7 @@ use sdmmc_protocol::{
 };
 
 use crate::{
-    block::{PlatformDeviceBlock, SharedDriver},
+    block::{ProbeFdtBlock, SharedDriver},
     mmio::iomap,
 };
 
@@ -52,7 +56,8 @@ crate::model_register!(
     ],
 );
 
-fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let info = probe.info();
     let base_reg = info
         .node
         .regs()
@@ -82,7 +87,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
 
     info!("k230-sdhci: initialize card");
     let mut card = SdioSdmmc::new(host);
-    let card_info = poll_card_init(&mut card, card_init_preference(&info))
+    let card_info = poll_card_init(&mut card, card_init_preference(info))
         .map_err(|e| card_init_error(base_reg.address, mmio_size, e))?;
     info!(
         "SDHCI card: kind={:?} high_capacity={} rca={} ocr={:#010x} capacity_blocks={:?} cid={} \
@@ -104,7 +109,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         queue_created: false,
         irq_handler_taken: false,
     };
-    let irq_source = plat_dev.register_block_from_fdt(dev, &info);
+    let irq_source = probe.register_block(dev);
     info!("k230-sdhci block device registered irq={:?}", irq_source);
     Ok(())
 }

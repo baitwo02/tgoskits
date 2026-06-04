@@ -1,5 +1,8 @@
 use ax_driver::BindingInfo;
-use rdrive::IrqSource;
+use rdrive::{
+    IrqSource,
+    probe::pci::{PciAddress, PciInfo},
+};
 #[cfg(feature = "plat-dyn")]
 use {
     axklib::{
@@ -9,9 +12,9 @@ use {
     core::time::Duration,
     fdt_edit::{Fdt, Node, Phandle, Property},
     rdrive::{
-        Platform, PlatformDevice,
+        Platform,
         probe::OnProbeError,
-        register::{DriverRegister, FdtInfo, ProbeKind, ProbeLevel, ProbePriority},
+        register::{DriverRegister, ProbeFdt, ProbeKind, ProbeLevel, ProbePriority},
     },
     std::ptr::NonNull,
     std::sync::Mutex,
@@ -113,6 +116,30 @@ fn explicit_binding_info_reports_numbered_irq() {
     assert_eq!(info.irq_num(), Some(33));
 }
 
+#[test]
+fn optional_pci_binding_info_can_be_empty() {
+    let info = BindingInfo::from_pci_optional(PciInfo {
+        address: PciAddress::new(0, 0, 0, 0),
+        interrupt_pin: 0,
+        interrupt_line: 0,
+    });
+
+    assert_eq!(info.irq_source(), None);
+    assert_eq!(info.irq_num(), None);
+}
+
+#[test]
+fn required_pci_binding_info_reports_unresolved_irq() {
+    let err = BindingInfo::from_pci_required(PciInfo {
+        address: PciAddress::new(0, 0, 0, 0),
+        interrupt_pin: 0,
+        interrupt_line: 0,
+    })
+    .unwrap_err();
+
+    assert!(err.to_string().contains("failed to resolve IRQ"));
+}
+
 #[cfg(feature = "plat-dyn")]
 #[test]
 fn fdt_binding_info_uses_first_fdt_irq_source() {
@@ -144,8 +171,8 @@ fn fdt_binding_info_uses_first_fdt_irq_source() {
 }
 
 #[cfg(feature = "plat-dyn")]
-fn capture_binding_info(info: FdtInfo<'_>, _plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-    *CAPTURED_INFO.lock().unwrap() = Some(BindingInfo::from_fdt(&info));
+fn capture_binding_info(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    *CAPTURED_INFO.lock().unwrap() = Some(BindingInfo::from_fdt(probe.info()));
     Ok(())
 }
 

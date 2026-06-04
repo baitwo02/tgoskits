@@ -1,49 +1,21 @@
 extern crate alloc;
 
 use alloc::format;
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 use alloc::vec::Vec;
 
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 use fdt_edit::Fdt;
 use fdt_edit::{NodeType, PciRange, PciSpace};
 use log::{debug, trace, warn};
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 use rdrive::probe::pci::PciAddress;
 use rdrive::{
-    PlatformDevice,
     probe::{
         OnProbeError,
         pci::{PciMem32, PciMem64, PcieController, new_driver_generic},
     },
-    register::FdtInfo,
+    register::{FdtInfo, ProbeFdt},
 };
 
 #[cfg(feature = "rk3588-pcie")]
@@ -62,7 +34,8 @@ crate::model_register!(
     ],
 );
 
-fn probe_generic_ecam(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe_generic_ecam(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let (info, plat_dev) = probe.into_parts();
     let NodeType::Pci(node) = info.node else {
         return Err(OnProbeError::NotMatch);
     };
@@ -158,16 +131,7 @@ pub(super) fn register_fdt_legacy_irq(info: &FdtInfo<'_>, logical_bus_end: u8) {
     super::register_legacy_irq_route(0, logical_bus_end, irq);
 }
 
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 pub fn fdt_irq_for_endpoint(
     address: PciAddress,
     interrupt_pin: u8,
@@ -180,16 +144,7 @@ pub fn fdt_irq_for_endpoint(
     result.map(Some)
 }
 
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 fn resolve_pci_irq_from_fdt(
     fdt: &Fdt,
     address: PciAddress,
@@ -259,16 +214,7 @@ fn resolve_pci_irq_from_fdt(
     })
 }
 
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "intel-net",
-        feature = "ixgbe",
-        feature = "realtek-rtl8125",
-        feature = "virtio-net",
-        feature = "xhci-pci",
-    )
-))]
+#[cfg(all(plat_dyn, target_os = "none"))]
 fn decode_irq_cells(specifier: &[u32]) -> Option<usize> {
     match specifier {
         [irq] => Some(*irq as usize),
@@ -284,7 +230,7 @@ fn decode_irq_cells(specifier: &[u32]) -> Option<usize> {
 #[cfg(feature = "list-pci-devices")]
 mod pci_list_devices {
     use log::info;
-    use rdrive::probe::pci::{EndpointRc, FnOnProbe};
+    use rdrive::probe::pci::{FnOnProbe, ProbePci};
 
     use super::*;
 
@@ -297,8 +243,9 @@ mod pci_list_devices {
         }],
     );
 
-    fn probe(endpoint: &mut EndpointRc, _plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
-        info!("PCIe endpoint: {} bars={:?}", &**endpoint, endpoint.bars());
+    fn probe(probe: ProbePci<'_>) -> Result<(), OnProbeError> {
+        let endpoint = probe.endpoint();
+        info!("PCIe endpoint: {} bars={:?}", endpoint, endpoint.bars());
         Err(OnProbeError::NotMatch)
     }
 }

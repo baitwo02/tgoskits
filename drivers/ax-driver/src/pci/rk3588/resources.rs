@@ -14,9 +14,8 @@ use fdt_edit::{ClockRef, Fdt, Node, PciRange, PciSpace, Phandle, RegFixed};
 use mmio_api::{MmioAddr, MmioRaw};
 use rdif_pcie::{PciMem64, PcieController};
 use rdrive::{
-    PlatformDevice,
     probe::{OnProbeError, fdt::NodeType},
-    register::FdtInfo,
+    register::{FdtInfo, ProbeFdt},
 };
 use rk3588_pci::{
     Delay, HostConfig, IatuMode, MEM_ATU_FIRST_REGION, OutboundWindow, ResetControl, Rk3588PcieHost,
@@ -229,7 +228,8 @@ struct CombphyResources {
     resets: Vec<ResetSpec>,
 }
 
-fn probe_rk3588(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe_rk3588(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let (info, plat_dev) = probe.into_parts();
     let NodeType::Pci(node) = info.node else {
         return Err(OnProbeError::NotMatch);
     };

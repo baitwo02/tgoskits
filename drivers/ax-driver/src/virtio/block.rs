@@ -29,12 +29,9 @@ model_register!(
 );
 
 #[cfg(any(plat_static, plat_dyn))]
-fn probe_pci(
-    endpoint: &mut rdrive::probe::pci::EndpointRc,
-    plat_dev: PlatformDevice,
-) -> Result<(), OnProbeError> {
-    let transport = crate::pci::take_virtio_transport(endpoint, DeviceType::Block)?;
-    register_transport(plat_dev, transport)
+fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeError> {
+    let transport = crate::pci::take_virtio_transport(probe.endpoint_mut(), DeviceType::Block)?;
+    register_transport(probe.into_platform_device(), transport)
 }
 
 #[cfg(plat_dyn)]
@@ -49,10 +46,8 @@ model_register!(
 );
 
 #[cfg(plat_dyn)]
-fn probe_fdt(
-    info: rdrive::register::FdtInfo<'_>,
-    plat_dev: PlatformDevice,
-) -> Result<(), OnProbeError> {
+fn probe_fdt(probe: rdrive::register::ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let (info, plat_dev) = probe.into_parts();
     let (ty, transport) = crate::virtio::probe_fdt_mmio_device(&info)?;
     if ty != DeviceType::Block {
         return Err(OnProbeError::NotMatch);

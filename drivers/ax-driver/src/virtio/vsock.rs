@@ -30,12 +30,9 @@ crate::model_register!(
 );
 
 #[cfg(any(plat_static, plat_dyn))]
-fn probe_pci(
-    endpoint: &mut rdrive::probe::pci::EndpointRc,
-    plat_dev: PlatformDevice,
-) -> Result<(), OnProbeError> {
-    let transport = crate::pci::take_virtio_transport(endpoint, DeviceType::Socket)?;
-    register_transport(plat_dev, transport)
+fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeError> {
+    let transport = crate::pci::take_virtio_transport(probe.endpoint_mut(), DeviceType::Socket)?;
+    register_transport(probe.into_platform_device(), transport)
 }
 
 pub fn register_transport<T: Transport + 'static>(

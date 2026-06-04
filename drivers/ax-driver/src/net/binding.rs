@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use rd_net::{Interface, NetError};
-use rdrive::{Device, DriverGeneric, IrqSource, probe::pci::EndpointRc, register::FdtInfo};
+use rdrive::{Device, DriverGeneric, IrqSource, probe::OnProbeError};
 
 use crate::BindingInfo;
 
@@ -42,137 +42,8 @@ impl DriverGeneric for PlatformNetDevice {
         self.name
     }
 }
-
-pub fn pci_legacy_irq(endpoint: &EndpointRc) -> Option<IrqSource> {
-    let address = endpoint.address();
-    let interrupt_pin = endpoint.interrupt_pin();
-    let interrupt_line = endpoint.interrupt_line();
-
-    pci_irq_candidates(
-        address,
-        interrupt_pin,
-        interrupt_line,
-        || {
-            #[cfg(all(
-                plat_dyn,
-                target_os = "none",
-                any(
-                    feature = "intel-net",
-                    feature = "ixgbe",
-                    feature = "realtek-rtl8125",
-                    feature = "virtio-net",
-                    feature = "xhci-pci",
-                )
-            ))]
-            {
-                if interrupt_pin != 0 {
-                    match crate::pci::acpi_irq_for_endpoint(address, interrupt_pin) {
-                        Ok(Some(irq)) => return Some(irq),
-                        Ok(None) => {}
-                        Err(err) => log::warn!(
-                            "failed to resolve ACPI IRQ for net endpoint {}: {err}",
-                            address
-                        ),
-                    }
-                }
-            }
-            None
-        },
-        || {
-            #[cfg(all(
-                plat_dyn,
-                target_os = "none",
-                any(
-                    feature = "intel-net",
-                    feature = "ixgbe",
-                    feature = "realtek-rtl8125",
-                    feature = "virtio-net",
-                    feature = "xhci-pci",
-                )
-            ))]
-            {
-                if interrupt_pin != 0 {
-                    match crate::pci::fdt_irq_for_endpoint(address, interrupt_pin) {
-                        Ok(Some(irq)) => return Some(irq),
-                        Ok(None) => {}
-                        Err(err) => log::warn!(
-                            "failed to resolve FDT IRQ for net endpoint {}: {err}",
-                            address
-                        ),
-                    }
-                }
-            }
-            None
-        },
-    )
-    .map(IrqSource::Number)
-}
-
-fn pci_irq_candidates(
-    address: rdrive::probe::pci::PciAddress,
-    interrupt_pin: u8,
-    interrupt_line: u8,
-    acpi: impl FnOnce() -> Option<usize>,
-    fdt: impl FnOnce() -> Option<usize>,
-) -> Option<usize> {
-    if let Some(irq) = acpi() {
-        return Some(irq);
-    }
-
-    if let Some(irq) = fdt() {
-        return Some(irq);
-    }
-
-    if let Some(irq) = crate::pci::legacy_irq_for_endpoint(address, interrupt_pin) {
-        return Some(irq);
-    }
-
-    if interrupt_line == 0 || interrupt_line == u8::MAX {
-        return None;
-    }
-    Some(crate::pci::legacy_line_to_irq(interrupt_line))
-}
-
-#[cfg(test)]
-mod tests {
-    use rdrive::probe::pci::PciAddress;
-
-    use super::pci_irq_candidates;
-
-    #[test]
-    fn pci_irq_resolution_prefers_acpi_then_fdt_then_fallback_line() {
-        let address = PciAddress::new(0, 0, 3, 0);
-
-        assert_eq!(
-            pci_irq_candidates(address, 1, 9, || Some(0x31), || Some(0x40)),
-            Some(0x31)
-        );
-        assert_eq!(
-            pci_irq_candidates(address, 1, 9, || None, || Some(0x40)),
-            Some(0x40)
-        );
-        let fallback_irq = pci_irq_candidates(address, 1, 9, || None, || None);
-        if cfg!(all(target_arch = "x86_64", plat_dyn)) {
-            assert_eq!(fallback_irq, Some(0x39));
-        } else if cfg!(target_arch = "x86_64") {
-            assert_eq!(fallback_irq, Some(0x29));
-        } else {
-            assert_eq!(fallback_irq, Some(9));
-        }
-    }
-}
-
 pub trait PlatformDeviceNet {
     fn register_net<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
-    where
-        T: Interface + 'static;
-
-    fn register_net_from_fdt<T>(
-        self,
-        name: &'static str,
-        dev: T,
-        info: &FdtInfo<'_>,
-    ) -> Option<IrqSource>
     where
         T: Interface + 'static;
 
@@ -194,18 +65,6 @@ impl PlatformDeviceNet for rdrive::PlatformDevice {
         register_net_with_info(self, name, dev, BindingInfo::empty())
     }
 
-    fn register_net_from_fdt<T>(
-        self,
-        name: &'static str,
-        dev: T,
-        info: &FdtInfo<'_>,
-    ) -> Option<IrqSource>
-    where
-        T: Interface + 'static,
-    {
-        register_net_with_info(self, name, dev, BindingInfo::from_fdt(info))
-    }
-
     fn register_net_with_irq<T>(
         self,
         name: &'static str,
@@ -216,6 +75,63 @@ impl PlatformDeviceNet for rdrive::PlatformDevice {
         T: Interface + 'static,
     {
         register_net_with_info(self, name, dev, BindingInfo::with_irq_source(irq_source))
+    }
+}
+
+pub trait ProbeFdtNet {
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
+    where
+        T: Interface + 'static;
+}
+
+impl ProbeFdtNet for rdrive::probe::fdt::ProbeFdt<'_> {
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
+    where
+        T: Interface + 'static,
+    {
+        let info = BindingInfo::from_fdt(self.info());
+        register_net_with_info(self.into_platform_device(), name, dev, info)
+    }
+}
+
+pub trait ProbePciNet {
+    fn register_net_optional_irq<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
+    where
+        T: Interface + 'static;
+
+    fn register_net_required_irq<T>(
+        self,
+        name: &'static str,
+        dev: T,
+    ) -> Result<Option<IrqSource>, OnProbeError>
+    where
+        T: Interface + 'static;
+}
+
+impl ProbePciNet for rdrive::probe::pci::ProbePci<'_> {
+    fn register_net_optional_irq<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
+    where
+        T: Interface + 'static,
+    {
+        let info = BindingInfo::from_pci_optional(self.info());
+        register_net_with_info(self.into_platform_device(), name, dev, info)
+    }
+
+    fn register_net_required_irq<T>(
+        self,
+        name: &'static str,
+        dev: T,
+    ) -> Result<Option<IrqSource>, OnProbeError>
+    where
+        T: Interface + 'static,
+    {
+        let info = BindingInfo::from_pci_required(self.info())?;
+        Ok(register_net_with_info(
+            self.into_platform_device(),
+            name,
+            dev,
+            info,
+        ))
     }
 }
 
