@@ -177,8 +177,8 @@ impl AppContext {
 
         let artifacts = self.tool.ctx().artifacts.clone();
         let kernel = artifacts
-            .bin
-            .or(artifacts.elf)
+            .bin()
+            .or(artifacts.elf())
             .context("cargo build did not produce a QEMU-loadable artifact")?;
 
         let mut cmd = Command::new("qemu-system-loongarch64");
