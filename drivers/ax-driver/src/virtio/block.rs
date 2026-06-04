@@ -19,7 +19,7 @@ use crate::{
 const VIRTIO_BLK_DMA_BUFFER_SIZE: usize = 32 * SECTOR_SIZE;
 
 #[cfg(any(plat_static, plat_dyn))]
-crate::model_register!(
+model_register!(
     name: "VirtIO Block",
     level: ProbeLevel::PostKernel,
     priority: ProbePriority::DEFAULT,
@@ -38,7 +38,7 @@ fn probe_pci(
 }
 
 #[cfg(plat_dyn)]
-crate::model_register!(
+model_register!(
     name: "VirtIO MMIO Block",
     level: ProbeLevel::PostKernel,
     priority: ProbePriority::DEFAULT,

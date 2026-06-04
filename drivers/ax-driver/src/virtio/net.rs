@@ -335,7 +335,7 @@ pub fn register_transport_with_irq<T: Transport + 'static>(
     if irq_source.is_some() {
         net.enable_irq();
     }
-    plat_dev.register_net("virtio-net", net, irq_source.clone());
+    let irq_source = plat_dev.register_net_with_irq("virtio-net", net, irq_source);
     log::info!("registered virtio network device irq={irq_source:?}");
     Ok(())
 }

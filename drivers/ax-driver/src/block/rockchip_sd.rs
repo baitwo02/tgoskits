@@ -26,7 +26,7 @@ use sdmmc_protocol::{
 };
 
 use crate::{
-    block::{PlatformDeviceBlock, SharedDriver, fdt_irq_source},
+    block::{PlatformDeviceBlock, SharedDriver},
     mmio::iomap,
     soc::scmi,
 };
@@ -130,7 +130,6 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         tune_rk3588_sdmmc_sample_phase(&mut sd, reference_clock);
     }
 
-    let irq_source = fdt_irq_source(&info);
     let raw = SharedDriver::new(sd);
     let dev = SdBlockDevice {
         raw: Some(raw.clone()),
@@ -139,7 +138,7 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         queue_created: false,
         irq_handler_taken: false,
     };
-    plat_dev.register_block_with_irq(dev, irq_source.clone());
+    let irq_source = plat_dev.register_block_from_fdt(dev, &info);
     info!("rockchip-sd block device registered irq={:?}", irq_source);
     Ok(())
 }

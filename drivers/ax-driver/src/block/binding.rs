@@ -13,11 +13,13 @@ use rdif_block::{
     BlkError, Buffer, IQueue, Interface, QueueInfo, Request, RequestFlags, RequestId, RequestOp,
     RequestStatus, TransferChunk, TransferPlan, TransferPlanner, TransferRuntimeCaps,
 };
-use rdrive::{Device, IrqSource};
+use rdrive::{Device, IrqSource, register::FdtInfo};
+
+use crate::BindingInfo;
 
 pub struct Block {
     name: String,
-    irq_source: Option<IrqSource>,
+    info: BindingInfo,
     irq_enabled: bool,
     #[cfg(feature = "irq")]
     irq_handler: Option<BlockIrqHandler>,
@@ -40,17 +42,17 @@ struct BlockBufferPool {
 pub struct PlatformBlockDevice {
     name: String,
     interface: Option<Box<dyn Interface>>,
-    irq_source: Option<IrqSource>,
+    info: BindingInfo,
 }
 
 const MAX_BLOCK_BUFFER_SIZE: usize = 16 * 1024;
 
 impl PlatformBlockDevice {
-    fn new(name: String, interface: Box<dyn Interface>, irq_source: Option<IrqSource>) -> Self {
+    fn new(name: String, interface: Box<dyn Interface>, info: BindingInfo) -> Self {
         Self {
             name,
             interface: Some(interface),
-            irq_source,
+            info,
         }
     }
 }
@@ -86,11 +88,11 @@ impl Block {
     }
 
     pub fn irq_num(&self) -> Option<usize> {
-        irq_source_number(self.irq_source.as_ref())
+        self.info.irq_num()
     }
 
     pub fn irq_source(&self) -> Option<&IrqSource> {
-        self.irq_source.as_ref()
+        self.info.irq_source()
     }
 
     pub fn enable_irq(&mut self) {
@@ -109,7 +111,7 @@ impl Block {
 
     #[cfg(feature = "irq")]
     pub fn take_irq_handler(&mut self) -> Option<(IrqSource, BlockIrqHandler)> {
-        let irq_source = self.irq_source.take()?;
+        let irq_source = self.info.irq_source().cloned()?;
         let handler = self.irq_handler.take()?;
         Some((irq_source, handler))
     }
@@ -251,7 +253,8 @@ impl TryFrom<Device<PlatformBlockDevice>> for Block {
     fn try_from(base: Device<PlatformBlockDevice>) -> Result<Self, Self::Error> {
         let mut dev = base.lock().map_err(|_| AxError::BadState)?;
         let name = dev.name.clone();
-        let irq_source = dev.irq_source.clone();
+        let info = dev.info.clone();
+        let irq_source = info.irq_source().cloned();
         let mut interface = dev.interface.take().ok_or(AxError::BadState)?;
         let queue = interface.create_queue().ok_or(AxError::BadState)?;
         let queues = BlockQueues::new(queue)?;
@@ -264,22 +267,22 @@ impl TryFrom<Device<PlatformBlockDevice>> for Block {
         drop(dev);
 
         #[cfg(feature = "irq")]
-        let irq_source = if irq_handler.is_some() {
-            irq_source
+        let info = if irq_handler.is_some() {
+            info
         } else {
-            None
+            BindingInfo::empty()
         };
         #[cfg(feature = "irq")]
         let irq_handler = irq_handler;
         #[cfg(not(feature = "irq"))]
-        let irq_source = {
+        let info = {
             let _ = irq_source;
-            None
+            BindingInfo::empty()
         };
 
         Ok(Self {
             name,
-            irq_source,
+            info,
             irq_enabled: interface.is_irq_enabled(),
             #[cfg(feature = "irq")]
             irq_handler,
@@ -290,30 +293,47 @@ impl TryFrom<Device<PlatformBlockDevice>> for Block {
 }
 
 pub trait PlatformDeviceBlock {
-    fn register_block<T: Interface>(self, dev: T);
-    fn register_block_with_irq<T: Interface>(self, dev: T, irq_source: Option<IrqSource>);
+    fn register_block<T: Interface>(self, dev: T) -> Option<IrqSource>;
+    fn register_block_from_fdt<T: Interface>(self, dev: T, info: &FdtInfo<'_>)
+    -> Option<IrqSource>;
+    fn register_block_with_irq<T: Interface>(
+        self,
+        dev: T,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource>;
 }
 
 impl PlatformDeviceBlock for rdrive::PlatformDevice {
-    fn register_block<T: Interface>(self, dev: T) {
-        self.register_block_with_irq(dev, None);
+    fn register_block<T: Interface>(self, dev: T) -> Option<IrqSource> {
+        register_block_with_info(self, dev, BindingInfo::empty())
     }
 
-    fn register_block_with_irq<T: Interface>(self, dev: T, irq_source: Option<IrqSource>) {
-        let name = dev.name().to_string();
-        self.register(PlatformBlockDevice::new(name, Box::new(dev), irq_source));
+    fn register_block_from_fdt<T: Interface>(
+        self,
+        dev: T,
+        info: &FdtInfo<'_>,
+    ) -> Option<IrqSource> {
+        register_block_with_info(self, dev, BindingInfo::from_fdt(info))
+    }
+
+    fn register_block_with_irq<T: Interface>(
+        self,
+        dev: T,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource> {
+        register_block_with_info(self, dev, BindingInfo::with_irq_source(irq_source))
     }
 }
 
-pub fn fdt_irq_source(info: &rdrive::register::FdtInfo<'_>) -> Option<IrqSource> {
-    rdrive::first_fdt_irq_source(info)
-}
-
-fn irq_source_number(source: Option<&IrqSource>) -> Option<usize> {
-    match source {
-        Some(IrqSource::Number(irq)) => Some(*irq),
-        _ => None,
-    }
+fn register_block_with_info<T: Interface>(
+    plat_dev: rdrive::PlatformDevice,
+    dev: T,
+    info: BindingInfo,
+) -> Option<IrqSource> {
+    let irq_source = info.irq_source().cloned();
+    let name = dev.name().to_string();
+    plat_dev.register(PlatformBlockDevice::new(name, Box::new(dev), info));
+    irq_source
 }
 
 pub fn take_block_devices() -> Vec<Block> {
@@ -683,7 +703,7 @@ mod tests {
         let layout = block_buffer_layout(info, planner.chunk_size()).unwrap();
         Block {
             name: String::from("test-block"),
-            irq_source: None,
+            info: BindingInfo::empty(),
             irq_enabled: false,
             #[cfg(feature = "irq")]
             irq_handler: None,

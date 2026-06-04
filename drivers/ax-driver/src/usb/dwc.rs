@@ -13,10 +13,10 @@ use crab_usb::{
 };
 use fdt_edit::{ClockRef, Fdt, Node, NodeType, Phandle, RegFixed};
 use log::{debug, info, warn};
-use rdrive::{IrqSource, PlatformDevice, probe::OnProbeError, register::FdtInfo};
+use rdrive::{PlatformDevice, probe::OnProbeError, register::FdtInfo};
 use rockchip_pm::{PowerDomain, RockchipPM};
 
-use super::{PlatformDeviceUsbHost, fdt_irq_source, usb_kernel};
+use super::{PlatformDeviceUsbHost, usb_kernel};
 use crate::{
     mmio::iomap,
     soc::{RockchipPinCtrl, rk3588_enable_clock, rk3588_reset_assert, rk3588_reset_deassert},
@@ -87,7 +87,6 @@ struct UsbdpPhyResources {
 
 struct DwcResources {
     ctrl: RegFixed,
-    irq_source: Option<IrqSource>,
     power_domains: Vec<usize>,
     clocks: Vec<ClockSpec>,
     ctrl_resets: Vec<ResetSpec>,
@@ -168,11 +167,11 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         ))
     })?;
 
-    plat_dev.register_usb_host(DRIVER_NAME, host, resources.irq_source.clone());
+    let irq_source = plat_dev.register_usb_host_from_fdt(DRIVER_NAME, host, &info);
     info!(
         "DWC xHCI driver initialized successfully for {} with irq {:?}",
         info.node.name(),
-        resources.irq_source
+        irq_source
     );
     Ok(())
 }
@@ -184,7 +183,6 @@ fn collect_resources(info: &FdtInfo<'_>, fdt: &Fdt) -> Result<DwcResources, OnPr
         .into_iter()
         .next()
         .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", info.node.name())))?;
-    let irq_source = fdt_irq_source(info);
     let (usb2_port, usbdp_port) = parse_phys(info.node.as_node())?;
     let usb2 = collect_usb2_phy(fdt, usb2_port)?;
     let usbdp = collect_usbdp_phy(fdt, usbdp_port)?;
@@ -199,7 +197,6 @@ fn collect_resources(info: &FdtInfo<'_>, fdt: &Fdt) -> Result<DwcResources, OnPr
 
     Ok(DwcResources {
         ctrl,
-        irq_source,
         power_domains: parse_power_domains(info.node.as_node())?,
         clocks,
         ctrl_resets: parse_resets(info.node)?,

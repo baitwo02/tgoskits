@@ -43,6 +43,7 @@ crate::model_register!(
     probe_kinds: &[],
 );
 
+mod binding_info;
 pub mod error;
 pub mod mmio;
 
@@ -76,4 +77,5 @@ pub mod usb;
 #[cfg(virtio_dev)]
 pub mod virtio;
 
+pub use binding_info::BindingInfo;
 pub use error::{Error, Result};

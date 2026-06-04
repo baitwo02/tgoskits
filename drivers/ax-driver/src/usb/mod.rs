@@ -9,6 +9,8 @@ use crab_usb::USBHost;
 use dma_api::{DmaAllocHandle, DmaConstraints, DmaDirection, DmaError, DmaMapHandle, DmaOp};
 use rdrive::{DriverGeneric, IrqSource};
 
+use crate::BindingInfo;
+
 #[cfg(all(feature = "rockchip-dwc-xhci", target_os = "none"))]
 mod dwc;
 #[cfg(all(feature = "xhci-mmio", target_os = "none"))]
@@ -137,29 +139,25 @@ pub fn usb_kernel() -> &'static dyn crab_usb::KernelOp {
 #[cfg(target_os = "none")]
 pub struct PlatformUsbHost {
     name: &'static str,
-    irq_source: Option<IrqSource>,
+    info: BindingInfo,
     host: USBHost,
 }
 
 #[cfg(not(target_os = "none"))]
 pub struct PlatformUsbHost {
     name: &'static str,
-    irq_source: Option<IrqSource>,
+    info: BindingInfo,
 }
 
 impl PlatformUsbHost {
     #[cfg(target_os = "none")]
-    fn new(name: &'static str, host: USBHost, irq_source: Option<IrqSource>) -> Self {
-        Self {
-            name,
-            irq_source,
-            host,
-        }
+    fn new(name: &'static str, host: USBHost, info: BindingInfo) -> Self {
+        Self { name, info, host }
     }
 
     #[cfg(not(target_os = "none"))]
-    fn new_stub(name: &'static str, irq_source: Option<IrqSource>) -> Self {
-        Self { name, irq_source }
+    fn new_stub(name: &'static str, info: BindingInfo) -> Self {
+        Self { name, info }
     }
 
     #[cfg(target_os = "none")]
@@ -173,14 +171,15 @@ impl PlatformUsbHost {
     }
 
     pub fn irq_num(&self) -> Option<usize> {
-        match self.irq_source.as_ref() {
-            Some(IrqSource::Number(irq)) => Some(*irq),
-            _ => None,
-        }
+        self.info.irq_num()
     }
 
     pub fn irq_source(&self) -> Option<&IrqSource> {
-        self.irq_source.as_ref()
+        self.info.irq_source()
+    }
+
+    pub fn info(&self) -> &BindingInfo {
+        &self.info
     }
 }
 
@@ -192,32 +191,138 @@ impl DriverGeneric for PlatformUsbHost {
 
 pub trait PlatformDeviceUsbHost {
     #[cfg(target_os = "none")]
-    fn register_usb_host(self, name: &'static str, host: USBHost, irq_source: Option<IrqSource>);
+    fn register_usb_host(self, name: &'static str, host: USBHost) -> Option<IrqSource>;
+
+    #[cfg(target_os = "none")]
+    fn register_usb_host_from_fdt(
+        self,
+        name: &'static str,
+        host: USBHost,
+        info: &rdrive::register::FdtInfo<'_>,
+    ) -> Option<IrqSource>;
+
+    #[cfg(all(feature = "xhci-pci", target_os = "none"))]
+    fn register_usb_host_from_pci(
+        self,
+        name: &'static str,
+        host: USBHost,
+        endpoint: &rdrive::probe::pci::EndpointRc,
+    ) -> Result<Option<IrqSource>, rdrive::probe::OnProbeError>;
+
+    #[cfg(target_os = "none")]
+    fn register_usb_host_with_irq(
+        self,
+        name: &'static str,
+        host: USBHost,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource>;
 
     #[cfg(not(target_os = "none"))]
-    fn register_usb_host_stub(self, name: &'static str, irq_source: Option<IrqSource>);
+    fn register_usb_host_stub(self, name: &'static str) -> Option<IrqSource>;
+
+    #[cfg(not(target_os = "none"))]
+    fn register_usb_host_stub_from_fdt(
+        self,
+        name: &'static str,
+        info: &rdrive::register::FdtInfo<'_>,
+    ) -> Option<IrqSource>;
+
+    #[cfg(not(target_os = "none"))]
+    fn register_usb_host_stub_with_irq(
+        self,
+        name: &'static str,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource>;
 }
 
 impl PlatformDeviceUsbHost for rdrive::PlatformDevice {
     #[cfg(target_os = "none")]
-    fn register_usb_host(self, name: &'static str, host: USBHost, irq_source: Option<IrqSource>) {
-        self.register(PlatformUsbHost::new(name, host, irq_source));
+    fn register_usb_host(self, name: &'static str, host: USBHost) -> Option<IrqSource> {
+        register_usb_host_with_info(self, name, host, BindingInfo::empty())
+    }
+
+    #[cfg(target_os = "none")]
+    fn register_usb_host_from_fdt(
+        self,
+        name: &'static str,
+        host: USBHost,
+        info: &rdrive::register::FdtInfo<'_>,
+    ) -> Option<IrqSource> {
+        register_usb_host_with_info(self, name, host, BindingInfo::from_fdt(info))
+    }
+
+    #[cfg(all(feature = "xhci-pci", target_os = "none"))]
+    fn register_usb_host_from_pci(
+        self,
+        name: &'static str,
+        host: USBHost,
+        endpoint: &rdrive::probe::pci::EndpointRc,
+    ) -> Result<Option<IrqSource>, rdrive::probe::OnProbeError> {
+        let info = binding_info_from_pci_endpoint(endpoint)?;
+        Ok(register_usb_host_with_info(self, name, host, info))
+    }
+
+    #[cfg(target_os = "none")]
+    fn register_usb_host_with_irq(
+        self,
+        name: &'static str,
+        host: USBHost,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource> {
+        register_usb_host_with_info(self, name, host, BindingInfo::with_irq_source(irq_source))
     }
 
     #[cfg(not(target_os = "none"))]
-    fn register_usb_host_stub(self, name: &'static str, irq_source: Option<IrqSource>) {
-        self.register(PlatformUsbHost::new_stub(name, irq_source));
+    fn register_usb_host_stub(self, name: &'static str) -> Option<IrqSource> {
+        register_usb_host_stub_with_info(self, name, BindingInfo::empty())
     }
+
+    #[cfg(not(target_os = "none"))]
+    fn register_usb_host_stub_from_fdt(
+        self,
+        name: &'static str,
+        info: &rdrive::register::FdtInfo<'_>,
+    ) -> Option<IrqSource> {
+        register_usb_host_stub_with_info(self, name, BindingInfo::from_fdt(info))
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn register_usb_host_stub_with_irq(
+        self,
+        name: &'static str,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource> {
+        register_usb_host_stub_with_info(self, name, BindingInfo::with_irq_source(irq_source))
+    }
+}
+
+#[cfg(target_os = "none")]
+fn register_usb_host_with_info(
+    plat_dev: rdrive::PlatformDevice,
+    name: &'static str,
+    host: USBHost,
+    info: BindingInfo,
+) -> Option<IrqSource> {
+    let irq_source = info.irq_source().cloned();
+    plat_dev.register(PlatformUsbHost::new(name, host, info));
+    irq_source
+}
+
+#[cfg(not(target_os = "none"))]
+fn register_usb_host_stub_with_info(
+    plat_dev: rdrive::PlatformDevice,
+    name: &'static str,
+    info: BindingInfo,
+) -> Option<IrqSource> {
+    let irq_source = info.irq_source().cloned();
+    plat_dev.register(PlatformUsbHost::new_stub(name, info));
+    irq_source
 }
 
 #[cfg(all(feature = "xhci-pci", target_os = "none"))]
 pub(crate) fn align_up_4k(size: usize) -> usize {
     const MASK: usize = 0xfff;
     (size + MASK) & !MASK
-}
-
-pub fn fdt_irq_source(info: &rdrive::register::FdtInfo<'_>) -> Option<IrqSource> {
-    rdrive::first_fdt_irq_source(info)
 }
 
 #[cfg(all(feature = "xhci-pci", target_os = "none"))]
@@ -231,18 +336,20 @@ fn pci_static_irq(endpoint: &rdrive::probe::pci::EndpointRc) -> Option<usize> {
 }
 
 #[cfg(all(feature = "xhci-pci", target_os = "none"))]
-pub(crate) fn pci_irq_or_error(
+fn binding_info_from_pci_endpoint(
     endpoint: &rdrive::probe::pci::EndpointRc,
-) -> Result<IrqSource, rdrive::probe::OnProbeError> {
+) -> Result<BindingInfo, rdrive::probe::OnProbeError> {
     #[cfg(plat_dyn)]
     if let Some(irq) =
         crate::pci::fdt_irq_for_endpoint(endpoint.address(), endpoint.interrupt_pin())?
     {
-        return Ok(IrqSource::Number(irq));
+        return Ok(BindingInfo::with_irq_source(Some(IrqSource::Number(irq))));
     }
 
     pci_static_irq(endpoint)
         .map(IrqSource::Number)
+        .map(Some)
+        .map(BindingInfo::with_irq_source)
         .ok_or_else(|| {
             rdrive::probe::OnProbeError::other(alloc::format!(
                 "failed to resolve IRQ for USB endpoint {}",

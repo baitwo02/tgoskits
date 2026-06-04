@@ -61,7 +61,7 @@ fn probe_pci(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), 
 
     let dev = IxgbeNet::new(mmio.as_ptr() as usize, bar_len)
         .map_err(|err| OnProbeError::other(format!("failed to initialize ixgbe: {err:?}")))?;
-    plat_dev.register_net(DRIVER_NAME, dev, Some(irq.clone()));
+    plat_dev.register_net_with_irq(DRIVER_NAME, dev, Some(irq.clone()));
     log::info!("registered ixgbe PCI network device at {address} with irq {irq:?}");
     Ok(())
 }

@@ -3,25 +3,27 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use rd_net::{Interface, NetError};
-use rdrive::{Device, DriverGeneric, IrqSource, probe::pci::EndpointRc};
+use rdrive::{Device, DriverGeneric, IrqSource, probe::pci::EndpointRc, register::FdtInfo};
+
+use crate::BindingInfo;
 
 pub struct PlatformNetDevice {
     name: &'static str,
-    irq_source: Option<IrqSource>,
+    info: BindingInfo,
     net: Option<rd_net::Net>,
 }
 
 impl PlatformNetDevice {
-    fn new(name: &'static str, net: rd_net::Net, irq_source: Option<IrqSource>) -> Self {
+    fn new(name: &'static str, net: rd_net::Net, info: BindingInfo) -> Self {
         Self {
             name,
-            irq_source,
+            info,
             net: Some(net),
         }
     }
 
     pub fn take_net(&mut self) -> Option<(rd_net::Net, &'static str, Option<IrqSource>)> {
-        Some((self.net.take()?, self.name, self.irq_source.clone()))
+        Some((self.net.take()?, self.name, self.info.irq_source().cloned()))
     }
 }
 
@@ -161,17 +163,73 @@ mod tests {
 }
 
 pub trait PlatformDeviceNet {
-    fn register_net<T>(self, name: &'static str, dev: T, irq_source: Option<IrqSource>)
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
+    where
+        T: Interface + 'static;
+
+    fn register_net_from_fdt<T>(
+        self,
+        name: &'static str,
+        dev: T,
+        info: &FdtInfo<'_>,
+    ) -> Option<IrqSource>
+    where
+        T: Interface + 'static;
+
+    fn register_net_with_irq<T>(
+        self,
+        name: &'static str,
+        dev: T,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource>
     where
         T: Interface + 'static;
 }
 
 impl PlatformDeviceNet for rdrive::PlatformDevice {
-    fn register_net<T>(self, name: &'static str, dev: T, irq_source: Option<IrqSource>)
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<IrqSource>
     where
         T: Interface + 'static,
     {
-        let net = rd_net::Net::new(dev, axklib::dma::op());
-        self.register(PlatformNetDevice::new(name, net, irq_source));
+        register_net_with_info(self, name, dev, BindingInfo::empty())
     }
+
+    fn register_net_from_fdt<T>(
+        self,
+        name: &'static str,
+        dev: T,
+        info: &FdtInfo<'_>,
+    ) -> Option<IrqSource>
+    where
+        T: Interface + 'static,
+    {
+        register_net_with_info(self, name, dev, BindingInfo::from_fdt(info))
+    }
+
+    fn register_net_with_irq<T>(
+        self,
+        name: &'static str,
+        dev: T,
+        irq_source: Option<IrqSource>,
+    ) -> Option<IrqSource>
+    where
+        T: Interface + 'static,
+    {
+        register_net_with_info(self, name, dev, BindingInfo::with_irq_source(irq_source))
+    }
+}
+
+fn register_net_with_info<T>(
+    plat_dev: rdrive::PlatformDevice,
+    name: &'static str,
+    dev: T,
+    info: BindingInfo,
+) -> Option<IrqSource>
+where
+    T: Interface + 'static,
+{
+    let irq_source = info.irq_source().cloned();
+    let net = rd_net::Net::new(dev, axklib::dma::op());
+    plat_dev.register(PlatformNetDevice::new(name, net, info));
+    irq_source
 }

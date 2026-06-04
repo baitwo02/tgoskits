@@ -50,7 +50,7 @@ fn probe(endpoint: &mut EndpointRc, plat_dev: PlatformDevice) -> Result<(), OnPr
     )
     .map_err(|err| OnProbeError::other(alloc::format!("failed to create e1000: {err:?}")))?;
 
-    plat_dev.register_net(DRIVER_NAME, dev, Some(irq.clone()));
+    plat_dev.register_net_with_irq(DRIVER_NAME, dev, Some(irq.clone()));
     debug!(
         "intel e1000 PCI device registered successfully at {} with irq {:?}",
         address, irq
