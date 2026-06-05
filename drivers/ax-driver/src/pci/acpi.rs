@@ -28,7 +28,7 @@ use rdrive::{
     PlatformDevice,
     probe::{
         OnProbeError,
-        acpi::{AcpiId, AcpiInfo},
+        acpi::{AcpiId, ProbeAcpi},
     },
 };
 
@@ -47,7 +47,8 @@ crate::model_register!(
     ],
 );
 
-fn probe_acpi_ecam(info: AcpiInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe_acpi_ecam(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
+    let (info, plat_dev) = probe.into_parts();
     let mut registered = false;
     for region in info.root.pci_ecam_regions() {
         debug!("ACPI MCFG PCI ECAM region: {region:?}");

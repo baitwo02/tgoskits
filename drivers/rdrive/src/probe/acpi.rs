@@ -628,7 +628,7 @@ impl System {
                 root: self,
                 path: "\\",
             };
-            let res = on_probe(info, PlatformDevice::new(desc));
+            let res = on_probe(ProbeAcpi::new(info, PlatformDevice::new(desc)));
             if res.is_ok() {
                 self.probed_names.lock().insert(register.name);
             }
