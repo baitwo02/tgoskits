@@ -2,9 +2,10 @@
 set -euo pipefail
 
 app_dir="${STARRY_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-base_rootfs="${STARRY_ROOTFS:-${STARRY_BASE_ROOTFS:-}}"
+base_rootfs="${STARRY_ROOTFS:-}"
 staging_root="${STARRY_STAGING_ROOT:-}"
 overlay_dir="${STARRY_OVERLAY_DIR:-}"
+arch="${STARRY_ARCH:-}"
 apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/mosquitto-apk-cache"
 
 require_env() {
@@ -19,7 +20,6 @@ require_env() {
 ensure_host_packages() {
     local missing=()
 
-    command -v apk >/dev/null 2>&1 || missing+=(apk-tools)
     command -v debugfs >/dev/null 2>&1 || missing+=(e2fsprogs)
     command -v install >/dev/null 2>&1 || missing+=(coreutils)
     command -v readelf >/dev/null 2>&1 || missing+=(binutils)
@@ -28,13 +28,87 @@ ensure_host_packages() {
         return
     fi
 
-    if ! command -v apk >/dev/null 2>&1; then
-        echo "error: missing required host packages and apk is unavailable: ${missing[*]}" >&2
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "error: missing required host packages and apt-get is unavailable: ${missing[*]}" >&2
         exit 1
     fi
 
     echo "installing missing host packages: ${missing[*]}"
-    apk add --no-cache "${missing[@]}"
+    apt-get update
+    apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+qemu_runner_candidates() {
+    case "$arch" in
+        aarch64)     printf '%s\n' qemu-aarch64-static qemu-aarch64 ;;
+        riscv64)     printf '%s\n' qemu-riscv64-static qemu-riscv64 ;;
+        x86_64)      printf '%s\n' qemu-x86_64-static qemu-x86_64 ;;
+        loongarch64) printf '%s\n' qemu-loongarch64-static qemu-loongarch64 ;;
+        *)
+            echo "error: unsupported Starry arch for Mosquitto prebuild: $arch" >&2
+            exit 1
+            ;;
+    esac
+}
+
+find_qemu_runner() {
+    local candidate
+    while IFS= read -r candidate; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done < <(qemu_runner_candidates)
+
+    echo "error: missing qemu-user runner for arch $arch; tried: $(qemu_runner_candidates | paste -sd ', ' -)" >&2
+    exit 1
+}
+
+run_guest_apk_once() {
+    local qemu_runner
+    qemu_runner="$(find_qemu_runner)"
+
+    if [[ ! -x "$staging_root/sbin/apk" ]]; then
+        echo "error: staging root is missing guest apk: $staging_root/sbin/apk" >&2
+        exit 1
+    fi
+
+    mkdir -p "$apk_cache"
+    QEMU_LD_PREFIX="$staging_root" \
+    LD_LIBRARY_PATH="$staging_root/lib:$staging_root/usr/lib" \
+        "$qemu_runner" -L "$staging_root" "$staging_root/sbin/apk" \
+            --root "$staging_root" \
+            --repositories-file "$staging_root/etc/apk/repositories" \
+            --keys-dir "$staging_root/etc/apk/keys" \
+            --cache-dir "$apk_cache" \
+            --update-cache \
+            --timeout 60 \
+            --no-interactive \
+            --force-no-chroot \
+            --scripts=no \
+            "$@"
+}
+
+run_guest_apk() {
+    local attempt
+    local max_attempts=4
+
+    if [[ -f /etc/resolv.conf ]]; then
+        cp /etc/resolv.conf "$staging_root/etc/resolv.conf"
+    fi
+
+    for attempt in $(seq 1 "$max_attempts"); do
+        if run_guest_apk_once "$@"; then
+            return 0
+        fi
+
+        if [[ "$attempt" -eq "$max_attempts" ]]; then
+            return 1
+        fi
+
+        echo "apk command failed, retrying ($attempt/$max_attempts)..." >&2
+        sleep $((attempt * 3))
+    done
 }
 
 extract_base_rootfs() {
@@ -42,13 +116,7 @@ extract_base_rootfs() {
 }
 
 install_mosquitto_package() {
-    mkdir -p "$apk_cache"
-    apk --root "$staging_root" \
-        --cache-dir "$apk_cache" \
-        --update-cache \
-        --no-progress \
-        --no-scripts \
-        add mosquitto mosquitto-clients
+    run_guest_apk add mosquitto mosquitto-clients
 }
 
 copy_file_to_overlay() {
@@ -143,6 +211,7 @@ EOF
 require_env STARRY_ROOTFS "$base_rootfs"
 require_env STARRY_STAGING_ROOT "$staging_root"
 require_env STARRY_OVERLAY_DIR "$overlay_dir"
+require_env STARRY_ARCH "$arch"
 
 ensure_host_packages
 extract_base_rootfs

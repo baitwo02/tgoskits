@@ -3,7 +3,7 @@ set -euo pipefail
 
 app_dir="${STARRY_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 arch="${STARRY_ARCH:-x86_64}"
-base_rootfs="${STARRY_ROOTFS:-${STARRY_BASE_ROOTFS:-}}"
+base_rootfs="${STARRY_ROOTFS:-}"
 staging_root="${STARRY_STAGING_ROOT:-}"
 overlay_dir="${STARRY_OVERLAY_DIR:-}"
 apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/pip-apk-cache"

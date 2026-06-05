@@ -5,3 +5,15 @@ apps/starry/llama-cpp
 apps/starry/deepseek-tui
 apps/starry/gdb-smoke
 apps/starry/mariadb
+apps/starry/selfhost/selfhost-full-kernel
+apps/starry/selfhost/test-selfhost-check
+apps/starry/stress/postgresql/postgresql
+apps/starry/qemu/nvme/nvme-rootfs-rw-20m
+apps/starry/qemu/lua-luarocks
+apps/starry/qemu/python-hello
+apps/starry/glibc-dynamic-smoke
+apps/starry/openrc
+apps/starry/k230-kpu-nncase 
+apps/starry/claw-code
+apps/starry/git
+apps/starry/nginx

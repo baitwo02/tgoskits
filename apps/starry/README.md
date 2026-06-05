@@ -27,6 +27,35 @@ apps/starry/<case>/
 - User programs under the case are examples only. The board rootfs must already
   contain the program and its shared libraries unless the case says otherwise.
 
+### Build config notes
+
+For QEMU app cases, keep `plat_dyn = true` in `build-aarch64-unknown-none-softfloat.toml`
+and `build-riscv64gc-unknown-none-elf.toml` unless the case deliberately targets a
+registered static platform. Starry has no static default platform for aarch64 or
+riscv64, so setting `plat_dyn = false` for those generic QEMU targets makes the
+build fail with `no default platform package is registered for arch ...`.
+
+Static `plat_dyn = false` configs are valid for arches with a Starry static
+default, such as x86_64 and loongarch64, or for board/platform-specific cases
+that explicitly select the platform they need.
+
+### QEMU rootfs notes
+
+QEMU app cases must boot with a guest rootfs image that matches the app
+configuration. Standard rootfs image names are fixed: use
+`tmp/axbuild/rootfs/rootfs-<arch>-alpine.img` for Alpine and
+`tmp/axbuild/rootfs/rootfs-<arch>-debian.img` for Debian. Do not rename these
+paths casually; `qemu-<arch>.toml`, prebuild scripts, and overlay injection flows
+treat them as part of the app-runner contract. Prepare the standard image with
+`cargo xtask starry rootfs --arch <arch>` before running a case, unless the case
+README or QEMU config explicitly names a case-specific image.
+
+If a case uses `prebuild.sh` or an overlay, the base image still has to be the
+expected distro and architecture because the app runner extracts files from it,
+installs packages into a staging root, and injects the result back into the QEMU
+rootfs. Keep `-drive ... rootfs-<arch>-alpine.img` and any kernel `root=...`
+argument consistent with the selected image and bus.
+
 Example:
 
 ```bash
@@ -78,7 +107,7 @@ Alpine staging root and injects the Redis binaries, scripts, and runtime
 libraries into the app rootfs overlay.
 
 ```bash
-cargo xtask starry app run -t redis --arch riscv64
+cargo xtask starry app qemu -t redis --arch riscv64
 ```
 
 Stress configs are available through explicit QEMU config variants; see
@@ -90,8 +119,8 @@ The `gdb-smoke` case is a RISC-V QEMU app workflow that prepares a temporary
 rootfs overlay with GDB, GDBServer, and two tiny target programs.
 
 ```bash
-cargo xtask starry app run -t gdb-smoke --arch riscv64
-cargo xtask starry app run -t gdb-smoke --arch riscv64 \
+cargo xtask starry app qemu -t gdb-smoke --arch riscv64
+cargo xtask starry app qemu -t gdb-smoke --arch riscv64 \
   --qemu-config qemu-riscv64-gdbserver.toml
 ```
 
@@ -102,10 +131,10 @@ initializes a fresh data directory, runs an InnoDB SQL workload, and checks that
 the data survives a server restart.
 
 ```bash
-cargo xtask starry app run -t mariadb --arch aarch64
-cargo xtask starry app run -t mariadb --arch loongarch64
-cargo xtask starry app run -t mariadb --arch x86_64
-cargo xtask starry app run -t mariadb --arch riscv64
+cargo xtask starry app qemu -t mariadb --arch aarch64
+cargo xtask starry app qemu -t mariadb --arch loongarch64
+cargo xtask starry app qemu -t mariadb --arch x86_64
+cargo xtask starry app qemu -t mariadb --arch riscv64
 ```
 
 ## jcode
@@ -132,7 +161,7 @@ packages in a staging root during prebuild, injects runtime artifacts to the
 app overlay, then runs nginx smoke tests inside StarryOS.
 
 ```bash
-cargo xtask starry app run -t nginx --arch x86_64
+cargo xtask starry app qemu -t nginx --arch x86_64
 ```
 
 `apps/starry/nginx` maintains four directories: `smoke`, `phase`, `stress`, and

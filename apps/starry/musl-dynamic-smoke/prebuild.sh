@@ -3,14 +3,14 @@ set -euo pipefail
 
 app_dir="${STARRY_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 overlay_dir="${STARRY_OVERLAY_DIR:-}"
-base_rootfs="${STARRY_BASE_ROOTFS:-}"
+base_rootfs="${STARRY_ROOTFS:-}"
 
 if [[ -z "$overlay_dir" ]]; then
     echo "error: STARRY_OVERLAY_DIR is required" >&2
     exit 1
 fi
 if [[ -z "$base_rootfs" ]]; then
-    echo "error: STARRY_BASE_ROOTFS is required" >&2
+    echo "error: STARRY_ROOTFS is required" >&2
     exit 1
 fi
 
@@ -34,25 +34,135 @@ case "$STARRY_ARCH" in
 esac
 
 command -v debugfs >/dev/null 2>&1 || { echo "ERROR: debugfs not found" >&2; exit 1; }
+command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf not found" >&2; exit 1; }
 
-# Resolve the lld driver on PATH. Debian/Ubuntu's llvm-14 package installs the
-# linker as 'ld.lld', while Arch/Alpine symlink the wrapper as 'lld'. Accept
-# either so a system that has clang+ld.lld does not silently fall back to
-# musl-cross GCC, whose default GNU ld cannot consume the .relr.dyn section
-# shipped in current Alpine libc.so.
+qemu_runner() {
+    case "$STARRY_ARCH" in
+        aarch64) printf "%s\n" qemu-aarch64-static ;;
+        riscv64) printf "%s\n" qemu-riscv64-static ;;
+        x86_64) printf "%s\n" qemu-x86_64-static ;;
+        *) echo "ERROR: unsupported arch for qemu-user: $STARRY_ARCH" >&2; return 1 ;;
+    esac
+}
+
+install_lld_in_sysroot() {
+    if [[ -x "$sysroot/usr/bin/ld.lld" ]]; then
+        return
+    fi
+    lld_installed_in_prebuild=1
+
+    local runner
+    runner="$(qemu_runner)"
+    command -v "$runner" >/dev/null 2>&1 || { echo "ERROR: $runner not found; cannot install lld into rootfs" >&2; exit 1; }
+    [[ -x "$sysroot/sbin/apk" ]] || { echo "ERROR: rootfs is missing /sbin/apk; cannot install lld" >&2; exit 1; }
+
+    if [[ -f /etc/resolv.conf ]]; then
+        cp /etc/resolv.conf "$sysroot/etc/resolv.conf"
+    fi
+
+    local apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/musl-dynamic-smoke-apk-cache"
+    mkdir -p "$apk_cache"
+    echo "installing lld into $STARRY_ARCH rootfs staging..."
+    QEMU_LD_PREFIX="$sysroot" \
+    LD_LIBRARY_PATH="$sysroot/lib:$sysroot/usr/lib" \
+        "$runner" -L "$sysroot" "$sysroot/sbin/apk" \
+            --root "$sysroot" \
+            --repositories-file "$sysroot/etc/apk/repositories" \
+            --keys-dir "$sysroot/etc/apk/keys" \
+            --cache-dir "$apk_cache" \
+            --update-cache \
+            --timeout 60 \
+            --no-interactive \
+            --force-no-chroot \
+            --scripts=no \
+            add lld
+}
+
+copy_rootfs_file_to_overlay() {
+    local guest_path="$1"
+    local mode="$2"
+    local source="$sysroot$guest_path"
+    local target="$overlay_dir$guest_path"
+
+    [[ -e "$source" ]] || { echo "ERROR: missing rootfs file after lld install: $guest_path" >&2; exit 1; }
+    if [[ -L "$source" ]]; then
+        source="$(readlink -f "$source")"
+    fi
+    install -Dm"$mode" "$source" "$target"
+}
+
+find_rootfs_library_path() {
+    local library="$1"
+    local dir
+    for dir in lib usr/lib usr/local/lib; do
+        if [[ -e "$sysroot/$dir/$library" ]]; then
+            printf "/%s/%s\n" "$dir" "$library"
+            return 0
+        fi
+    done
+    return 1
+}
+
+copy_lld_runtime_to_overlay() {
+    local pending=(/usr/bin/ld.lld /usr/bin/lld)
+    local seen=" "
+    local guest_path library library_path
+
+    while [[ ${#pending[@]} -gt 0 ]]; do
+        guest_path="${pending[0]}"
+        pending=("${pending[@]:1}")
+        if [[ "$seen" == *" $guest_path "* ]]; then
+            continue
+        fi
+        seen+="$guest_path "
+
+        copy_rootfs_file_to_overlay "$guest_path" 0755
+        while IFS= read -r library; do
+            if library_path="$(find_rootfs_library_path "$library")"; then
+                pending+=("$library_path")
+            fi
+        done < <(readelf -d "$sysroot$guest_path" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+    done
+}
+
+# Resolve an ELF lld driver on PATH. clang/GCC use `-fuse-ld=lld`,
+# which looks for an `ld.lld`-style driver, so wrap generic `lld` or
+# Rust toolchain `rust-lld` with `-flavor gnu` when needed. This avoids
+# falling back to musl-cross GCC's default GNU ld, which cannot consume
+# the .relr.dyn section shipped in current Alpine libc.so.
 lld_linker=""
-if command -v lld >/dev/null 2>&1; then
-    lld_linker="lld"
-elif command -v ld.lld >/dev/null 2>&1; then
-    lld_linker="ld.lld"
+lld_linker_dir=""
+lld_installed_in_prebuild=""
+if command -v ld.lld >/dev/null 2>&1; then
+    lld_linker="$(command -v ld.lld)"
+elif command -v lld >/dev/null 2>&1; then
+    lld_linker_dir="$(mktemp -d)"
+    printf '#!/usr/bin/env bash\nexec %q -flavor gnu "$@"\n' \
+        "$(command -v lld)" >"$lld_linker_dir/ld.lld"
+    chmod +x "$lld_linker_dir/ld.lld"
+    lld_linker="$lld_linker_dir/ld.lld"
+elif command -v rust-lld >/dev/null 2>&1; then
+    lld_linker_dir="$(mktemp -d)"
+    printf '#!/usr/bin/env bash\nexec %q -flavor gnu "$@"\n' \
+        "$(command -v rust-lld)" >"$lld_linker_dir/ld.lld"
+    chmod +x "$lld_linker_dir/ld.lld"
+    lld_linker="$lld_linker_dir/ld.lld"
+fi
+if [[ -n "$lld_linker_dir" ]]; then
+    PATH="$lld_linker_dir:$PATH"
 fi
 
 # Build into a temp directory so the compiled ELF never lands inside the
 # application source tree. The trap cleans both sysroot and build_dir on exit.
 sysroot="$(mktemp -d)"
 build_dir="$(mktemp -d)"
-trap 'rm -rf "$sysroot" "$build_dir"' EXIT
+trap 'rm -rf "$sysroot" "$build_dir" "$lld_linker_dir"' EXIT
 debugfs -R "rdump / $sysroot" "$base_rootfs" >/dev/null 2>&1
+install_lld_in_sysroot
+if [[ -n "$lld_installed_in_prebuild" ]]; then
+    copy_lld_runtime_to_overlay
+    copy_rootfs_file_to_overlay /lib/apk/db/installed 0644
+fi
 
 if command -v clang >/dev/null 2>&1 && [[ -n "$lld_linker" ]]; then
     CC="clang"
@@ -68,13 +178,13 @@ elif command -v "${MUSL_TARGET}-gcc" >/dev/null 2>&1; then
         # Alpine libc.so.
         CC_FLAGS="--sysroot=$sysroot -nostdlib -fuse-ld=lld"
     else
-        echo "ERROR: ${MUSL_TARGET}-gcc found, but no lld driver (lld or ld.lld) on PATH." >&2
+        echo "ERROR: ${MUSL_TARGET}-gcc found, but no lld driver (lld, ld.lld, or rust-lld) on PATH." >&2
         echo "  The Alpine rootfs in this smoke case uses .relr.dyn, which GNU ld cannot consume." >&2
-        echo "  Install lld/lld.lld (e.g. 'apt-get install lld-14') and retry." >&2
+        echo "  Install lld/lld.lld (e.g. 'apt-get install lld-14') or a Rust toolchain with rust-lld and retry." >&2
         exit 1
     fi
 else
-    echo "ERROR: no compiler for $MUSL_TARGET (tried clang+lld/lld.lld, ${MUSL_TARGET}-gcc)" >&2
+    echo "ERROR: no compiler for $MUSL_TARGET (tried clang+lld/ld.lld/rust-lld, ${MUSL_TARGET}-gcc)" >&2
     exit 1
 fi
 

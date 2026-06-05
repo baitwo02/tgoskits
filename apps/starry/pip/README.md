@@ -20,7 +20,7 @@
 ## 运行测试
 
 ```bash
-cargo xtask starry app run -t pip
+cargo xtask starry app qemu -t pip
 ```
 
 ## 在 Linux 主机上快速验证测试脚本

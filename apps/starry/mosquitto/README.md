@@ -32,20 +32,20 @@ Mosquitto是一个轻量级的MQTT消息代理（broker），实现了MQTT协议
 默认运行全部测试（smoke + normal + stress）：
 
 ```bash
-cargo xtask starry app run -t mosquitto --arch x86_64
+cargo xtask starry app qemu -t mosquitto --arch x86_64
 ```
 
 也可以单独运行某个级别：
 
 ```bash
 # 仅 Smoke 测试
-cargo xtask starry app run -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-smoke.toml
+cargo xtask starry app qemu -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-smoke.toml
 
 # 仅普通测试
-cargo xtask starry app run -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-normal.toml
+cargo xtask starry app qemu -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-normal.toml
 
 # 仅压力测试
-cargo xtask starry app run -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-stress.toml
+cargo xtask starry app qemu -t mosquitto --arch x86_64 --qemu-config qemu-x86_64-stress.toml
 ```
 
 ## 测试内容
