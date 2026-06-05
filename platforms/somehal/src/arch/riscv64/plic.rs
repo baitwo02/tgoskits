@@ -9,9 +9,9 @@ use ax_riscv_plic::{PLICRegs, Plic, PlicIrqHandler};
 use kernutil::StaticCell;
 use rdif_intc::Interface;
 use rdrive::{
-    Device, DriverGeneric, Phandle, PlatformDevice, module_driver,
-    probe::{OnProbeError, fdt::NodeType},
-    register::FdtInfo,
+    Device, DriverGeneric, Phandle, module_driver,
+    probe::OnProbeError,
+    register::{FdtInfo, ProbeFdt},
 };
 use riscv::register::{sie, sip};
 use sbi_rt::HartMask;
@@ -139,7 +139,8 @@ pub fn send_ipi_to_cpu(cpu_id: usize) {
     }
 }
 
-fn probe_plic(info: FdtInfo<'_>, dev: PlatformDevice) -> Result<(), OnProbeError> {
+fn probe_plic(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let (info, dev) = probe.into_parts();
     let reg = info
         .node
         .regs()
