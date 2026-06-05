@@ -7,9 +7,9 @@ use core::{
 };
 
 use ax_kernel_guard::NoPreemptIrqSave;
-use rd_net::{DmaBuffer, Event, IRxQueue, ITxQueue, NetError, QueueConfig};
 #[cfg(any(plat_static, plat_dyn))]
 use rd_net::Interface;
+use rd_net::{DmaBuffer, Event, IRxQueue, ITxQueue, NetError, QueueConfig};
 use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError};
 #[cfg(any(plat_static, plat_dyn))]
 use virtio_drivers::transport::DeviceType;
