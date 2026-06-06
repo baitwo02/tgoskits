@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13](https://github.com/rcore-os/tgoskits/compare/x86_vlapic-v0.4.12...x86_vlapic-v0.4.13) - 2026-06-06
+
+### Fixed
+
+- *(axvisor)* cache x86 emulated devices directly and harden vCPU interrupt queuing ([#1137](https://github.com/rcore-os/tgoskits/pull/1137))
+
 ### Fixed
 
 - publish the host interface module used by `axvm`

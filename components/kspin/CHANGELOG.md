@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11](https://github.com/rcore-os/tgoskits/compare/ax-kspin-v0.3.10...ax-kspin-v0.3.11) - 2026-06-06
+
+### Fixed
+
+- *(lockdep)* resolve Starry lock ordering and log print issues ([#1103](https://github.com/rcore-os/tgoskits/pull/1103))
+
 ## [0.3.10](https://github.com/rcore-os/tgoskits/compare/ax-kspin-v0.3.9...ax-kspin-v0.3.10) - 2026-06-03
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/rcore-os/tgoskits/compare/someboot-v0.1.16...someboot-v0.1.17) - 2026-06-06
+
+### Fixed
+
+- *(ci)* switch x86_64 defaults to dynamic platform ([#1024](https://github.com/rcore-os/tgoskits/pull/1024))
+
 ## [0.1.16](https://github.com/rcore-os/tgoskits/compare/someboot-v0.1.15...someboot-v0.1.16) - 2026-06-03
 
 ### Added

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.6](https://github.com/rcore-os/tgoskits/compare/ax-cpu-v0.6.5...ax-cpu-v0.6.6) - 2026-06-06
+
+### Fixed
+
+- *(axcpu-aarch64)* emulate EL0 MRS reads of ID_AA64* feature registers ([#1128](https://github.com/rcore-os/tgoskits/pull/1128))
+- *(ci)* switch x86_64 defaults to dynamic platform ([#1024](https://github.com/rcore-os/tgoskits/pull/1024))
+
+### Other
+
+- *(starryos)* add K230 NNCase runtime demo ([#1058](https://github.com/rcore-os/tgoskits/pull/1058))
+
 ## [0.6.5](https://github.com/rcore-os/tgoskits/compare/ax-cpu-v0.6.4...ax-cpu-v0.6.5) - 2026-06-03
 
 ### Added

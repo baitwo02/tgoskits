@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.9...axbuild-v0.4.10) - 2026-06-06
+
+### Added
+
+- *(starry)* wire qperf app runtime into Starry perf ([#1095](https://github.com/rcore-os/tgoskits/pull/1095))
+- *(backtrace)* add showcase workflow ([#1094](https://github.com/rcore-os/tgoskits/pull/1094))
+- *(starry-kernel)* support waitid P_PIDFD ([#1051](https://github.com/rcore-os/tgoskits/pull/1051))
+- *(axbuild)* improve incremental clippy coverage ([#1088](https://github.com/rcore-os/tgoskits/pull/1088))
+
+### Fixed
+
+- *(axbuild)* infer diff base for zero since ref ([#1143](https://github.com/rcore-os/tgoskits/pull/1143))
+- *(ci)* switch x86_64 defaults to dynamic platform ([#1024](https://github.com/rcore-os/tgoskits/pull/1024))
+
+### Other
+
+- *(axbuild)* pin ostool runtime bin fix ([#1158](https://github.com/rcore-os/tgoskits/pull/1158))
+- *(starry)* add grouped step markers ([#1138](https://github.com/rcore-os/tgoskits/pull/1138))
+- Refactor Axvisor to unify ArceOS API and improve modularity ([#1019](https://github.com/rcore-os/tgoskits/pull/1019))
+
 ## [0.4.9](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.8...axbuild-v0.4.9) - 2026-06-03
 
 ### Added
