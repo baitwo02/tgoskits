@@ -246,7 +246,11 @@ jobs:
       container_image: >-
         ${{
           matrix.container_image == 'base'
-          && format('{0}:latest', needs.detect_changes.outputs.base_container_image)
+          && (
+            github.event.repository.fork
+            && 'ghcr.io/rcore-os/tgoskits-container:latest'
+            || format('{0}:latest', needs.detect_changes.outputs.base_container_image)
+          )
           || matrix.container_image
         }}
       fetch_depth: ${{ matrix.fetch_depth == 'full' && '0' || '1' }}
@@ -588,9 +592,17 @@ jobs:
       container_image: >-
         ${{
           matrix.container_image == 'base'
-          && format('{0}:latest', needs.detect_changes.outputs.base_container_image)
+          && (
+            github.event.repository.fork
+            && 'ghcr.io/rcore-os/tgoskits-container:latest'
+            || format('{0}:latest', needs.detect_changes.outputs.base_container_image)
+          )
           || matrix.container_image == 'axvisor-lvz'
-          && format('{0}:latest', needs.detect_changes.outputs.axvisor_lvz_container_image)
+          && (
+            github.event.repository.fork
+            && 'ghcr.io/rcore-os/tgoskits-container-axvisor-lvz:latest'
+            || format('{0}:latest', needs.detect_changes.outputs.axvisor_lvz_container_image)
+          )
           || matrix.container_image
         }}
       apk_region: ${{ matrix.apk_region || 'china' }}
