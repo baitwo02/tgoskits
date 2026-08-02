@@ -7,15 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1](https://github.com/rcore-os/tgoskits/compare/axivc-v0.1.0...axivc-v0.1.1) - 2026-09-09
-
 ### Added
 
-- feat(StarryOS)：Enhance axivc IVC char devices and improve ioctl handling ([#2214](https://github.com/rcore-os/tgoskits/pull/2214))
+- Added allocation-free Message V1 framing with nonblocking fragmented send,
+  receive, discard, and abort state machines.
+- Added explicit protocol errors for malformed frames, inconsistent message
+  metadata, output-buffer exhaustion, and transfer aborts.
+- Added streaming, malformed-input, long-message, SPSC concurrency, and
+  ArceOS full-duplex coverage.
 
-### Fixed
+### Changed
 
-- *(repo)* remove redundant Cargo manifest declarations ([#2297](https://github.com/rcore-os/tgoskits/pull/2297))
+- Changed ring storage into opaque 64-byte cells and moved Request/Ack plus
+  application sequence semantics out of `axivc` payload transport.
+- Upgraded the shared region layout from v2 to v3. This is intentionally
+  incompatible with v2 peers; the publish/subscribe/notify HVC ABI is unchanged.
+- Migrated the ArceOS publisher and subscriber demos to application-owned
+  Request/Ack/Data payloads with strict sequence, length, and body validation
+  across fragment, ring-capacity, and backpressure boundaries.
+
+### Removed
+
+- Removed the fixed 48-byte `IvcProducer`/`IvcConsumer` API and
+  `IvcMessageKind` application protocol from the transport crate.
+
+### Compatibility
+
+- The external Linux `axvisor.ko` companion has not yet been migrated to region
+  v3 and must be updated before the ArceOS-to-Linux QEMU case is compatible.
 
 ## [0.1.0] - 2026-07-15
 
