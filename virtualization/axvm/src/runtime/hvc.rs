@@ -688,7 +688,7 @@ impl HyperCall {
                     notify_irq
                 );
 
-                Ok(0)
+                Ok(HyperCallOutcome::Return(0))
             }
             _ => {
                 warn!("Unsupported hypercall code: {:?}", self.code);
