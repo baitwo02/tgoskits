@@ -13,6 +13,24 @@ fn main() {
 #[cfg(not(feature = "arceos"))]
 fn main() {}
 
+#[cfg(any(feature = "arceos", test))]
+fn ack_body_is_valid(body: &[u8]) -> bool {
+    matches!(
+        body,
+        b"ack from arceos subscriber" | b"ack from linux subscriber"
+    )
+}
+
+#[cfg(any(feature = "arceos", test))]
+fn reply_stream_is_complete(
+    next_ack_sequence: u64,
+    ack_count: u64,
+    next_data_sequence: u64,
+    data_count: u64,
+) -> bool {
+    next_ack_sequence == ack_count + 1 && next_data_sequence == data_count + 1
+}
+
 #[cfg(feature = "arceos")]
 mod publisher {
     use core::{cell::UnsafeCell, result::Result::Err, sync::atomic::AtomicU64};
@@ -29,7 +47,8 @@ mod publisher {
         IvcMessageReceiver, IvcMessageSender, IvcPeerEventWaiter, IvcRegion, record_peer_event,
     };
 
-    const ACK_BODY: &[u8] = b"ack from arceos subscriber";
+    use super::{ack_body_is_valid, reply_stream_is_complete};
+
     const APP_HEADER_LEN: usize = 11;
     const APP_MAX_MESSAGE_LEN: usize = 700;
     const REQUEST_MESSAGE_LENGTHS: [usize; 5] = [39, 40, 41, 640, 700];
@@ -87,22 +106,24 @@ mod publisher {
         // consume IRQ observations meant to wake the other.
         let sender = thread::spawn(move || {
             let waiter = IvcPeerEventWaiter::new(irq_enabled, &NOTIFY_IRQ_COUNT);
-            sender_task(publish_producer, &waiter);
+            sender_task(publish_producer, &waiter)
         });
         let receiver = thread::spawn(move || {
             let waiter = IvcPeerEventWaiter::new(irq_enabled, &NOTIFY_IRQ_COUNT);
-            receiver_task(publish_consumer, &waiter);
+            receiver_task(publish_consumer, &waiter)
         });
 
-        sender.join().expect("sender thread panicked");
-        receiver.join().expect("receiver thread panicked");
+        let sender_succeeded = sender.join().expect("sender thread panicked");
+        let receiver_succeeded = receiver.join().expect("receiver thread panicked");
 
-        println!("ivc full-duplex demo complete");
+        if sender_succeeded && receiver_succeeded {
+            println!("ivc full-duplex demo complete");
+        }
     }
 
     /// Sends messages spanning one-cell, fragment-boundary, ring-boundary, and
     /// backpressured lengths without waiting for individual acknowledgements.
-    fn sender_task(mut sender: IvcMessageSender<'_>, waiter: &IvcPeerEventWaiter<'_>) {
+    fn sender_task(mut sender: IvcMessageSender<'_>, waiter: &IvcPeerEventWaiter<'_>) -> bool {
         let mut payload = [0u8; APP_MAX_MESSAGE_LEN];
         let mut subscriber_ready = false;
         for (index, &message_len) in REQUEST_MESSAGE_LENGTHS.iter().enumerate() {
@@ -110,18 +131,22 @@ mod publisher {
             let message = &mut payload[..message_len];
             if !encode_pattern_message(message, AppMessageKind::Request, sequence) {
                 println!("ivc validation failed: cannot encode request seq={sequence}");
-                return;
+                return false;
             }
             if !send_payload(&mut sender, message, waiter, &mut subscriber_ready) {
-                return;
+                return false;
             }
             println!("ivc send seq={sequence} len={message_len}");
         }
+        true
     }
 
     /// Receives independently sequenced Data and Ack messages and rejects any
     /// duplicate, gap, reorder, length mismatch, or body corruption.
-    fn receiver_task(mut receiver: IvcMessageReceiver<'_>, waiter: &IvcPeerEventWaiter<'_>) {
+    fn receiver_task(
+        mut receiver: IvcMessageReceiver<'_>,
+        waiter: &IvcPeerEventWaiter<'_>,
+    ) -> bool {
         let mut payload = [0u8; APP_MAX_MESSAGE_LEN];
         let mut received = 0;
         let mut expected_ack_sequence = 1u64;
@@ -132,7 +157,7 @@ mod publisher {
                     Ok(Some(meta)) if message_fits(meta.len(), payload.len()) => {}
                     Ok(Some(meta)) => {
                         println!("ivc recv error oversized message len={}", meta.len());
-                        return;
+                        return false;
                     }
                     Ok(None) => {
                         waiter.wait_for_peer_event();
@@ -140,7 +165,7 @@ mod publisher {
                     }
                     Err(err) => {
                         println!("ivc recv error {err:?}");
-                        return;
+                        return false;
                     }
                 }
             }
@@ -154,12 +179,12 @@ mod publisher {
                     if progress.is_complete() {
                         let Some(message) = decode_app_message(&payload[..received]) else {
                             println!("ivc recv error malformed application payload");
-                            return;
+                            return false;
                         };
                         match message.kind {
                             AppMessageKind::Ack => {
                                 if message.sequence != expected_ack_sequence
-                                    || message.body != ACK_BODY
+                                    || !ack_body_is_valid(message.body)
                                 {
                                     println!(
                                         "ivc validation failed: ack expected={} actual={} len={}",
@@ -167,26 +192,12 @@ mod publisher {
                                         message.sequence,
                                         message.body.len()
                                     );
-                                    return;
-                                }
-                                if expected_ack_sequence == PUBLISH_COUNT
-                                    && expected_data_sequence
-                                        != SUBSCRIBER_DATA_MESSAGE_LENGTHS.len() as u64 + 1
-                                {
-                                    println!(
-                                        "ivc validation failed: missing subscriber data \
-                                         expected={}",
-                                        expected_data_sequence
-                                    );
-                                    return;
+                                    return false;
                                 }
                                 let text =
                                     core::str::from_utf8(message.body).unwrap_or("<non-utf8>");
                                 println!("ivc ack seq={} msg={text}", message.sequence);
                                 expected_ack_sequence += 1;
-                                if expected_ack_sequence == PUBLISH_COUNT + 1 {
-                                    return;
-                                }
                             }
                             AppMessageKind::Data => {
                                 let Some(&expected_len) = SUBSCRIBER_DATA_MESSAGE_LENGTHS
@@ -196,7 +207,7 @@ mod publisher {
                                         "ivc validation failed: unexpected subscriber data seq={}",
                                         message.sequence
                                     );
-                                    return;
+                                    return false;
                                 };
                                 if !validate_pattern_message(
                                     &message,
@@ -209,7 +220,7 @@ mod publisher {
                                          actual={} len={}",
                                         expected_data_sequence, message.sequence, received
                                     );
-                                    return;
+                                    return false;
                                 }
                                 let text =
                                     core::str::from_utf8(message.body).unwrap_or("<non-utf8>");
@@ -221,8 +232,16 @@ mod publisher {
                             }
                             AppMessageKind::Request => {
                                 println!("ivc validation failed: unexpected Request on reply ring");
-                                return;
+                                return false;
                             }
+                        }
+                        if reply_stream_is_complete(
+                            expected_ack_sequence,
+                            PUBLISH_COUNT,
+                            expected_data_sequence,
+                            SUBSCRIBER_DATA_MESSAGE_LENGTHS.len() as u64,
+                        ) {
+                            return true;
                         }
                         received = 0;
                     } else if progress.consumed_cells() == 0 {
@@ -231,7 +250,7 @@ mod publisher {
                 }
                 Err(err) => {
                     println!("ivc recv ack error {err:?}");
-                    return;
+                    return false;
                 }
             }
         }
@@ -437,5 +456,33 @@ mod publisher {
             // the shared region before subscribers can use the Message V1 rings.
             Some(&mut *(vaddr.as_mut_ptr() as *mut IvcRegion))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ack_body_is_valid, reply_stream_is_complete};
+
+    #[test]
+    fn final_ack_does_not_complete_before_final_subscriber_data() {
+        assert!(!reply_stream_is_complete(6, 5, 3, 3));
+    }
+
+    #[test]
+    fn reply_stream_completes_after_all_ack_and_data_messages() {
+        assert!(reply_stream_is_complete(6, 5, 4, 3));
+    }
+
+    #[test]
+    fn accepts_arceos_and_linux_subscriber_ack_bodies() {
+        assert!(ack_body_is_valid(b"ack from arceos subscriber"));
+        assert!(ack_body_is_valid(b"ack from linux subscriber"));
+    }
+
+    #[test]
+    fn rejects_unknown_or_non_subscriber_ack_bodies() {
+        assert!(!ack_body_is_valid(b"ack from subscriber"));
+        assert!(!ack_body_is_valid(b"ack from unknown subscriber"));
+        assert!(!ack_body_is_valid(b"ack from linux publisher"));
     }
 }

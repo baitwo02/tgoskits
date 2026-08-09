@@ -43,12 +43,6 @@ const EXCEPTION_SYNC: usize = TrapKind::Synchronous as usize;
 /// Equals to [`TrapKind::Irq`], used in exception.S.
 const EXCEPTION_IRQ: usize = TrapKind::Irq as usize;
 
-const AARCH64_EXCEPTION_INSN_SIZE: usize = 4;
-
-fn advance_aarch64_exception_pc(ctx: &mut TrapFrame) {
-    ctx.set_exception_pc(ctx.exception_pc() + AARCH64_EXCEPTION_INSN_SIZE);
-}
-
 #[repr(u8)]
 #[derive(Debug)]
 #[allow(unused)]
@@ -100,6 +94,8 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
         Some(ESR_EL2::EC::Value::HVC64) => {
             // The `#imm` argument when triggering a hvc call, currently not used.
             let _hvc_arg_imm16 = ESR_EL2.read(ESR_EL2::ISS);
+            // ELR_EL2 already holds the post-HVC return address. Advancing it
+            // again would skip the guest instruction that consumes x0.
 
             if let Some(result) = handle_hvc_psci_version(ctx) {
                 return result;
@@ -140,14 +136,11 @@ fn handle_hvc_psci_version(ctx: &mut TrapFrame) -> Option<ArmVcpuResult<ArmVmExi
         return None;
     }
 
-    advance_aarch64_exception_pc(ctx);
     ctx.set_gpr(0, PSCI_VERSION_0_2);
     Some(Ok(ArmVmExit::Nothing))
 }
 
 fn handle_hvc64_exception(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
-    advance_aarch64_exception_pc(ctx);
-
     // Is this a psci call?
     //
     // By convention, a psci call can use either the `hvc` or the `smc` instruction.
@@ -386,25 +379,22 @@ mod tests {
     const TEST_PC: usize = 0x8020_0000;
 
     #[test]
-    fn hvc_psci_exit_advances_exception_pc() {
+    fn hvc_psci_version_preserves_hardware_return_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, PSCI_VERSION_32 as usize);
 
-        let exit = handle_hvc64_exception(&mut ctx).expect("PSCI HVC should produce VM exit");
+        let exit = handle_hvc_psci_version(&mut ctx)
+            .expect("PSCI_VERSION should use the fast path")
+            .expect("PSCI_VERSION HVC should succeed");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
-        assert!(matches!(
-            exit,
-            ArmVmExit::Hypercall {
-                nr: PSCI_VERSION_32,
-                ..
-            }
-        ));
+        assert_eq!(ctx.exception_pc(), TEST_PC);
+        assert_eq!(ctx.gpr(0), 2);
+        assert!(matches!(exit, ArmVmExit::Nothing));
     }
 
     #[test]
-    fn generic_hvc_exit_advances_exception_pc() {
+    fn generic_hvc_preserves_hardware_return_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, GENERIC_HVC_NR as usize);
@@ -413,7 +403,7 @@ mod tests {
 
         let exit = handle_hvc64_exception(&mut ctx).expect("generic HVC should produce VM exit");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
+        assert_eq!(ctx.exception_pc(), TEST_PC);
         assert!(matches!(
             exit,
             ArmVmExit::Hypercall {

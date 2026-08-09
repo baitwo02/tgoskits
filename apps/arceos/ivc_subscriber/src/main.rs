@@ -103,17 +103,19 @@ mod subscriber {
         // consume IRQ observations meant to wake the other.
         let sender = thread::spawn(move || {
             let waiter = IvcPeerEventWaiter::new(irq_enabled, &NOTIFY_IRQ_COUNT);
-            sender_task(reply_producer, &waiter);
+            sender_task(reply_producer, &waiter)
         });
         let receiver = thread::spawn(move || {
             let waiter = IvcPeerEventWaiter::new(irq_enabled, &NOTIFY_IRQ_COUNT);
-            receiver_task(request_consumer, &waiter);
+            receiver_task(request_consumer, &waiter)
         });
 
-        sender.join().expect("sender thread panicked");
-        receiver.join().expect("receiver thread panicked");
+        let sender_succeeded = sender.join().expect("sender thread panicked");
+        let receiver_succeeded = receiver.join().expect("receiver thread panicked");
 
-        println!("ivc subscriber full-duplex demo complete");
+        if sender_succeeded && receiver_succeeded {
+            println!("ivc subscriber full-duplex demo complete");
+        }
     }
 
     fn wait_for_protocol_header(region: &IvcRegion, waiter: &IvcPeerEventWaiter<'_>) -> bool {
@@ -153,7 +155,7 @@ mod subscriber {
 
     /// Sends independently sequenced Data and Ack messages on one Message V1
     /// direction without interleaving their fragments.
-    fn sender_task(mut sender: IvcMessageSender<'_>, waiter: &IvcPeerEventWaiter<'_>) {
+    fn sender_task(mut sender: IvcMessageSender<'_>, waiter: &IvcPeerEventWaiter<'_>) -> bool {
         let mut data_payload = [0u8; APP_MAX_MESSAGE_LEN];
         let mut sent_data = 0u64;
         let mut last_acked_sequence = 0u64;
@@ -166,10 +168,10 @@ mod subscriber {
                 let payload = &mut data_payload[..message_len];
                 if !encode_pattern_message(payload, AppMessageKind::Data, sequence) {
                     println!("ivc validation failed: cannot encode data seq={sequence}");
-                    return;
+                    return false;
                 }
                 if !send_payload(&mut sender, payload, waiter, &mut publisher_ready) {
-                    return;
+                    return false;
                 }
                 sent_data = sequence;
                 println!("ivc send data seq={sent_data} len={message_len}");
@@ -180,14 +182,14 @@ mod subscriber {
                 let sequence = last_acked_sequence + 1;
                 let payload = encode_ack(sequence);
                 if !send_payload(&mut sender, &payload, waiter, &mut publisher_ready) {
-                    return;
+                    return false;
                 }
                 last_acked_sequence = sequence;
                 println!("ivc ack pub seq={last_acked_sequence}");
             }
 
             if sent_data == SUBSCRIBE_DATA_COUNT && last_acked_sequence == PUBLISH_COUNT {
-                return;
+                return true;
             }
             waiter.wait_for_peer_event();
         }
@@ -195,7 +197,10 @@ mod subscriber {
 
     /// Receives publisher Requests and rejects any duplicate, gap, reorder,
     /// length mismatch, kind mismatch, or body corruption.
-    fn receiver_task(mut receiver: IvcMessageReceiver<'_>, waiter: &IvcPeerEventWaiter<'_>) {
+    fn receiver_task(
+        mut receiver: IvcMessageReceiver<'_>,
+        waiter: &IvcPeerEventWaiter<'_>,
+    ) -> bool {
         let mut payload = [0u8; APP_MAX_MESSAGE_LEN];
         let mut received = 0;
         let mut expected_sequence = 1u64;
@@ -205,7 +210,7 @@ mod subscriber {
                     Ok(Some(meta)) if message_fits(meta.len(), payload.len()) => {}
                     Ok(Some(meta)) => {
                         println!("ivc recv error oversized message len={}", meta.len());
-                        return;
+                        return false;
                     }
                     Ok(None) => {
                         waiter.wait_for_peer_event();
@@ -213,7 +218,7 @@ mod subscriber {
                     }
                     Err(err) => {
                         println!("ivc recv error {err:?}");
-                        return;
+                        return false;
                     }
                 }
             }
@@ -227,7 +232,7 @@ mod subscriber {
                     if progress.is_complete() {
                         let Some(message) = decode_app_message(&payload[..received]) else {
                             println!("ivc recv error malformed application payload");
-                            return;
+                            return false;
                         };
                         let Some(&expected_len) =
                             REQUEST_MESSAGE_LENGTHS.get((expected_sequence - 1) as usize)
@@ -236,7 +241,7 @@ mod subscriber {
                                 "ivc validation failed: unexpected request seq={}",
                                 message.sequence
                             );
-                            return;
+                            return false;
                         };
                         if !validate_pattern_message(
                             &message,
@@ -248,7 +253,7 @@ mod subscriber {
                                 "ivc validation failed: request expected={} actual={} len={}",
                                 expected_sequence, message.sequence, received
                             );
-                            return;
+                            return false;
                         }
                         let text = core::str::from_utf8(message.body).unwrap_or("<non-utf8>");
                         println!(
@@ -258,7 +263,7 @@ mod subscriber {
                         HIGHEST_RECV_SEQ.store(expected_sequence, Ordering::Release);
                         expected_sequence += 1;
                         if expected_sequence == PUBLISH_COUNT + 1 {
-                            return;
+                            return true;
                         }
                         received = 0;
                     } else if progress.consumed_cells() == 0 {
@@ -267,7 +272,7 @@ mod subscriber {
                 }
                 Err(err) => {
                     println!("ivc recv error {err:?}");
-                    return;
+                    return false;
                 }
             }
         }

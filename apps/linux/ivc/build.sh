@@ -66,9 +66,10 @@ build_user_program() {
 
     "${demo_cross}gcc" \
         -I"${script_dir}/include" \
-        -Wall -Wextra -Os -s -Wl,--gc-sections -static \
+        -std=gnu11 -Wall -Wextra -Werror -Os -s -Wl,--gc-sections -static \
         -o "${out_dir}/${name}" \
         "${source}" \
+        "${script_dir}/lib/app_proto.c" \
         "${script_dir}/lib/ivc.c"
 }
 

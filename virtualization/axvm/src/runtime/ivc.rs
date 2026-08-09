@@ -382,6 +382,18 @@ impl<H: PagingHandler> IVCChannel<H> {
             operation: "allocate IVC shared region frames",
         })?;
 
+        unsafe {
+            // The frame allocator does not promise zeroed DMA pages. Clear the
+            // region before the channel is inserted into the global table so a
+            // concurrently running subscriber can never accept a valid-looking
+            // protocol header or ring state left by an earlier channel.
+            core::ptr::write_bytes(
+                H::phys_to_virt(shared_region_base).as_mut_ptr(),
+                0,
+                shared_region_size,
+            );
+        }
+
         let mut channel = IVCChannel {
             publisher_vm_id,
             key,
@@ -529,7 +541,12 @@ mod tests {
         if offset + bytes > TEST_ARENA_SIZE {
             return None;
         }
-        Some(PhysAddr::from_usize(arena_base() + offset))
+        let address = arena_base() + offset;
+        unsafe {
+            // Model a real frame allocator which can return stale bytes.
+            core::ptr::write_bytes(address as *mut u8, 0xa5, bytes);
+        }
+        Some(PhysAddr::from_usize(address))
     }
 
     impl PagingHandler for MockPagingHandler {
@@ -585,6 +602,29 @@ mod tests {
                 .contains(&(base.as_usize(), 4))
         );
         assert!(DEALLOC_FRAME_CALLS.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allocation_clears_stale_protocol_state_before_publishing_identity() {
+        let channel = IVCChannel::<MockPagingHandler>::alloc(
+            0x1122,
+            0x3344,
+            PAGE_SIZE_4K,
+            GuestPhysAddr::from_usize(0x7000_0800),
+        )
+        .unwrap();
+
+        assert_eq!(channel.header().publisher_id, 0x1122);
+        assert_eq!(channel.header().key, 0x3344);
+        let protocol_bytes = unsafe {
+            core::slice::from_raw_parts(
+                MockPagingHandler::phys_to_virt(channel.base_hpa())
+                    .as_ptr()
+                    .add(core::mem::size_of::<IVCChannelHeader>()),
+                channel.size() - core::mem::size_of::<IVCChannelHeader>(),
+            )
+        };
+        assert!(protocol_bytes.iter().all(|&byte| byte == 0));
     }
 
     #[test]

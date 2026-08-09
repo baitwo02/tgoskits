@@ -472,7 +472,9 @@ jobs:
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
             self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivc
+            command: |
+              make -C apps/linux/ivc/tests clean test
+              cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivc
             cache_key: ""
             container_image: base
             limit_to_owner: ""
