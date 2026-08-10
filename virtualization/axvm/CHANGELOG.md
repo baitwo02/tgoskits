@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
 - *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
 - *(ci)* update Rust nightly to 2026-09-04 ([#2273](https://github.com/rcore-os/tgoskits/pull/2273))
+### Fixed
+
+ - Clear newly allocated IVC shared regions before publishing channel identity.
+### Fixed
+
+- Clear newly allocated IVC shared regions before publishing channel identity.
 
 ## [0.6.2](https://github.com/rcore-os/tgoskits/compare/axvm-v0.6.1...axvm-v0.6.2) - 2026-08-27
 
