@@ -4,7 +4,7 @@ use ax_errno::{AxError, AxResult};
 use ax_fs_ng::vfs::FS_CONTEXT;
 use ax_kspin::SpinNoIrq;
 use ax_runtime::hal::cpu::uspace::UserContext;
-use ax_task::{AxTaskExt, current, spawn_task};
+use ax_task::{AxTaskExt, current, spawn_task_with};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 use scope_local::Scope;
@@ -303,10 +303,10 @@ impl CloneArgs {
             if flags.contains(CloneFlags::NEWNS) {
                 new_nsproxy.unshare_mnt();
             }
+            let mut is_pid_namespace_init = false;
             if flags.contains(CloneFlags::NEWPID) {
                 new_nsproxy.unshare_pid();
-                new_nsproxy.pid_ns.lock().alloc_local_pid(tid as u64);
-                new_nsproxy.pid_ns.lock().set_init_global_tid(tid as u64);
+                is_pid_namespace_init = true;
             }
             if flags.contains(CloneFlags::NEWNET) {
                 new_nsproxy.unshare_net();
@@ -325,18 +325,23 @@ impl CloneArgs {
                 let mut parent_ns = old_proc_data.nsproxy.lock();
                 if let Some(child_pid_ns) = parent_ns.child_pid_ns.take() {
                     new_nsproxy.pid_ns = child_pid_ns;
-                    {
-                        let mut pid_ns = new_nsproxy.pid_ns.lock();
-                        pid_ns.alloc_local_pid(tid as u64);
-                        pid_ns.set_init_global_tid(tid as u64);
-                    }
+                    is_pid_namespace_init = true;
                 }
+            }
+            axnsproxy::PidNamespace::alloc_pid_chain(&new_nsproxy.pid_ns, tid as u64);
+            if is_pid_namespace_init {
+                new_nsproxy.pid_ns.lock().set_init_global_tid(tid as u64);
             }
 
             *proc_data.nsproxy.lock() = new_nsproxy;
 
             proc_data
         };
+
+        if flags.contains(CloneFlags::THREAD) {
+            let pid_ns = new_proc_data.nsproxy.lock().pid_ns.clone();
+            axnsproxy::PidNamespace::alloc_pid_chain(&pid_ns, tid as u64);
+        }
 
         let mut scope = Scope::new();
         let current_fd_table = crate::file::current_fd_table();
@@ -431,7 +436,12 @@ impl CloneArgs {
         if trace_clone && let Some(tracer_pid) = curr.as_thread().proc_data.ptrace_tracer_pid() {
             if !flags.contains(CloneFlags::THREAD) {
                 new_proc_data.set_ptrace_tracer_pid(tracer_pid);
-                new_proc_data.set_ptrace_attached();
+                let attach_mode = if curr.as_thread().proc_data.is_ptrace_seized() {
+                    crate::task::PtraceAttachMode::Seize
+                } else {
+                    crate::task::PtraceAttachMode::Attach
+                };
+                new_proc_data.set_ptrace_attach_mode(attach_mode);
             }
             new_proc_data.set_ptrace_stop(tid, starry_signal::Signo::SIGSTOP, &new_uctx);
         }
@@ -448,8 +458,7 @@ impl CloneArgs {
             guard.commit();
         }
 
-        let task = spawn_task(new_task);
-        add_task_to_table(&task);
+        spawn_task_with(new_task, add_task_to_table);
 
         if trace_clone && needs_vfork_block {
             let _ = crate::task::send_signal_to_thread(

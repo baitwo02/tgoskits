@@ -11,10 +11,10 @@ const PUBLISHER_VM_ID: usize = 1;
 const CHANNEL_SIZE: usize = 4096;
 
 #[test]
-fn region_v3_header_matches_after_initialize() {
-    let mut region = new_region();
+fn region_header_and_channel_header_match_after_initialize() {
+    let mut region = new_region(PUBLISHER_VM_ID, CHANNEL_KEY);
 
-    region.initialize(PUBLISHER_VM_ID, CHANNEL_KEY);
+    region.initialize();
 
     assert_eq!(IVC_REGION_VERSION, 3);
     assert!(region.channel_header_matches(PUBLISHER_VM_ID, CHANNEL_KEY));
@@ -213,8 +213,8 @@ fn spsc_message_endpoints_deliver_all_messages_across_threads() {
 
     const MESSAGES: u64 = 100_000;
 
-    let region = Box::leak(Box::new(new_region()));
-    region.initialize(PUBLISHER_VM_ID, CHANNEL_KEY);
+    let region = Box::leak(Box::new(new_region(PUBLISHER_VM_ID, CHANNEL_KEY)));
+    region.initialize();
     let region: &'static IvcRegion = region;
     let (mut sender, _publisher_receiver) = unsafe { region.publisher_endpoints() }.into_parts();
     let (_subscriber_sender, mut receiver) = unsafe { region.subscriber_endpoints() }.into_parts();
@@ -273,11 +273,11 @@ fn transfer_one_message(payload: &[u8]) -> std::vec::Vec<u8> {
 }
 
 fn initialized_region() -> IvcRegion {
-    let mut region = new_region();
-    region.initialize(PUBLISHER_VM_ID, CHANNEL_KEY);
+    let mut region = new_region(PUBLISHER_VM_ID, CHANNEL_KEY);
+    region.initialize();
     region
 }
 
-fn new_region() -> IvcRegion {
-    new_region_for_test()
+fn new_region(publisher_id: usize, key: usize) -> IvcRegion {
+    new_region_for_test(publisher_id, key)
 }

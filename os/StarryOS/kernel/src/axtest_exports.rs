@@ -303,6 +303,14 @@ pub fn dummy_stat_fs_fields_match_expected_defaults() -> bool {
     super::pseudofs::dummy_stat_fs_fields_match_expected_defaults_for_test()
 }
 
+pub fn perf_control_callback_runs_preemptible() -> bool {
+    super::perf::control_callback_runs_preemptible_for_test()
+}
+
+pub fn stop_machine_runs_action_and_sync_on_each_cpu() -> bool {
+    super::stop_machine::stop_machine_runs_action_and_sync_on_each_cpu_for_test()
+}
+
 pub fn is_wext_ioctl_validation_rules_hold() -> bool {
     super::file::is_wext_ioctl_validation_rules_hold_for_test()
 }

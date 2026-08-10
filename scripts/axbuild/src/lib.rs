@@ -78,6 +78,8 @@ enum Commands {
     },
     /// TGOS image management
     Image(image::ImageArgs),
+    /// Fetch verified OVMF firmware and print its paths as JSON
+    Ovmf(support::ovmf::OvmfArgs),
     /// Axvisor host-side commands
     Axvisor {
         #[command(subcommand)]
@@ -105,6 +107,18 @@ pub async fn run() -> anyhow::Result<()> {
     run_root_cli(cli).await
 }
 
+/// Like [`run`], but parses from an explicit argument list instead of
+/// [`std::env::args_os`].  Used by external tools (e.g. the axvisor
+/// xtask) that dispatch a sub‑command through axbuild's own CLI.
+pub async fn run_from<I, T>(args: I) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::parse_from(args);
+    run_root_cli(cli).await
+}
+
 async fn run_root_cli(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::AgentReviewBench { command } => agent_review_bench::execute(command).await,
@@ -116,6 +130,7 @@ async fn run_root_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Board { command } => board::execute(command).await,
         Commands::Backtrace { command } => backtrace::execute(command),
         Commands::Image(args) => image::run(args).await,
+        Commands::Ovmf(args) => support::ovmf::execute(args).await,
         Commands::Axvisor { command } => Axvisor::new()?.execute(command).await,
         Commands::Axloader { command } => Axloader::new()?.execute(command).await,
         Commands::Arceos { command } => ArceOS::new()?.execute(command).await,

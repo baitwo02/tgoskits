@@ -13,15 +13,18 @@
 // limitations under the License.
 
 //! Inter-VM communication (IVC) module.
-use alloc::{
+use std::{
     collections::{BTreeMap, btree_map::Entry},
     format,
+    sync::Mutex,
 };
 
-use ax_kspin::SpinNoIrq as Mutex;
 use ax_memory_addr::{PAGE_SIZE_4K, align_up_4k};
 
-use crate::{AxVmError, AxVmResult, GuestPhysAddr, HostPhysAddr, ax_err_type, host::PagingHandler};
+use crate::{
+    AxVmError, AxVmResult, GuestPhysAddr, HostPhysAddr, ax_err_type, host::PagingHandler,
+    sync::MutexExt,
+};
 
 /// A global btree map to store IVC channels,
 /// indexed by (publisher_vm_id, channel_key).
@@ -44,7 +47,7 @@ pub struct IvcNotifyRoute {
 }
 
 pub fn insert_channel(publisher_vm_id: usize, channel: HostIVCChannel) -> AxVmResult<()> {
-    let mut channels = IVC_CHANNELS.lock();
+    let mut channels = IVC_CHANNELS.lock_unpoisoned();
     let channel_key = (publisher_vm_id, channel.key);
     match channels.entry(channel_key) {
         Entry::Vacant(entry) => {
@@ -56,7 +59,10 @@ pub fn insert_channel(publisher_vm_id: usize, channel: HostIVCChannel) -> AxVmRe
 }
 
 pub fn ensure_channel_absent(publisher_vm_id: usize, key: usize) -> AxVmResult<()> {
-    if IVC_CHANNELS.lock().contains_key(&(publisher_vm_id, key)) {
+    if IVC_CHANNELS
+        .lock_unpoisoned()
+        .contains_key(&(publisher_vm_id, key))
+    {
         Err(ax_err_type!(
             AlreadyExists,
             format!(
@@ -75,7 +81,7 @@ pub fn ensure_channel_absent(publisher_vm_id: usize, key: usize) -> AxVmResult<(
 /// If the channel is successfully unpublished, it will return the base GPA and size of the channel.
 /// If the channel does not exist, it will return an error.
 pub fn unpublish_channel(publisher_vm_id: usize, key: usize) -> AxVmResult<(GuestPhysAddr, usize)> {
-    let mut channels = IVC_CHANNELS.lock();
+    let mut channels = IVC_CHANNELS.lock_unpoisoned();
     let channel_key = (publisher_vm_id, key);
     let channel = channels.get_mut(&channel_key).ok_or_else(|| {
         ax_err_type!(
@@ -112,7 +118,7 @@ pub fn prepare_subscribe_channel(
     key: usize,
     subscriber_vm_id: usize,
 ) -> AxVmResult<usize> {
-    let channels = IVC_CHANNELS.lock();
+    let channels = IVC_CHANNELS.lock_unpoisoned();
     let channel = channels.get(&(publisher_vm_id, key)).ok_or_else(|| {
         ax_err_type!(
             NotFound,
@@ -145,7 +151,7 @@ pub fn subscribe_to_channel_of_publisher(
     subscriber_vm_id: usize,
     subscriber_gpa: GuestPhysAddr,
 ) -> AxVmResult<(HostPhysAddr, usize)> {
-    let mut channels = IVC_CHANNELS.lock();
+    let mut channels = IVC_CHANNELS.lock_unpoisoned();
     let channel = channels.get_mut(&(publisher_vm_id, key)).ok_or_else(|| {
         ax_err_type!(
             NotFound,
@@ -179,7 +185,7 @@ pub fn unsubscribe_from_channel_of_publisher(
     key: usize,
     subscriber_vm_id: usize,
 ) -> AxVmResult<(GuestPhysAddr, usize)> {
-    let mut channels = IVC_CHANNELS.lock();
+    let mut channels = IVC_CHANNELS.lock_unpoisoned();
     let (base_gpa, size) = if let Some(channel) = channels.get_mut(&(publisher_vm_id, key)) {
         // Remove the subscriber VM ID from the channel.
         if let Some(subscriber_gpa) = channel.remove_subscriber(subscriber_vm_id) {
@@ -218,7 +224,7 @@ pub fn prepare_notify_channel(
     source_vm_id: usize,
     target_vm_id: usize,
 ) -> AxVmResult<IvcNotifyRoute> {
-    let channels = IVC_CHANNELS.lock();
+    let channels = IVC_CHANNELS.lock_unpoisoned();
     let channel = channels.get(&(publisher_vm_id, key)).ok_or_else(|| {
         ax_err_type!(
             NotFound,
@@ -282,7 +288,7 @@ pub struct IVCChannel<H: PagingHandler> {
     /// The base address of the shared memory region in guest physical address of the publisher VM.
     /// `None` if the channel has been unpublished (but still has subscribers).
     base_gpa: Option<GuestPhysAddr>,
-    _phantom: core::marker::PhantomData<H>,
+    _phantom: std::marker::PhantomData<H>,
 }
 
 #[repr(C)]
@@ -326,13 +332,13 @@ impl<H: PagingHandler> IVCChannel<H> {
             // Return a pointer to the data region, which starts after the header.
             H::phys_to_virt(self.shared_region_base)
                 .as_mut_ptr()
-                .add(core::mem::size_of::<IVCChannelHeader>())
+                .add(std::mem::size_of::<IVCChannelHeader>())
         }
     }
 }
 
-impl<H: PagingHandler> core::fmt::Debug for IVCChannel<H> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<H: PagingHandler> std::fmt::Debug for IVCChannel<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "IVCChannel(publisher[{}], subscriber {:?}, base: {:?}, size: {:#x}, gpa: {:?})",
@@ -382,6 +388,19 @@ impl<H: PagingHandler> IVCChannel<H> {
             operation: "allocate IVC shared region frames",
         })?;
 
+        unsafe {
+            // The frame allocator may return bytes left by a prior owner. The
+            // allocation is contiguous, exclusively owned here, and directly
+            // mapped by `phys_to_virt` for its full page-aligned size. Clear it
+            // before publishing the channel so no peer can observe stale ring
+            // indices, protocol metadata, or payload bytes.
+            std::ptr::write_bytes(
+                H::phys_to_virt(shared_region_base).as_mut_ptr(),
+                0,
+                shared_region_size,
+            );
+        }
+
         let mut channel = IVCChannel {
             publisher_vm_id,
             key,
@@ -389,7 +408,7 @@ impl<H: PagingHandler> IVCChannel<H> {
             shared_region_base,
             shared_region_size,
             base_gpa: Some(base_gpa),
-            _phantom: core::marker::PhantomData,
+            _phantom: std::marker::PhantomData,
         };
 
         {
@@ -529,7 +548,13 @@ mod tests {
         if offset + bytes > TEST_ARENA_SIZE {
             return None;
         }
-        Some(PhysAddr::from_usize(arena_base() + offset))
+        let address = arena_base() + offset;
+        unsafe {
+            // The bump allocator assigned this in-bounds range exclusively to
+            // the caller. Fill the complete allocation to model stale frames.
+            core::ptr::write_bytes(address as *mut u8, 0xa5, bytes);
+        }
+        Some(PhysAddr::from_usize(address))
     }
 
     impl PagingHandler for MockPagingHandler {
@@ -585,6 +610,31 @@ mod tests {
                 .contains(&(base.as_usize(), 4))
         );
         assert!(DEALLOC_FRAME_CALLS.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allocation_clears_stale_protocol_state_before_publishing_identity() {
+        let channel = IVCChannel::<MockPagingHandler>::alloc(
+            0x1122,
+            0x3344,
+            PAGE_SIZE_4K,
+            GuestPhysAddr::from_usize(0x7000_0800),
+        )
+        .unwrap();
+
+        assert_eq!(channel.header().publisher_id, 0x1122);
+        assert_eq!(channel.header().key, 0x3344);
+        let protocol_bytes = unsafe {
+            // The channel exclusively owns this directly mapped allocation;
+            // the slice starts after its live header and remains in bounds.
+            core::slice::from_raw_parts(
+                MockPagingHandler::phys_to_virt(channel.base_hpa())
+                    .as_ptr()
+                    .add(core::mem::size_of::<IVCChannelHeader>()),
+                channel.size() - core::mem::size_of::<IVCChannelHeader>(),
+            )
+        };
+        assert!(protocol_bytes.iter().all(|&byte| byte == 0));
     }
 
     #[test]

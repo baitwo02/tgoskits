@@ -37,14 +37,16 @@ pub struct IvcRegion {
 unsafe impl Sync for IvcRegion {}
 
 impl IvcRegion {
-    /// Initializes the protocol region and preserves the Axvisor IVC header.
-    pub fn initialize(&mut self, publisher_id: usize, key: usize) {
+    /// Initializes the guest-owned protocol region.
+    ///
+    /// The leading channel header is initialized by Axvisor before the channel
+    /// is made subscribable. It is read-only to guests, so protocol setup must
+    /// not rewrite it while a subscriber may already be reading it.
+    pub fn initialize(&mut self) {
         // A newly mapped GPA can contain bytes from an earlier session. Clear
         // publication first so a racing subscriber cannot accept stale layout
         // metadata while the rings are being reinitialized.
         self.header.invalidate();
-        self.publisher_id = publisher_id as u64;
-        self.key = key as u64;
         self.publisher_to_subscriber
             .initialize(IvcRingDirection::PublisherToSubscriber);
         self.subscriber_to_publisher
@@ -165,10 +167,10 @@ impl AtomicU16Compat {
 }
 
 #[cfg(test)]
-pub(crate) fn new_region_for_test() -> IvcRegion {
+pub(crate) fn new_region_for_test(publisher_id: usize, key: usize) -> IvcRegion {
     IvcRegion {
-        publisher_id: 0,
-        key: 0,
+        publisher_id: publisher_id as u64,
+        key: key as u64,
         header: IvcRegionHeader {
             magic: AtomicU32::new(0),
             version: AtomicU16Compat(AtomicU32::new(0)),

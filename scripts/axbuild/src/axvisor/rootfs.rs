@@ -29,7 +29,7 @@ struct VmKernelRootfsProbe {
 }
 
 pub(super) async fn qemu(axvisor: &mut Axvisor, args: super::ArgsQemu) -> anyhow::Result<()> {
-    let request = axvisor.prepare_request(
+    let mut request = axvisor.prepare_request(
         (&args.build).into(),
         args.qemu_config,
         None,
@@ -46,13 +46,14 @@ pub(super) async fn qemu(axvisor: &mut Axvisor, args: super::ArgsQemu) -> anyhow
             )
         })
         .transpose()?;
+    let mut cargo = build::load_cargo_config(&request)?;
+    request.vmconfigs = build::vmconfigs_from_cargo(&cargo);
     ensure_qemu_rootfs_ready(
         &request,
         axvisor.app.workspace_root(),
         explicit_rootfs.as_deref(),
     )
     .await?;
-    let mut cargo = build::load_cargo_config(&request)?;
     let qemu =
         load_patched_qemu_config(axvisor, &request, &cargo, explicit_rootfs.as_deref()).await?;
     cargo.to_bin = qemu_to_bin_requested(&qemu)?;
@@ -178,9 +179,16 @@ pub(crate) fn infer_rootfs_path(vmconfigs: &[PathBuf]) -> anyhow::Result<Option<
         let Some(kernel_path) = probe.kernel.and_then(|kernel| kernel.kernel_path) else {
             continue;
         };
-        let rootfs_path = Path::new(&kernel_path)
-            .parent()
-            .map(|dir| dir.join("rootfs.img"));
+        let kernel_path = Path::new(&kernel_path);
+        let kernel_path = if kernel_path.is_absolute() {
+            kernel_path.to_path_buf()
+        } else {
+            vmconfig
+                .parent()
+                .map(|parent| parent.join(kernel_path))
+                .unwrap_or_else(|| kernel_path.to_path_buf())
+        };
+        let rootfs_path = kernel_path.parent().map(|dir| dir.join("rootfs.img"));
         if let Some(rootfs_path) = rootfs_path
             && rootfs_path.exists()
         {
@@ -234,13 +242,10 @@ mod tests {
         let vmconfig = root.path().join("vm.toml");
         fs::write(
             &vmconfig,
-            format!(
-                r#"
+            r#"
 [kernel]
-kernel_path = "{}"
+kernel_path = "image/qemu-aarch64"
 "#,
-                image_dir.join("qemu-aarch64").display()
-            ),
         )
         .unwrap();
 
@@ -357,9 +362,9 @@ kernel_path = "{}"
         let mut qemu = QemuConfig {
             args: vec![
                 "-device".to_string(),
-                "virtio-blk-device,drive=disk0".to_string(),
+                "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65".to_string(),
                 "-append".to_string(),
-                "root=/dev/vda rw init=/bin/sh".to_string(),
+                "root=/dev/nvme0n1 rw init=/bin/sh".to_string(),
             ],
             ..Default::default()
         };
@@ -370,11 +375,11 @@ kernel_path = "{}"
             qemu.args,
             vec![
                 "-device".to_string(),
-                "virtio-blk-device,drive=disk0".to_string(),
+                "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65".to_string(),
                 "-drive".to_string(),
                 format!("id=disk0,if=none,format=raw,file={}", rootfs.display()),
                 "-append".to_string(),
-                "root=/dev/vda rw init=/bin/sh".to_string(),
+                "root=/dev/nvme0n1 rw init=/bin/sh".to_string(),
             ]
         );
     }
@@ -453,5 +458,30 @@ kernel_path = "{}"
         };
 
         assert!(qemu_to_bin_requested(&qemu).is_err());
+    }
+
+    #[test]
+    fn axvisor_host_rootfs_configs_use_nvme_device_names() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let configs = [
+            "test-suit/axvisor/normal/qemu/smoke/qemu-aarch64.toml",
+            "test-suit/axvisor/normal/qemu/smoke/qemu-riscv64.toml",
+            "test-suit/axvisor/normal/qemu/build-loongarch64-unknown-none-softfloat.toml",
+            "os/axvisor/configs/qemu/qemu-aarch64.toml",
+            "os/axvisor/configs/qemu/qemu-riscv64.toml",
+            "os/axvisor/configs/board/qemu-loongarch64.toml",
+        ];
+
+        for relative in configs {
+            let config = fs::read_to_string(workspace_root.join(relative)).unwrap();
+            assert!(
+                !config.contains("root=/dev/vda"),
+                "{relative} still names the removed VirtIO block root device"
+            );
+            assert!(
+                config.contains("ax-driver/nvme") || config.contains("\"nvme,drive=disk0"),
+                "{relative} does not enable or attach NVMe"
+            );
+        }
     }
 }

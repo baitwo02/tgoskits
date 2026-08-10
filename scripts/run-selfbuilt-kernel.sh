@@ -57,7 +57,7 @@ case "$ARCH" in
         QEMU_MACHINE="virt"
         QEMU_CPU="rv64"
         QEMU_EXTRA=""
-        QEMU_BLK_DEV="virtio-blk-pci,drive=disk0"
+        QEMU_BLK_DEV="nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65"
         QEMU_NET_DEV="virtio-net-pci,netdev=net0"
         ;;
     x86_64)
@@ -71,7 +71,7 @@ case "$ARCH" in
             QEMU_CPU="IvyBridge"
             QEMU_EXTRA=""
         fi
-        QEMU_BLK_DEV="virtio-blk-pci,drive=disk0"
+        QEMU_BLK_DEV="nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65"
         QEMU_NET_DEV="virtio-net-pci,netdev=net0"
         ;;
     aarch64)
@@ -80,7 +80,7 @@ case "$ARCH" in
         QEMU_MACHINE="virt"
         QEMU_CPU="cortex-a72"
         QEMU_EXTRA=""
-        QEMU_BLK_DEV="virtio-blk-device,drive=disk0"
+        QEMU_BLK_DEV="nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65"
         QEMU_NET_DEV="virtio-net-device,netdev=net0"
         ;;
     *)
@@ -179,40 +179,19 @@ case "$ARCH" in
         cp "$BIN_KERNEL" "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
         info "ESP ready: $ESP_DIR/EFI/BOOT/BOOTX64.EFI"
 
-        # OVMF firmware — search common distribution paths.
-        # Arch:    /usr/share/edk2/x64/OVMF_CODE.4m.fd  (edk2-ovmf)
-        # Debian:  /usr/share/OVMF/OVMF_CODE_4M.fd, /usr/share/OVMF/OVMF_CODE.fd  (ovmf)
-        # Fedora:  /usr/share/edk2/ovmf/OVMF_CODE.fd    (edk2-ovmf)
-        # Generic: /usr/share/ovmf/OVMF.fd, /usr/share/qemu/OVMF.fd
-        OVMF_CODE=""
-        for candidate in \
-            /usr/share/edk2/x64/OVMF_CODE.4m.fd \
-            /usr/share/OVMF/OVMF_CODE_4M.fd \
-            /usr/share/OVMF/OVMF_CODE.fd \
-            /usr/share/edk2/ovmf/OVMF_CODE.fd \
-            /usr/share/ovmf/OVMF.fd \
-            /usr/share/qemu/OVMF.fd; do
-            if [ -f "$candidate" ]; then
-                OVMF_CODE="$candidate"
-                break
-            fi
-        done
-        [ -n "$OVMF_CODE" ] || error "OVMF firmware not found; install edk2-ovmf or ovmf"
+        # Fetch the same verified OVMF asset used by xtask QEMU flows.
+        OVMF_JSON="$(cargo xtask ovmf --arch x86_64)" ||
+            error "failed to prepare OVMF firmware"
+        OVMF_PATHS="$(python3 -c \
+            'import json, sys; value = json.load(sys.stdin); print(value["code"]); print(value["vars"])' \
+            <<<"$OVMF_JSON")" || error "failed to parse OVMF path JSON"
+        OVMF_CODE="$(printf '%s\n' "$OVMF_PATHS" | sed -n '1p')"
+        OVMF_VARS_TEMPLATE="$(printf '%s\n' "$OVMF_PATHS" | sed -n '2p')"
+        [ -f "$OVMF_CODE" ] || error "OVMF code firmware not found: $OVMF_CODE"
+        [ -f "$OVMF_VARS_TEMPLATE" ] ||
+            error "OVMF vars firmware not found: $OVMF_VARS_TEMPLATE"
         info "OVMF firmware: $OVMF_CODE"
 
-        # Derive VARS template from same directory as CODE.
-        OVMF_DIR="$(dirname "$OVMF_CODE")"
-        OVMF_VARS_TEMPLATE=""
-        for candidate in \
-            "${OVMF_DIR}/OVMF_VARS.4m.fd" \
-            "${OVMF_DIR}/OVMF_VARS_4M.fd" \
-            "${OVMF_DIR}/OVMF_VARS.fd"; do
-            if [ -f "$candidate" ]; then
-                OVMF_VARS_TEMPLATE="$candidate"
-                break
-            fi
-        done
-        [ -n "$OVMF_VARS_TEMPLATE" ] || error "OVMF_VARS not found alongside OVMF_CODE in $OVMF_DIR"
         OVMF_VARS="$REPO_ROOT/tmp/OVMF_VARS.x86_64.fd"
         if [ ! -f "$OVMF_VARS" ]; then
             cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
@@ -231,7 +210,7 @@ case "$ARCH" in
             -drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_CODE" \
             -drive if=pflash,format=raw,unit=1,file="$OVMF_VARS" \
             -drive format=raw,file=fat:rw:"$ESP_DIR" \
-            -device virtio-blk-pci,drive=disk0 \
+            -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
             -drive id=disk0,if=none,format=raw,file="$ROOTFS_IMG",file.locking=off \
             -device virtio-net-pci,netdev=net0 \
             -netdev user,id=net0

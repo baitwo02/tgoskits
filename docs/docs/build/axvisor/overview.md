@@ -44,13 +44,16 @@ Axvisor board Build Config 的额外字段为：
 
 ```toml
 target = "x86_64-unknown-none"
-features = ["ax-driver/virtio-blk", "vmx"]
+features = ["ax-driver/nvme", "vmx"]
 vm_configs = ["os/axvisor/configs/vms/qemu/x86_64/linux-vmx-smp1.toml"]
 ```
 
 ### 2.2 VM 选择
 
-CLI 传入的 `--vmconfigs` 非空时覆盖该配置中的 `vm_configs`；否则使用 Build Config 中的列表。相对 VM 路径相对于 workspace 根解析后写入 `AXVISOR_VM_CONFIGS`，以平台路径分隔符连接。
+CLI 传入的 `--vmconfigs` 非空时覆盖该配置中的 `vm_configs`；否则使用 Build Config 中的列表。
+相对 VM config 路径相对于 workspace 根解析；其中五个 `[kernel]` 镜像路径字段支持 Ostool
+变量，并按原 VM config 目录解析相对路径。最终解析后的配置写入 `AXVISOR_VM_CONFIGS`，以
+平台路径分隔符连接。
 
 ## 3. 虚拟化后端
 
@@ -62,6 +65,10 @@ CLI 传入的 `--vmconfigs` 非空时覆盖该配置中的 `vm_configs`；否则
 test-suit/axvisor/normal/qemu/build-x86_64-unknown-none-vmx.toml
 test-suit/axvisor/normal/qemu/build-x86_64-unknown-none-svm.toml
 ```
+
+这两个首阶段块运行时 smoke 配置不启动 guest，而是保留 VMX/SVM
+宿主初始化并直接验证 Axvisor 宿主 NVMe 根文件系统。guest block ABI
+继续由独立 VM 配置维护，不纳入本次 NVMe 运行时验收。
 
 ## 4. 默认配置
 
@@ -84,7 +91,7 @@ tmp/axbuild/config/axvisor/build-<target>.toml
 cargo xtask axvisor qemu \
   --vmconfigs os/axvisor/configs/vms/qemu/aarch64/linux-smp1.toml
 
-# x86 VMX 和 SVM 是不同的显式构建契约
+# x86 VMX 和 SVM smoke 验证宿主能力与宿主 NVMe 根文件系统
 cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-vmx
 cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-svm
 

@@ -75,7 +75,7 @@ flowchart TD
 | 步骤 | 源码位置 | 行为 |
 |------|----------|------|
 | 用例发现 | `discovery.rs::discover_qemu_cases()` | 扫描 `test-suit/axvisor/<group>/`，默认 group 为 `normal` |
-| VM 配置 | `qemu_group_build_context()` | 从 `AXVISOR_VM_CONFIGS` 环境变量解析 VM 配置路径，相对路径相对于 workspace 根 |
+| VM 配置 | `qemu_group_build_context()` | 读取 axbuild 已解析并写入 `AXVISOR_VM_CONFIGS` 的 VM 配置路径 |
 | rootfs 准备 | `rootfs::ensure_qemu_rootfs_ready()` | 每个 build group 编译前准备当前 arch 的 managed rootfs |
 | grouped 校验 | `validate_grouped_qemu_commands()` | 检查 `test_commands` 无空命令 |
 | 结果判定 | `QemuTestSummary` | 收集所有 case 的 pass/fail，最终 `finish_with_total_detail()` 统一判定退出码 |
@@ -129,6 +129,8 @@ flowchart TD
 4. `app.board()` 编译 + 部署到远程板卡，由 board config 的正则判定结果
 
 `--test-case` 和 `--board` 支持按用例名和板卡名过滤；`--list` 列出所有 board test group。发现算法通过 `discover_board_test_groups()` 递归扫描，board 配置按板卡名命名（`board-{name}.toml`），通过 `nearest_build_wrapper()` 向上查找最近的构建配置。
+
+ROCK 4D 用例从板卡文件系统加载 BSP kernel 和 guest DTB，运行前必须单独准备这两项持久化资产。完整命令见 [ROCK 4D Linux Guest](./rock-4d)。
 
 ## 4. 资产管线
 
