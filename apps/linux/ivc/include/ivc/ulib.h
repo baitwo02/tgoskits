@@ -23,10 +23,15 @@ typedef struct ivc_subscriber {
     ivc_subscribe_arg_t subscribe_arg;      // Subscription argument structure
     int64_t             fd;                 // File descriptor for the subscriber's device
     uint64_t            read;               // Number of bytes read from the channel
+    uint64_t            write;              // Number of bytes written to the channel
 } ivc_subscriber_t, *ivc_subscriber_p;
 
 ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uint64_t channel_key);
 int ivc_read(ivc_subscriber_p subscriber, void *buf, size_t count);
+int ivc_subscriber_write(ivc_subscriber_p subscriber, const void *buf, size_t count);
+// Message-oriented device writes must complete in one syscall; short writes fail.
+// Empty messages are not supported by the POSIX read/write adapter.
+int ivc_subscriber_write_all(ivc_subscriber_p subscriber, const void *buf, size_t count);
 int ivc_unsubscribe(ivc_subscriber_p subscriber);
 
 
@@ -34,11 +39,15 @@ typedef struct ivc_publisher {
     ivc_manager_p       manager;            // Pointer to the IVC manager
     ivc_publish_arg_t   publish_arg;        // Publish argument structure
     int64_t             fd;                 // File descriptor for the publisher's device
+    uint64_t            read;               // Number of bytes read from the channel
     uint64_t            write;              // Number of bytes written to the channel
 } ivc_publisher_t, *ivc_publisher_p;
 
 ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size);
+int ivc_publisher_read(ivc_publisher_p publisher, void *buf, size_t count);
 int ivc_write(ivc_publisher_p publisher, const void *buf, size_t count);
+// Message-oriented device writes must complete in one syscall; short writes fail.
+// Empty messages are not supported by the POSIX read/write adapter.
 int ivc_write_all(ivc_publisher_p publisher, const void *buf, size_t count);
 int ivc_unpublish(ivc_publisher_p publisher);
 

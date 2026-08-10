@@ -13,6 +13,7 @@ static unsigned long expected_rollback_request;
 static int create_requests;
 static int rollback_requests;
 static int open_requests;
+static int unexpected_open_flags;
 
 static void reset_mocks(unsigned long create_request, unsigned long rollback_request)
 {
@@ -21,6 +22,7 @@ static void reset_mocks(unsigned long create_request, unsigned long rollback_req
     create_requests = 0;
     rollback_requests = 0;
     open_requests = 0;
+    unexpected_open_flags = 0;
 }
 
 int __wrap_ioctl(int fd, unsigned long request, ...)
@@ -58,9 +60,11 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 int __wrap_open(const char *path, int flags, ...)
 {
     (void)path;
-    (void)flags;
 
     open_requests++;
+    if (flags != O_RDWR) {
+        unexpected_open_flags = 1;
+    }
     errno = ENOENT;
     return -1;
 }
@@ -77,6 +81,10 @@ static int expect_rollback(const char *operation)
     }
     if (rollback_requests != 1) {
         fprintf(stderr, "%s: expected one rollback ioctl, got %d\n", operation, rollback_requests);
+        return 1;
+    }
+    if (unexpected_open_flags != 0) {
+        fprintf(stderr, "%s: expected the channel device to open with O_RDWR\n", operation);
         return 1;
     }
     return 0;

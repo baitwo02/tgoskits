@@ -3,9 +3,11 @@
 #include <ivc/ivc_dev.h>
 #include <ivc/ioctl_args.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 
@@ -70,6 +72,7 @@ ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uin
     subscriber->subscribe_arg.channel_key = channel_key;
     memset(subscriber->subscribe_arg.device_name, 0, sizeof(subscriber->subscribe_arg.device_name));
     subscriber->read = 0;
+    subscriber->write = 0;
 
     // Perform the subscription operation
     if (ioctl(manager->fd, IVC_SUBSCRIBE_CHANNEL, &subscriber->subscribe_arg) < 0) {
@@ -79,11 +82,11 @@ ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uin
     }
 
     // Open the subscriber device
-    subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDONLY);
+    subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDWR);
     if (subscriber->fd < 0) {
         perror("Failed to open subscriber device");
         if (ioctl(manager->fd, IVC_UNSUBSCRIBE_CHANNEL, &subscriber->subscribe_arg) < 0) {
-            perror("Failed to rollback subscriber channel");
+            perror("Failed to roll back subscription after device open failure");
         }
         free(subscriber);
         return NULL;
@@ -109,6 +112,47 @@ int ivc_read(ivc_subscriber_p subscriber, void *buf, size_t count) {
         subscriber->read += bytes_read;
     }
     return bytes_read;
+}
+
+int ivc_subscriber_write(ivc_subscriber_p subscriber, const void *buf, size_t count) {
+    if (count == 0) {
+        errno = EOPNOTSUPP;
+        fprintf(stderr, "Empty IVC messages are not representable by the read/write device ABI\n");
+        return -1;
+    }
+
+    if (!subscriber || !buf) {
+        fprintf(stderr, "Invalid arguments for ivc_subscriber_write\n");
+        return -1;
+    }
+
+    int bytes_written = write(subscriber->fd, buf, count);
+    if (bytes_written < 0) {
+        perror("Failed to write to subscriber device");
+    } else {
+        subscriber->write += bytes_written;
+    }
+    return bytes_written;
+}
+
+int ivc_subscriber_write_all(ivc_subscriber_p subscriber, const void *buf, size_t count) {
+    if (count > INT_MAX) {
+        errno = EMSGSIZE;
+        fprintf(stderr, "Subscriber message is too large\n");
+        return -1;
+    }
+
+    int bytes_written = ivc_subscriber_write(subscriber, buf, count);
+    if (bytes_written != (int)count) {
+        if (bytes_written >= 0) {
+            fprintf(stderr,
+                    "Subscriber device returned a short message write: %d/%zu\n",
+                    bytes_written,
+                    count);
+        }
+        return -1;
+    }
+    return bytes_written;
 }
 
 int ivc_unsubscribe(ivc_subscriber_p subscriber) {
@@ -153,6 +197,7 @@ ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_
     publisher->publish_arg.channel_key = channel_key;
     publisher->publish_arg.channel_size = channel_size;
     memset(publisher->publish_arg.device_name, 0, sizeof(publisher->publish_arg.device_name));
+    publisher->read = 0;
     publisher->write = 0;
 
     // Perform the publish operation
@@ -163,11 +208,11 @@ ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_
     }
 
     // Open the publisher device
-    publisher->fd = open(publisher->publish_arg.device_name, O_WRONLY);
+    publisher->fd = open(publisher->publish_arg.device_name, O_RDWR);
     if (publisher->fd < 0) {
         perror("Failed to open publisher device");
         if (ioctl(manager->fd, IVC_UNPUBLISH_CHANNEL, &publisher->publish_arg) < 0) {
-            perror("Failed to rollback publisher channel");
+            perror("Failed to roll back publication after device open failure");
         }
         free(publisher);
         return NULL;
@@ -176,9 +221,30 @@ ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_
     return publisher;
 }
 
+int ivc_publisher_read(ivc_publisher_p publisher, void *buf, size_t count) {
+    if (count == 0) {
+        return 0;
+    }
+
+    if (!publisher || !buf) {
+        fprintf(stderr, "Invalid arguments for ivc_publisher_read\n");
+        return -1;
+    }
+
+    int bytes_read = read(publisher->fd, buf, count);
+    if (bytes_read < 0) {
+        perror("Failed to read from publisher device");
+    } else {
+        publisher->read += bytes_read;
+    }
+    return bytes_read;
+}
+
 int ivc_write(ivc_publisher_p publisher, const void *buf, size_t count) {
     if (count == 0) {
-        return 0; // Nothing to write
+        errno = EOPNOTSUPP;
+        fprintf(stderr, "Empty IVC messages are not representable by the read/write device ABI\n");
+        return -1;
     }
 
     if (!publisher || !buf) {
@@ -196,24 +262,23 @@ int ivc_write(ivc_publisher_p publisher, const void *buf, size_t count) {
 }
 
 int ivc_write_all(ivc_publisher_p publisher, const void *buf, size_t count) {
-    if (count == 0) {
-        return 0; // Nothing to write
+    if (count > INT_MAX) {
+        errno = EMSGSIZE;
+        fprintf(stderr, "Publisher message is too large\n");
+        return -1;
     }
 
-    size_t total_written = 0;
-    while (total_written < count) {
-        int bytes_written = ivc_write(publisher, (const char *)buf + total_written, count - total_written);
-        if (bytes_written < 0) {
-            perror("Failed to write to publisher device");
-            return -1;
+    int bytes_written = ivc_write(publisher, buf, count);
+    if (bytes_written != (int)count) {
+        if (bytes_written >= 0) {
+            fprintf(stderr,
+                    "Publisher device returned a short message write: %d/%zu\n",
+                    bytes_written,
+                    count);
         }
-        if (bytes_written == 0) {
-            fprintf(stderr, "Failed to write to publisher device: no progress\n");
-            return -1;
-        }
-        total_written += bytes_written;
+        return -1;
     }
-    return total_written;
+    return bytes_written;
 }
 
 int ivc_unpublish(ivc_publisher_p publisher) {

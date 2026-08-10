@@ -63,9 +63,10 @@ build_user_program() {
 
     "${demo_cross}gcc" \
         -I"${script_dir}/include" \
-        -Wall -Wextra -Os -s -Wl,--gc-sections -static \
+        -std=gnu11 -Wall -Wextra -Werror -Os -s -Wl,--gc-sections -static \
         -o "${out_dir}/${name}" \
         "${source}" \
+        "${script_dir}/lib/app_proto.c" \
         "${script_dir}/lib/ivc.c"
 }
 
@@ -76,7 +77,15 @@ run_host_tests() {
     mkdir -p "${test_out_dir}"
     "${host_cc}" \
         -I"${script_dir}/include" \
-        -Wall -Wextra -Werror -O0 -g -Wl,--wrap=write \
+        -std=c11 -Wall -Wextra -Werror -O2 \
+        -o "${test_out_dir}/ivc-app-proto" \
+        "${script_dir}/tests/test_app_proto.c" \
+        "${script_dir}/lib/app_proto.c"
+    "${test_out_dir}/ivc-app-proto"
+
+    "${host_cc}" \
+        -I"${script_dir}/include" \
+        -std=c11 -Wall -Wextra -Werror -O0 -g -Wl,--wrap=write \
         -o "${test_out_dir}/ivc-write-all-zero-progress" \
         "${script_dir}/tests/ivc_write_all_zero_progress.c" \
         "${script_dir}/lib/ivc.c"
@@ -84,7 +93,7 @@ run_host_tests() {
 
     "${host_cc}" \
         -I"${script_dir}/include" \
-        -Wall -Wextra -Werror -O0 -g -Wl,--wrap=open -Wl,--wrap=ioctl \
+        -std=c11 -Wall -Wextra -Werror -O0 -g -Wl,--wrap=open -Wl,--wrap=ioctl \
         -o "${test_out_dir}/ivc-open-failure-rolls-back" \
         "${script_dir}/tests/ivc_open_failure_rolls_back.c" \
         "${script_dir}/lib/ivc.c"
