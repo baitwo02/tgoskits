@@ -386,7 +386,7 @@ mod tests {
 
     struct ResetFunction {
         name: &'static str,
-        fail: bool,
+        error_detail: Option<&'static str>,
         calls: AtomicUsize,
     }
 
@@ -432,14 +432,12 @@ mod tests {
         }
         fn reset(&self) -> DeviceResult {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.fail {
+            self.error_detail.map_or(Ok(()), |detail| {
                 Err(DeviceError::Unsupported {
                     operation: "reset PCI endpoint",
-                    detail: "test failure".into(),
+                    detail: detail.into(),
                 })
-            } else {
-                Ok(())
-            }
+            })
         }
     }
 
@@ -486,15 +484,18 @@ mod tests {
             PciTopologyBuilder, ResourceRequest,
         };
 
-        let first_id = DeviceNodeId::new("first").unwrap();
-        let second_id = DeviceNodeId::new("second").unwrap();
-        let first_bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
-        let second_bdf = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+        let ids = [
+            DeviceNodeId::new("first").unwrap(),
+            DeviceNodeId::new("second").unwrap(),
+            DeviceNodeId::new("third").unwrap(),
+        ];
+        let bdfs = [
+            PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap(),
+            PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap(),
+            PciBdf::new(PciSegment::new(0), 0, 3, 0).unwrap(),
+        ];
         let mut builder = PciTopologyBuilder::new();
-        for (id, bdf) in [
-            (first_id.clone(), first_bdf),
-            (second_id.clone(), second_bdf),
-        ] {
+        for (id, bdf) in ids.iter().cloned().zip(bdfs) {
             builder
                 .add_function(
                     PciFunctionSpec::new(
@@ -513,23 +514,32 @@ mod tests {
         ));
         let first = Arc::new(ResetFunction {
             name: "first",
-            fail: true,
+            error_detail: Some("first reset failure"),
             calls: AtomicUsize::new(0),
         });
         let second = Arc::new(ResetFunction {
             name: "second",
-            fail: false,
+            error_detail: Some("second reset failure"),
             calls: AtomicUsize::new(0),
         });
-        let first_function: Arc<dyn PciFunction> = first.clone();
-        let second_function: Arc<dyn PciFunction> = second.clone();
-        let _first_lease = binding
-            .bind(&first_id, DeviceId::new(1), first_function)
-            .unwrap();
-        let _second_lease = binding
-            .bind(&second_id, DeviceId::new(2), second_function)
-            .unwrap();
-        for bdf in [first_bdf, second_bdf] {
+        let third = Arc::new(ResetFunction {
+            name: "third",
+            error_detail: None,
+            calls: AtomicUsize::new(0),
+        });
+        let mut leases = alloc::vec::Vec::new();
+        for (index, function) in [first.clone(), second.clone(), third.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let function: Arc<dyn PciFunction> = function;
+            leases.push(
+                binding
+                    .bind(&ids[index], DeviceId::new(index as u32 + 1), function)
+                    .unwrap(),
+            );
+        }
+        for bdf in bdfs {
             root.write_config(
                 bdf,
                 ConfigOffset::new(4).unwrap(),
@@ -539,13 +549,16 @@ mod tests {
             .unwrap();
         }
 
-        assert!(matches!(
-            binding.reset(),
-            Err(DeviceManagerError::Device(DeviceError::Unsupported { .. }))
-        ));
+        match binding.reset() {
+            Err(DeviceManagerError::Device(DeviceError::Unsupported { detail, .. })) => {
+                assert_eq!(detail, "first reset failure");
+            }
+            other => panic!("reset must return the first endpoint error, got {other:?}"),
+        }
         assert_eq!(first.calls.load(Ordering::Relaxed), 1);
         assert_eq!(second.calls.load(Ordering::Relaxed), 1);
-        for bdf in [first_bdf, second_bdf] {
+        assert_eq!(third.calls.load(Ordering::Relaxed), 1);
+        for bdf in bdfs {
             assert_eq!(
                 root.read_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word)
                     .unwrap(),

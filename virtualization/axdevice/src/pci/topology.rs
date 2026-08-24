@@ -601,6 +601,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn automatic_placement_reports_exhaustion_after_thirty_two_devices() {
+        let mut builder = PciTopologyBuilder::new();
+        for index in 0..33u8 {
+            builder
+                .add_function(function(&alloc::format!("auto-{index:02}")))
+                .unwrap();
+        }
+
+        match builder.resolve(APERTURE_START..APERTURE_END) {
+            Err(PciError::BdfExhausted { function }) => assert_eq!(function, "auto-32"),
+            other => panic!("device 33 must exhaust bus-zero placement, got {other:?}"),
+        }
+    }
+
     fn function(id: &str) -> PciFunctionSpec {
         PciFunctionSpec::new(
             node(id),
