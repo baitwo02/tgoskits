@@ -466,8 +466,8 @@ mod tests {
         );
 
         // The same byte lanes are written independently and honor write
-        // masks: both selected lanes are read-only for this function, so the
-        // write has no effect instead of failing the guest access.
+        // masks: command-high accepts only INTx Disable (bit 2), while the
+        // selected status byte remains read-only.
         write(
             &frontend,
             CONFIG_ADDRESS_PORT,
@@ -475,7 +475,7 @@ mod tests {
             0x8000_0004,
         );
         write(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word, 0xffff);
-        assert_eq!(read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word), 0);
+        assert_eq!(read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word), 4);
         write(
             &frontend,
             CONFIG_ADDRESS_PORT,
