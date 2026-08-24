@@ -11,7 +11,8 @@ use core::{fmt, ops::Range};
 use ax_sync::SpinLock;
 
 use super::{
-    EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciError, PciResult, ResolvedPciTopology,
+    EndpointRouteToken, FOUR_GIB, PciBarDecodePolicy, PciBarIndex, PciBdf, PciError, PciResult,
+    ResolvedPciTopology,
     config::{BarWriteAction, FunctionState},
 };
 use crate::{AccessWidth, ConfigOffset};
@@ -102,12 +103,28 @@ impl PciRootState {
         match action {
             BarWriteAction::Probe { bar } => state.functions[function_index].apply_probe(bar),
             BarWriteAction::Relocate { bar, candidate } => {
-                let accepted = state.bar_address_available(
-                    self.topology.memory_aperture(),
-                    function_index,
-                    bar,
-                    candidate,
-                );
+                let target = &state.functions[function_index].bars()[bar];
+                let policy = target.decode_policy();
+                let planned = target.planned_address();
+                let bar_index = target.index();
+                let accepted = match policy {
+                    PciBarDecodePolicy::Fixed => {
+                        if candidate != planned {
+                            log::warn!(
+                                "ignoring PCI BAR{bar_index} relocation to {candidate:#x}: fixed \
+                                 policy keeps the planned base {planned:#x}"
+                            );
+                        }
+                        candidate == planned
+                    }
+                    PciBarDecodePolicy::RelocatableWithinHostAperture => state
+                        .bar_address_available(
+                            self.topology.memory_aperture(),
+                            function_index,
+                            bar,
+                            candidate,
+                        ),
+                };
                 state.functions[function_index]
                     .finish_relocation(bar, accepted.then_some(candidate));
             }
@@ -427,6 +444,64 @@ mod tests {
             0xffff_0000
         );
         assert!(root.resolve_bar(bar_base, AccessWidth::Byte).is_some());
+    }
+
+    #[test]
+    fn fixed_prefetchable_bar_rejects_relocation_and_preserves_attributes() {
+        let bar2 = PciBarIndex::new(2).unwrap();
+        let endpoint = function("fixed")
+            .with_bar(
+                PciMemoryBar::new(bar2, BAR_SIZE)
+                    .unwrap()
+                    .prefetchable()
+                    .with_decode_policy(PciBarDecodePolicy::Fixed)
+                    .with_address(ResourceRequest::Fixed(APERTURE_START)),
+            )
+            .unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder.add_function(endpoint).unwrap();
+        let topology = Arc::new(builder.resolve(APERTURE_START..APERTURE_END).unwrap());
+        assert!(
+            topology
+                .function(&node("fixed"))
+                .unwrap()
+                .bar(bar2)
+                .unwrap()
+                .prefetchable()
+        );
+        let bdf = topology.function(&node("fixed")).unwrap().bdf();
+        let root = PciRootState::new(topology);
+        root.write_config(bdf, offset(4), AccessWidth::Word, 2)
+            .unwrap();
+
+        root.write_config(
+            bdf,
+            offset(0x18),
+            AccessWidth::Dword,
+            APERTURE_START + BAR_SIZE,
+        )
+        .unwrap();
+        assert_eq!(
+            root.read_config(bdf, offset(0x18), AccessWidth::Dword)
+                .unwrap(),
+            APERTURE_START | 0x8
+        );
+        assert!(
+            root.resolve_bar(APERTURE_START, AccessWidth::Byte)
+                .is_some()
+        );
+        assert!(
+            root.resolve_bar(APERTURE_START + BAR_SIZE, AccessWidth::Byte)
+                .is_none()
+        );
+
+        root.write_config(bdf, offset(0x18), AccessWidth::Dword, u64::from(u32::MAX))
+            .unwrap();
+        assert_eq!(
+            root.read_config(bdf, offset(0x18), AccessWidth::Dword)
+                .unwrap(),
+            0xffff_0008
+        );
     }
 
     #[test]

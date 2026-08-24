@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add architecture-neutral ECAM, memory-aperture, and root lifecycle frontends for graph-resolved PCI hosts.
+- Add fixed versus relocatable 32-bit BAR decode policies and preserve prefetchable attributes across probes, partial writes, and reset.
 
 - *(axvisor)* add generic vPCI foundation with x86 PCI enumeration ([#2197](https://github.com/rcore-os/tgoskits/pull/2197))
 
