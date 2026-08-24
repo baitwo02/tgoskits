@@ -108,7 +108,15 @@ cases = ["smoke"]
 id = "test-axvisor-qemu-ivc"
 impact_targets = ["axvisor:aarch64"]
 name = "QEMU aarch64 · IVC"
+timeout_minutes = 30
 command = '''
+export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivc-local-e2e/tgosimages"
+export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild-local/rootfs"
+cargo xtask image pull rootfs-aarch64-alpine.img
+apps/linux/ivc/build.sh --test
+export IVC_E2E_KDIR="$PWD/tmp/ivc-linux-kernel"
+scripts/ivc-prepare-linux-kernel.sh
+scripts/ivc-local-e2e.sh --no-run
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
 '''
 
