@@ -8,6 +8,7 @@
 mod address;
 mod bar;
 mod config;
+mod ecam;
 mod error;
 mod function;
 mod graph;
@@ -23,6 +24,9 @@ pub(crate) const FOUR_GIB: u64 = 1 << 32;
 
 pub use address::{ConfigOffset, PciBarIndex, PciBdf, PciSegment};
 pub use bar::PciMemoryBar;
+pub use ecam::{
+    PCI_BUS_ZERO_ECAM_SIZE, PciEcamFrontend, PciMmioApertureDevice, PciRootStateLifecycle,
+};
 pub use error::{PciError, PciResult};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
 pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};

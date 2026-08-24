@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add an AArch64 generic ECAM host provider and conditionally emit its FDT node from graph-resolved resources when the topology contains an endpoint.
+
 ### Fixed
 
 - Clear newly allocated IVC shared regions before publishing channel identity.
