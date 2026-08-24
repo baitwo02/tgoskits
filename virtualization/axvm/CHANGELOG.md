@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add an AArch64 generic ECAM host provider and conditionally emit its FDT node from graph-resolved resources when the topology contains an endpoint.
+- Add an initial `ivshmem-pci` endpoint with a private 64 KiB BAR2 aperture for vPCI integration validation.
 
 - *(axvm)* service virtio block images with on-demand file I/O ([#2310](https://github.com/rcore-os/tgoskits/pull/2310))
 - *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))

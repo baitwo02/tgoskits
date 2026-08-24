@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(axvisor)* preserve configured pre-build commands for test guest preparation
+
 - *(axvm)* service virtio block images with on-demand file I/O ([#2310](https://github.com/rcore-os/tgoskits/pull/2310))
 - *(nixos-tests)* add local StarryOS-backed nixosTest framework ([#2226](https://github.com/rcore-os/tgoskits/pull/2226))
 - *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))
