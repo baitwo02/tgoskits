@@ -24,6 +24,7 @@ mod firmware_plan;
 mod gic;
 mod images;
 mod npt;
+mod pci_plan;
 mod resource_pools;
 mod shared_mmio;
 mod shared_provider;

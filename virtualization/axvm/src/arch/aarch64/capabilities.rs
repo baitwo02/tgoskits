@@ -79,6 +79,7 @@ pub(super) fn patch_runtime_fdt(
         ivc_channels,
         gic_profile,
         timer_profile,
+        pci_host,
     ) = vm.with_architecture_plan(|plan| {
         Ok((
             plan.serial_profile(),
@@ -91,9 +92,10 @@ pub(super) fn patch_runtime_fdt(
             plan.ivc_channels().to_vec(),
             plan.gic_profile().clone(),
             plan.timer_profile().clone(),
+            plan.pci_firmware(),
         ))
     })?;
-    super::fdt::core::create::patch_guest_fdt_for_runtime(
+    let bytes = super::fdt::core::create::patch_guest_fdt_for_runtime(
         super::fdt::core::create::GuestFdtRuntimePatch {
             fdt_bytes,
             memory_regions: &vm.memory_regions(),
@@ -108,7 +110,8 @@ pub(super) fn patch_runtime_fdt(
             initrd_start_size: initrd,
             create_chosen: true,
         },
-    )
+    )?;
+    super::fdt::core::pci::install_pci_host(&bytes, pci_host.as_ref())
 }
 
 pub(super) fn patch_provided_fdt(

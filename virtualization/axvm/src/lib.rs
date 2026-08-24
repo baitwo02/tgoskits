@@ -43,6 +43,9 @@ mod vcpu;
 mod vm;
 
 #[cfg(all(test, not(target_arch = "aarch64")))]
+#[path = "arch/aarch64/pci_plan.rs"]
+mod aarch64_pci_plan_tests;
+#[cfg(all(test, not(target_arch = "aarch64")))]
 #[path = "arch/aarch64/shared_mmio.rs"]
 mod aarch64_shared_mmio_tests;
 #[cfg(all(test, not(target_arch = "aarch64")))]
@@ -62,7 +65,8 @@ pub use axvm_types::{
 };
 pub use configured::{
     ConfiguredDeviceCatalog, ConfiguredDeviceError, ConfiguredModelConstructor,
-    ConfiguredModelRegistration, DefaultVirtualDeviceIntent, DeviceInstantiationContext,
+    ConfiguredModelRegistration, ConfiguredPciEndpoint, ConfiguredPciModelConstructor,
+    ConfiguredPciModelRegistration, DefaultVirtualDeviceIntent, DeviceInstantiationContext,
     FixedDeviceBindings, FixedWiredBinding,
 };
 pub use error::{AxVmError, AxVmResult};
