@@ -5,7 +5,7 @@
 //! runtime identities, and lifecycle callbacks are introduced by later
 //! integration layers.
 
-use alloc::{collections::BTreeMap, string::ToString, sync::Arc};
+use alloc::{collections::BTreeMap, string::ToString, sync::Arc, vec::Vec};
 use core::{fmt, ops::Range};
 
 use ax_sync::SpinLock;
@@ -188,9 +188,20 @@ impl PciRootState {
 
     /// Restores every function's root-owned power-on config and BAR route.
     pub fn reset(&self) {
-        for function in &mut self.state.lock_irqsave().functions {
+        drop(self.reset_collecting_bound_tokens());
+    }
+
+    /// Restores root state and snapshots bound endpoint generations in BDF order.
+    pub(crate) fn reset_collecting_bound_tokens(&self) -> Vec<EndpointRouteToken> {
+        let mut state = self.state.lock_irqsave();
+        for function in &mut state.functions {
             function.reset();
         }
+        state
+            .functions
+            .iter()
+            .filter_map(|function| state.bindings.get(&function.bdf()).copied())
+            .collect()
     }
 }
 

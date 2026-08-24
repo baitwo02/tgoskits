@@ -93,7 +93,7 @@ impl DeviceModel for Aarch64PciHostModel {
             memory.1,
             binding.clone(),
         )));
-        bundle.add_lifecycle(Arc::new(PciRootStateLifecycle::new(root)));
+        bundle.add_lifecycle(Arc::new(PciRootStateLifecycle::new(binding.clone())));
         bundle.provide_service::<PciRootBindingKey>(binding)?;
         Ok(bundle)
     }

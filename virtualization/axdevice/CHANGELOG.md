@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reset every bound PCI endpoint after restoring root state, continue after failures, and return the first endpoint error.
+
 - *(repo)* remove redundant Cargo manifest declarations ([#2297](https://github.com/rcore-os/tgoskits/pull/2297))
 
 ## [0.6.2](https://github.com/rcore-os/tgoskits/compare/axdevice-v0.6.1...axdevice-v0.6.2) - 2026-08-27
