@@ -283,18 +283,17 @@ impl Device for PciMemoryApertureDevice {
     }
 }
 
-/// Lifecycle adapter restoring only root-owned PCI config and BAR state.
-pub struct PciRootLifecycle(Arc<PciRootState>);
+/// Lifecycle adapter restoring root and bound endpoint state.
+pub struct PciRootLifecycle(Arc<PciRootBinding>);
 impl PciRootLifecycle {
-    /// Creates a lifecycle adapter for one generic PCI root.
-    pub const fn new(root: Arc<PciRootState>) -> Self {
-        Self(root)
+    /// Creates a lifecycle adapter for one generic PCI root binding.
+    pub const fn new(binding: Arc<PciRootBinding>) -> Self {
+        Self(binding)
     }
 }
 impl DeviceLifecycle for PciRootLifecycle {
     fn reset(&self) -> DeviceManagerResult {
-        self.0.reset();
-        Ok(())
+        self.0.reset()
     }
     fn suspend(&self) -> DeviceManagerResult {
         Ok(())

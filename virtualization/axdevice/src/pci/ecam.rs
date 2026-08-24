@@ -149,20 +149,19 @@ impl Device for PciMmioApertureDevice {
     }
 }
 
-/// Lifecycle adapter restoring root-owned PCI configuration and BAR state.
-pub struct PciRootStateLifecycle(Arc<PciRootState>);
+/// Lifecycle adapter restoring root and bound endpoint state.
+pub struct PciRootStateLifecycle(Arc<PciRootBinding>);
 
 impl PciRootStateLifecycle {
-    /// Creates a lifecycle adapter for one shared root.
-    pub const fn new(root: Arc<PciRootState>) -> Self {
-        Self(root)
+    /// Creates a lifecycle adapter for one shared root binding.
+    pub const fn new(binding: Arc<PciRootBinding>) -> Self {
+        Self(binding)
     }
 }
 
 impl DeviceLifecycle for PciRootStateLifecycle {
     fn reset(&self) -> DeviceManagerResult {
-        self.0.reset();
-        Ok(())
+        self.0.reset()
     }
 
     fn suspend(&self) -> DeviceManagerResult {
