@@ -23,7 +23,7 @@ pub(crate) use root::all_ones;
 pub(crate) const FOUR_GIB: u64 = 1 << 32;
 
 pub use address::{ConfigOffset, PciBarIndex, PciBdf, PciSegment};
-pub use bar::PciMemoryBar;
+pub use bar::{PciBarDecodePolicy, PciMemoryBar};
 pub use ecam::{
     PCI_BUS_ZERO_ECAM_SIZE, PciEcamFrontend, PciMmioApertureDevice, PciRootStateLifecycle,
 };

@@ -81,11 +81,11 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, PCI_BUS_ZERO_ECAM_SIZE, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass,
-    PciEcamFrontend, PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement,
-    PciFunctionSpec, PciHostKey, PciHostProvider, PciMemoryBar, PciMmioApertureDevice, PciResult,
-    PciRootBinding, PciRootBindingKey, PciRootState, PciRootStateLifecycle, PciSegment,
-    ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
+    ConfigOffset, PCI_BUS_ZERO_ECAM_SIZE, PciBarAccess, PciBarDecodePolicy, PciBarIndex,
+    PciBarRoute, PciBdf, PciClass, PciEcamFrontend, PciEndpointIdentity, PciError, PciFunction,
+    PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider, PciMemoryBar,
+    PciMmioApertureDevice, PciResult, PciRootBinding, PciRootBindingKey, PciRootState,
+    PciRootStateLifecycle, PciSegment, ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
 };
 pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{
