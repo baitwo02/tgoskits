@@ -13,7 +13,7 @@ use ax_sync::SpinLock;
 use super::{
     EndpointRouteToken, FOUR_GIB, PciBarDecodePolicy, PciBarIndex, PciBdf, PciError, PciResult,
     ResolvedPciTopology,
-    config::{BarWriteAction, FunctionState},
+    config::{BarWriteAction, FunctionState, PciCommandState},
 };
 use crate::{AccessWidth, ConfigOffset};
 
@@ -95,9 +95,15 @@ impl PciRootState {
         let Some(function_index) = state.function_index(bdf) else {
             return Ok(());
         };
+        let command_before = state.functions[function_index].command_state();
         let Some(action) = state.functions[function_index].prepare_bar_write(offset, size, value)
         else {
             state.functions[function_index].write_non_bar(offset, size, value);
+            let command_after = state.functions[function_index].command_state();
+            drop(state);
+            if command_after != command_before {
+                dispatch_command_effect(command_after);
+            }
             return Ok(());
         };
         match action {
@@ -186,6 +192,17 @@ impl PciRootState {
             function.reset();
         }
     }
+}
+
+fn dispatch_command_effect(command: PciCommandState) {
+    // Keep endpoint-visible effects outside the root lock. The first endpoint
+    // observer can extend this seam without changing config-state ownership.
+    log::debug!(
+        "PCI command state: memory_space={}, bus_master={}, intx_disabled={}",
+        command.memory_space_enabled,
+        command.bus_master_enabled,
+        command.intx_disabled
+    );
 }
 
 fn resolve_route(
@@ -403,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn command_register_only_accepts_memory_space_enable() {
+    fn command_register_models_memory_bus_master_and_intx_disable() {
         let (root, endpoint_bdf, bar_base) = root_with_bar();
 
         assert!(root.resolve_bar(bar_base, AccessWidth::Dword).is_none());
@@ -413,7 +430,7 @@ mod tests {
         assert_eq!(
             root.read_config(endpoint_bdf, offset(4), AccessWidth::Word)
                 .unwrap(),
-            0x0002
+            0x0406
         );
         let route = root.resolve_bar(bar_base + 8, AccessWidth::Dword).unwrap();
         assert_eq!(route.bdf(), endpoint_bdf);
