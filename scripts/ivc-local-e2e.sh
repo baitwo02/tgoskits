@@ -65,7 +65,7 @@ done
 log() { printf '\n\033[1;34m[ivc-local-e2e]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[ivc-local-e2e] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
-for tool in debugfs tar python3 cargo make modinfo; do
+for tool in cargo debugfs make python3 tar; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 [ -f "$ARCHIVE" ] || die "rootfs archive not found: $ARCHIVE"
@@ -91,6 +91,9 @@ if ! command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1; then
     command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 \
         || die "no aarch64 kernel cross compiler found"
 fi
+READELF="${CROSS_COMPILE}readelf"
+command -v "$READELF" >/dev/null 2>&1 \
+    || die "cross-toolchain readelf not found: $READELF"
 
 make -C "$KERNEL_DRIVER" \
     CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" clean >/dev/null 2>&1 || true
@@ -98,7 +101,12 @@ make -C "$KERNEL_DRIVER" \
     CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" -j"${IVC_E2E_JOBS:-4}"
 MODULE="$KERNEL_DRIVER/axvisor.ko"
 [ -f "$MODULE" ] || die "module build failed: axvisor.ko missing"
-MODULE_VERMAGIC="$(modinfo -F vermagic "$MODULE")"
+MODULE_VERMAGIC="$(
+    "$READELF" --string-dump=.modinfo "$MODULE" \
+        | sed -n 's/.*vermagic=//p'
+)"
+[ -n "$MODULE_VERMAGIC" ] \
+    || die "module vermagic not found in $MODULE"
 MODULE_RELEASE="${MODULE_VERMAGIC%% *}"
 [ "$MODULE_RELEASE" = "$KERNEL_RELEASE" ] \
     || die "module release $MODULE_RELEASE does not match guest kernel $KERNEL_RELEASE"
