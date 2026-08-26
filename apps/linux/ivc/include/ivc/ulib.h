@@ -9,12 +9,14 @@
 extern "C" {
 #endif
 
-// TODO: record publishers and subscribers created and recycle them when close the IVC manager.
 typedef struct ivc_manager {
     int64_t             fd;                 // File descriptor for the IVC device
+    uint64_t            active_endpoints;   // Publishers and subscribers using this manager
 } ivc_manager_t, *ivc_manager_p;
 
 ivc_manager_p ivc_open_manager(void);
+// Returns EBUSY without consuming manager while endpoints remain. Otherwise,
+// consumes manager even when closing its device reports an error.
 int ivc_close_manager(ivc_manager_p manager);
 
 

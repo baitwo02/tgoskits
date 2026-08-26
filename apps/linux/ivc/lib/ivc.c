@@ -19,6 +19,16 @@ int ivc_manager_is_valid(ivc_manager_p manager) {
     return 1;
 }
 
+static int ivc_manager_release_endpoint(ivc_manager_p manager, const char *operation) {
+    if (manager->active_endpoints == 0) {
+        errno = EINVAL;
+        fprintf(stderr, "IVC manager endpoint count underflow during %s\n", operation);
+        return -1;
+    }
+    manager->active_endpoints--;
+    return 0;
+}
+
 ivc_manager_p ivc_open_manager(void) {
     // Allocate memory for the IVC manager
     ivc_manager_p manager = malloc(sizeof(ivc_manager_t));
@@ -28,6 +38,7 @@ ivc_manager_p ivc_open_manager(void) {
     }
     // Open the IVC device
     manager->fd = open(IVC_DEV_PATH, O_RDWR);
+    manager->active_endpoints = 0;
     if (manager->fd < 0) {
         perror("Failed to open IVC device");
         free(manager);
@@ -42,14 +53,21 @@ int ivc_close_manager(ivc_manager_p manager) {
         fprintf(stderr, "Invalid IVC manager for close\n");
         return -1;
     }
-    // Close the IVC device
-    if (close(manager->fd) < 0) {
-        perror("Failed to close IVC device");
+    if (manager->active_endpoints != 0) {
+        errno = EBUSY;
+        fprintf(stderr,
+                "Cannot close IVC manager with %llu active endpoint(s)\n",
+                (unsigned long long)manager->active_endpoints);
         return -1;
     }
-    // Free the manager memory
+
+    int result = 0;
+    if (close(manager->fd) < 0) {
+        perror("Failed to close IVC device");
+        result = -1;
+    }
     free(manager);
-    return 0;
+    return result;
 }
 
 ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uint64_t channel_key) {
@@ -92,6 +110,7 @@ ivc_subscriber_p ivc_subscribe(ivc_manager_p manager, uint64_t publisher_id, uin
         return NULL;
     }
 
+    manager->active_endpoints++;
     return subscriber;
 }
 
@@ -174,6 +193,9 @@ int ivc_unsubscribe(ivc_subscriber_p subscriber) {
         result = -1;
     }
 
+    if (ivc_manager_release_endpoint(subscriber->manager, "unsubscribe") < 0) {
+        result = -1;
+    }
     free(subscriber);
     return result;
 }
@@ -218,6 +240,7 @@ ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_
         return NULL;
     }
 
+    manager->active_endpoints++;
     return publisher;
 }
 
@@ -300,6 +323,9 @@ int ivc_unpublish(ivc_publisher_p publisher) {
         result = -1;
     }
 
+    if (ivc_manager_release_endpoint(publisher->manager, "unpublish") < 0) {
+        result = -1;
+    }
     free(publisher);
     return result;
 }

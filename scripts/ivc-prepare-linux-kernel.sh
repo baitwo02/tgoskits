@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# TEMPORARY(IVC_ROOTFS_PATCH): This helper builds the external module metadata
+# used only by the pull-and-patch guest-image workflow and may be removed with it.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${IVC_E2E_WORKSPACE:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}"
 KDIR="${IVC_E2E_KDIR:-$WORKSPACE/tmp/ivc-linux-kernel}"
@@ -25,6 +28,7 @@ kernel_tree_is_ready() {
     [ -f "$KDIR/include/config/kernel.release" ] \
         && [ -f "$KDIR/include/generated/autoconf.h" ] \
         && [ -f "$KDIR/Module.symvers" ] \
+        && [ -f "$KDIR/scripts/module.lds" ] \
         && [ -x "$KDIR/scripts/mod/modpost" ] \
         && [ "$(cat "$KDIR/include/config/kernel.release")" = "$EXPECTED_KERNEL_RELEASE" ] \
         && {
@@ -87,9 +91,10 @@ make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" defconfig
     --set-str LOCALVERSION "-g74fe02ce122a-dirty" \
     --disable LOCALVERSION_AUTO
 make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
-# A complete vmlinux link generates Module.symvers. modules_prepare alone does
-# not provide the exported-symbol metadata needed for strict external-module
-# modpost validation.
+# modules_prepare generates scripts/module.lds for the final external-module
+# link. A complete vmlinux link is still required to generate Module.symvers
+# for strict modpost validation.
+make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" modules_prepare
 make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" vmlinux
 cp "$KDIR/vmlinux.symvers" "$KDIR/Module.symvers"
 printf '%s %s\n' "$LINUX_REF" "$EXPECTED_ARCHIVE_SHA256" > "$SOURCE_MARKER"

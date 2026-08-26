@@ -112,6 +112,7 @@ static int run_unpublish_failure(const char *operation,
 {
     ivc_manager_t manager = {
         .fd = 7,
+        .active_endpoints = 1,
     };
     ivc_publisher_t publisher = {
         .manager = &manager,
@@ -138,6 +139,7 @@ static int run_unsubscribe_failure(const char *operation,
 {
     ivc_manager_t manager = {
         .fd = 7,
+        .active_endpoints = 1,
     };
     ivc_subscriber_t subscriber = {
         .manager = &manager,

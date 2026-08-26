@@ -38,6 +38,14 @@ Region v3/Message V1 intentionally rejects the older fixed-slot region v2
 layout. The Linux programs and `/root/axvisor.ko` must therefore be updated
 together.
 
+## User-library lifetime
+
+A publisher or subscriber keeps its manager busy until `ivc_unpublish()` or
+`ivc_unsubscribe()` consumes the endpoint. `ivc_close_manager()` returns
+`EBUSY` without consuming the manager while any endpoint remains. Once no
+endpoint remains, closing the manager always consumes its allocation, even if
+the underlying `close()` reports an error.
+
 ## Build and test
 
 Build the guest programs with:
@@ -70,6 +78,9 @@ apps/linux/ivc/build.sh --test
 ```
 
 ## QEMU test image
+
+<!-- TEMPORARY(IVC_ROOTFS_PATCH): The pull-and-patch workflow documented below
+may be removed once the published guest image contains matching IVC artifacts. -->
 
 The QEMU IVC test boots its Linux guest from the tgosimages rootfs artifact.
 `scripts/ivc-local-e2e.sh` builds the kernel module and user programs from the

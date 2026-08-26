@@ -108,6 +108,15 @@ run_host_tests() {
         "${script_dir}/lib/ivc.c"
     "${test_out_dir}/ivc-teardown-best-effort"
 
+    "${host_cc}" \
+        -I"${script_dir}/include" \
+        -std=c11 -Wall -Wextra -Werror -O0 -g \
+        -Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=ioctl -Wl,--wrap=free \
+        -o "${test_out_dir}/ivc-manager-lifecycle" \
+        "${script_dir}/tests/ivc_manager_lifecycle.c" \
+        "${script_dir}/lib/ivc.c"
+    "${test_out_dir}/ivc-manager-lifecycle"
+
     echo "AXVISOR_IVC_TEST_OUT_DIR=${test_out_dir}"
 }
 

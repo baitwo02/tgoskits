@@ -104,12 +104,16 @@ kind = "axvisor-qemu"
 arch = "loongarch64"
 cases = ["smoke"]
 
+# TEMPORARY(IVC_ROOTFS_PATCH): This check pulls and mutates a published guest
+# image in place. Remove the patching integration when that image ships matching
+# IVC artifacts.
 [[check]]
 id = "test-axvisor-qemu-ivc"
 impact_targets = ["axvisor:aarch64"]
 name = "QEMU aarch64 · IVC"
 timeout_minutes = 30
 command = '''
+# TEMPORARY(IVC_ROOTFS_PATCH): Pull and patch the guest image for this run.
 export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivc-local-e2e/tgosimages"
 export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild-local/rootfs"
 cargo xtask image pull rootfs-aarch64-alpine.img
