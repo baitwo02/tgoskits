@@ -129,7 +129,7 @@ cases = [
   "qemu-vm-pool-http",
   "browser-console",
   "qemu-ivc-arceos",
-  # "qemu-ivc", # Linux guest image uses IVC v3; ArceOS publisher uses v2.
+  # "qemu-ivc", # Prebuilt guest images must match the publisher protocol.
 ]
 
 [[check]]
