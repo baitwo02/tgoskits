@@ -59,7 +59,7 @@ echo "==> axvisor aarch64 browser console"
 cargo xtask axvisor test qemu --arch aarch64 --test-case browser-console
 echo "==> axvisor aarch64 ArceOS IVC owner teardown"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc-arceos
-# Disabled until the Linux IVC guest image matches the v2 publisher protocol.
+# Disabled until the Linux IVC guest image matches the publisher protocol.
 # echo "==> axvisor aarch64 IVC"
 # cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
 '''
@@ -71,7 +71,7 @@ cases = [
   "http-control-plane",
   "browser-console",
   "qemu-ivc-arceos",
-  # "qemu-ivc", # Linux guest image uses IVC v3; ArceOS publisher uses v2.
+  # "qemu-ivc", # Prebuilt guest images must match the publisher protocol.
 ]
 
 [[check]]
