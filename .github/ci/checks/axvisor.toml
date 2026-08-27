@@ -32,9 +32,8 @@ echo "==> axvisor aarch64 HTTP control-plane (incl. pause/resume)"
 cargo xtask axvisor test qemu --arch aarch64 --test-case http-control-plane
 echo "==> axvisor aarch64 browser console"
 cargo xtask axvisor test qemu --arch aarch64 --test-case browser-console
-# Disabled until the Linux IVC guest image matches the v2 publisher protocol.
-# echo "==> axvisor aarch64 IVC"
-# cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
+echo "==> axvisor aarch64 IVC"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
 '''
 
 [[check.suite]]
@@ -43,7 +42,7 @@ arch = "aarch64"
 cases = [
   "http-control-plane",
   "browser-console",
-  # "qemu-ivc", # Linux guest image uses IVC v3; ArceOS publisher uses v2.
+  "qemu-ivc",
 ]
 
 [[check]]
