@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add a typed virtual PCI Type-0/ECAM foundation with deterministic BDF/BAR planning and transactional resolved-device-graph integration.
+- Add root-level direct config access validation for supported widths and function-boundary checks.
+- Add PCI BDF reservations (`PciTopologyBuilder::reserve_bdf`) so architectures can protect platform positions, and make automatic placement device-granular so unrelated endpoints never merge into one multi-function device.
+- Add PCI BAR decode policies: `PciMemoryBar::with_decode_policy(Fixed)` keeps a planner-owned base permanent against guest relocations, and the prefetchable attribute is modeled and preserved across reads, sizing probes, partial writes, and reset. BAR write classification now happens after the write is merged into the full dword, so partial accesses obey the same policy as whole accesses.
+- Model standard PCI command state (Memory Space Enable, Bus Master Enable, and INTx Disable) in the root config image and dispatch command transitions as effects outside the root lock, preparing the seam for endpoint observers and function reset.
+
+### Changed
+
+- *(breaking)* Split the PCI root state from the ECAM frontend: config images, BAR decode, bindings, and reset now live in one shared root state behind separate ECAM and memory-aperture runtime devices.
+
+### Removed
+
+- Remove `PciHostBridgeConfig`; resolved ECAM and memory windows are exposed through `ResolvedPciBus` and validated by `validate_host_windows`.
+
+### Fixed
+
+- PCI root reset now attempts every bound endpoint function instead of only recovering root-owned state, returning the first real error and logging later ones so transport, Bus Master, and INTx state cannot stay stale after a re-enumeration.
 
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/axdevice-v0.5.7...axdevice-v0.6.0) - 2026-08-20
 

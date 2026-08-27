@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use axdevice::*;
 use axdevice_base::*;
@@ -6,6 +9,10 @@ use axdevice_base::*;
 const ECAM_BASE: u64 = 0x1000_0000;
 const APERTURE_BASE: u64 = 0x2000_0000;
 const APERTURE_END: u64 = 0x2010_0000;
+
+fn ecam_window(base: u64) -> Range<u64> {
+    base..base + 0x10_0000
+}
 
 type RecordedAccess = (PciBdf, PciBarIndex, u64, bool, u64);
 
@@ -55,7 +62,7 @@ impl PciFunction for RecordingFunction {
 }
 
 struct StaticEndpointModel {
-    function: Arc<RecordingFunction>,
+    function: Arc<dyn PciFunction>,
 }
 
 impl PciEndpointModel for StaticEndpointModel {
@@ -134,7 +141,9 @@ fn ecam_exposes_type_zero_identity_capabilities_and_absent_functions() {
     assert_eq!(read_config(&runtime, bdf, 0x43, AccessWidth::Byte), 0xbb);
 
     write_config(&runtime, bdf, 4, AccessWidth::Word, u64::MAX);
-    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0002);
+    // Memory Space Enable, Bus Master Enable, and INTx Disable are the
+    // modeled command bits; everything else stays masked off.
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
     assert_eq!(read_config(&runtime, bdf, 0x100, AccessWidth::Dword), 0);
 
     let absent = PciBdf::new(PciSegment::new(0), 0, 31, 7).unwrap();
@@ -156,6 +165,40 @@ fn ecam_exposes_type_zero_identity_capabilities_and_absent_functions() {
 
     runtime.reset_lifecycle_devices().unwrap();
     assert_eq!(read_config(&runtime, bdf, 0x42, AccessWidth::Byte), 0xaa);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+}
+
+#[test]
+fn command_register_expresses_mse_bme_and_intx_disable() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 6, 0).unwrap();
+    let spec = bare_function("endpoint").with_bdf(ResourceRequest::Fixed(bdf));
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    // Modeled command bits are writable and read back; unmodeled bits are
+    // masked off instead of being stored from guest writes.
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+
+    // INTx Disable lives in the high byte of the 16-bit command field.
+    write_config(&runtime, bdf, 5, AccessWidth::Byte, 0);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0006);
+    write_config(&runtime, bdf, 5, AccessWidth::Byte, 0xff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+}
+
+#[test]
+fn reset_restores_power_on_command_state() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 6, 0).unwrap();
+    let spec = bare_function("endpoint").with_bdf(ResourceRequest::Fixed(bdf));
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+    runtime.reset_lifecycle_devices().unwrap();
     assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
 }
 
@@ -335,6 +378,445 @@ fn sixty_four_bit_bar_probe_and_relocation_update_the_pair_together() {
     );
 }
 
+fn fixed_policy_bar_function(id: &str, bdf: PciBdf, bars: Vec<PciMemoryBar>) -> PciFunctionSpec {
+    let mut spec = PciFunctionSpec::new(function_id(id), endpoint_identity())
+        .with_bdf(ResourceRequest::Fixed(bdf));
+    for bar in bars {
+        spec = spec.with_bar(bar).unwrap();
+    }
+    spec
+}
+
+/// Endpoint probe whose reset outcome, error identity, and invocation count
+/// are observable.
+struct LifecycleProbeFunction {
+    name: &'static str,
+    fail_reset: bool,
+    error_detail: &'static str,
+    reset_calls: Mutex<u32>,
+}
+
+impl PciFunction for LifecycleProbeFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn read_bar(
+        &self,
+        _access: &PciBarAccess,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult<u64> {
+        Ok(0)
+    }
+
+    fn write_bar(
+        &self,
+        _access: &PciBarAccess,
+        _value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        Ok(())
+    }
+
+    fn reset(&self) -> DeviceResult {
+        *self.reset_calls.lock().unwrap() += 1;
+        if self.fail_reset {
+            Err(DeviceError::Unsupported {
+                operation: "reset PCI function",
+                detail: self.error_detail.into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn root_reset_tries_every_bound_function_and_returns_first_error() {
+    // Two failing functions with distinguishable errors pin the "first real
+    // error" contract: a last-error regression would flip the assertion.
+    let failing_a = Arc::new(LifecycleProbeFunction {
+        name: "failing-a",
+        fail_reset: true,
+        error_detail: "first probe failure",
+        reset_calls: Mutex::new(0),
+    });
+    let failing_b = Arc::new(LifecycleProbeFunction {
+        name: "failing-b",
+        fail_reset: true,
+        error_detail: "second probe failure",
+        reset_calls: Mutex::new(0),
+    });
+    let healthy = Arc::new(LifecycleProbeFunction {
+        name: "healthy",
+        fail_reset: false,
+        error_detail: "",
+        reset_calls: Mutex::new(0),
+    });
+    let bdf_a = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let bdf_b = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+    let bdf_c = PciBdf::new(PciSegment::new(0), 0, 3, 0).unwrap();
+    let specs = [
+        bare_function("ep-a").with_bdf(ResourceRequest::Fixed(bdf_a)),
+        bare_function("ep-b").with_bdf(ResourceRequest::Fixed(bdf_b)),
+        bare_function("ep-c").with_bdf(ResourceRequest::Fixed(bdf_c)),
+    ];
+    let (_, runtime) = build_pci_dyn(
+        specs,
+        [
+            ("ep-a", failing_a.clone()),
+            ("ep-b", failing_b.clone()),
+            ("ep-c", healthy.clone()),
+        ],
+    );
+
+    // All three functions carry non-power-on command state before the reset.
+    for bdf in [bdf_a, bdf_b, bdf_c] {
+        write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    }
+
+    match runtime.reset_lifecycle_devices() {
+        Err(DeviceManagerError::Device(DeviceError::Unsupported { detail, .. })) => {
+            assert_eq!(detail, "first probe failure");
+        }
+        other => panic!("reset must return the first function error, got {other:?}"),
+    }
+
+    // Every bound function is attempted exactly once despite the failures.
+    assert_eq!(*failing_a.reset_calls.lock().unwrap(), 1);
+    assert_eq!(*failing_b.reset_calls.lock().unwrap(), 1);
+    assert_eq!(*healthy.reset_calls.lock().unwrap(), 1);
+
+    // Root-owned power-on state is restored regardless of endpoint failures.
+    for bdf in [bdf_a, bdf_b, bdf_c] {
+        assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+    }
+}
+
+#[test]
+fn fixed_bar_size_probe_returns_mask_with_attributes_and_keeps_decode() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let base = APERTURE_BASE;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(base)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        0xffff_f000
+    );
+    // The sizing probe must not move the decode: the aperture still routes.
+    assert_eq!(
+        read_mmio(&runtime, base + 0x24, AccessWidth::Dword).unwrap(),
+        0xa500_0024
+    );
+}
+
+#[test]
+fn fixed_bar_rejects_relocation_but_accepts_planned_address() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let planned = APERTURE_BASE + 0x4000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+    // Rewriting the planned address itself stays accepted and harmless.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, planned);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 8, AccessWidth::Dword).unwrap(),
+        0xa500_0008
+    );
+
+    // Any other whole-dword address is ignored: readback and decode stay on
+    // the plan.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, planned + 0x2000);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert!(read_mmio(&runtime, planned + 0x2008, AccessWidth::Dword).is_err());
+
+    // A partial write that only changes address bits is rejected as well.
+    write_config(&runtime, bdf, 0x11, AccessWidth::Byte, 0xff);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 8, AccessWidth::Dword).unwrap(),
+        0xa500_0008
+    );
+}
+
+#[test]
+fn fixed_bar_half_mask_write_is_ignored_and_full_probe_still_reports_mask() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let planned = APERTURE_BASE + 0x3000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // One half of the sizing mask alone matches neither the mask nor the
+    // planned base: it must leave config and decode untouched instead of
+    // starting a relocation transaction.
+    write_config(&runtime, bdf, 0x12, AccessWidth::Word, 0xffff);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 4, AccessWidth::Dword).unwrap(),
+        0xa500_0004
+    );
+
+    // The completed all-ones dword afterwards is classified as a probe and
+    // reports the size mask without moving the decode.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        0xffff_f000
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 4, AccessWidth::Dword).unwrap(),
+        0xa500_0004
+    );
+}
+
+#[test]
+fn bar_attributes_survive_probe_partial_writes_and_reset() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+    let plain32 = APERTURE_BASE;
+    let prefetchable32 = APERTURE_BASE + 0x1000;
+    let prefetchable64 = APERTURE_BASE + 0x2000;
+
+    // Fixed policy keeps every readback below deterministic; the prefetchable
+    // bit rides on the low dword and the width bit selects the high dword.
+    let bars = [
+        PciMemoryBar::new(
+            PciBarIndex::new(0).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits32,
+        )
+        .unwrap()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(plain32)),
+        PciMemoryBar::new(
+            PciBarIndex::new(2).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits32,
+        )
+        .unwrap()
+        .prefetchable()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(prefetchable32)),
+        PciMemoryBar::new(
+            PciBarIndex::new(4).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits64,
+        )
+        .unwrap()
+        .prefetchable()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(prefetchable64)),
+    ];
+    let mut spec = PciFunctionSpec::new(function_id("endpoint"), endpoint_identity())
+        .with_bdf(ResourceRequest::Fixed(bdf));
+    for bar in bars {
+        spec = spec.with_bar(bar).unwrap();
+    }
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // Ordinary reads expose the planned attributes.
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+    // Undeclared BAR slots stay hard-wired to zero.
+    assert_eq!(read_config(&runtime, bdf, 0x14, AccessWidth::Dword), 0);
+
+    // Sizing probes carry the same attributes in the mask.
+    for (offset, attribute) in [(0x10u16, 0u32), (0x18, 0x8), (0x20, 0xc)] {
+        write_config(
+            &runtime,
+            bdf,
+            offset,
+            AccessWidth::Dword,
+            u64::from(u32::MAX),
+        );
+        assert_eq!(
+            read_config(&runtime, bdf, offset, AccessWidth::Dword),
+            0xffff_f000 | u64::from(attribute),
+            "probe mask must keep attributes at {offset:#x}"
+        );
+    }
+    // Probing the high dword of the 64-bit pair reports its address mask.
+    write_config(&runtime, bdf, 0x24, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x24, AccessWidth::Dword),
+        0xffff_ffff
+    );
+
+    // Guest writes cannot flip attributes: the bits are re-derived from the
+    // plan on every read instead of being stored from the config image.
+    for (offset, value) in [
+        (0x10u16, 0x08u8), // try to mark the plain BAR prefetchable
+        (0x18, 0xf7),      // try to clear the prefetchable bit
+        (0x20, 0xf3),      // try to clear the 64-bit width bit
+    ] {
+        write_config(&runtime, bdf, offset, AccessWidth::Byte, u64::from(value));
+    }
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+
+    runtime.reset_lifecycle_devices().unwrap();
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+}
+
+#[test]
+fn sixty_four_bit_fixed_bar_pair_probe_preserves_high_dword_mask() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 3, 0).unwrap();
+    let planned = APERTURE_BASE + 0x8000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(2).unwrap(),
+                0x2000,
+                PciMemoryBarWidth::Bits64,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // Probing both dwords reports the full pair masks without moving decode.
+    write_config(&runtime, bdf, 0x18, AccessWidth::Dword, u64::from(u32::MAX));
+    write_config(&runtime, bdf, 0x1c, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        0xffff_e004
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x1c, AccessWidth::Dword),
+        0xffff_ffff
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 0x40, AccessWidth::Dword).unwrap(),
+        0xa500_0040
+    );
+
+    // A high-dword relocation attempt is rejected. It clears only its own
+    // probe flag: the low dword keeps its latched sizing response until it
+    // is rewritten, exactly like the committed high dword returns to zero.
+    write_config(&runtime, bdf, 0x1c, AccessWidth::Dword, 1);
+    assert_eq!(read_config(&runtime, bdf, 0x1c, AccessWidth::Dword), 0);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        0xffff_e004
+    );
+
+    // Rewriting the planned pair itself is accepted and the decode stays.
+    write_config(&runtime, bdf, 0x18, AccessWidth::Dword, planned | 0x4);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        planned | 0x4
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 0x40, AccessWidth::Dword).unwrap(),
+        0xa500_0040
+    );
+
+    runtime.reset_lifecycle_devices().unwrap();
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        planned | 0x4
+    );
+    assert_eq!(read_config(&runtime, bdf, 0x1c, AccessWidth::Dword), 0);
+}
+
 #[test]
 fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
     let original_bdf = PciBdf::new(PciSegment::new(0), 0, 5, 0).unwrap();
@@ -348,7 +830,7 @@ fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
             .add_function(bare_function("same").with_bdf(ResourceRequest::Fixed(replacement_bdf)))
             .is_err()
     );
-    let duplicate_id = duplicate_id.resolve(host_config()).unwrap();
+    let duplicate_id = duplicate_id.resolve(APERTURE_BASE..APERTURE_END).unwrap();
     assert_eq!(
         duplicate_id.function(&function_id("same")).unwrap().bdf(),
         original_bdf
@@ -390,9 +872,17 @@ fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
 
 #[test]
 fn host_and_config_access_validation_rejects_invalid_ranges_and_widths() {
-    assert!(PciHostBridgeConfig::new(ECAM_BASE + 0x1000, APERTURE_BASE..APERTURE_END).is_err());
-    assert!(PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_BASE).is_err());
-    assert!(PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..0x1_0000_1000).is_err());
+    assert!(
+        validate_host_windows(ecam_window(ECAM_BASE + 0x1000), APERTURE_BASE..APERTURE_END)
+            .is_err()
+    );
+    assert!(validate_host_windows(ecam_window(ECAM_BASE), APERTURE_BASE..APERTURE_BASE).is_err());
+    assert!(validate_host_windows(ecam_window(ECAM_BASE), APERTURE_BASE..0x1_0000_1000).is_err());
+    // Overlapping windows must also be rejected before any runtime device is
+    // published.
+    assert!(
+        validate_host_windows(ecam_window(APERTURE_BASE), APERTURE_BASE..APERTURE_END).is_err()
+    );
 
     let bdf = PciBdf::new(PciSegment::new(0), 0, 0, 0).unwrap();
     let (_, runtime) = build_pci(
@@ -419,8 +909,7 @@ fn topology_reports_bar_and_capability_aperture_exhaustion() {
     );
     assert!(resolve_topology([invalid_identity]).is_err());
 
-    let tiny_host =
-        PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_BASE + 0x1000).unwrap();
+    let tiny_host = APERTURE_BASE..APERTURE_BASE + 0x1000;
     let bar = PciMemoryBar::new(
         PciBarIndex::new(0).unwrap(),
         0x2000,
@@ -443,6 +932,109 @@ fn topology_reports_bar_and_capability_aperture_exhaustion() {
 }
 
 #[test]
+fn fixed_platform_functions_and_reservations_shape_deterministic_auto_allocation() {
+    let platform_bdf =
+        |device: u8, function: u8| PciBdf::new(PciSegment::new(0), 0, device, function).unwrap();
+
+    let build = |reverse_platform: bool| -> ResolvedPciTopology {
+        let mut builder = PciTopologyBuilder::new();
+        // The host bridge and LPC are real guest-enumerable platform
+        // functions declared below. The reserved holes include the first
+        // free device, so automatic placement provably skips reservations —
+        // without this position the scan would never reach a reserved BDF.
+        for position in [platform_bdf(1, 0), platform_bdf(3, 0)] {
+            builder.reserve_bdf(position).unwrap();
+            builder.reserve_bdf(position).unwrap();
+        }
+        let mut platform = [
+            (
+                "host-bridge",
+                PciEndpointIdentity::new(0x8086, 0x29c0, PciClass::new(0x06, 0x00, 0x00)),
+                platform_bdf(0, 0),
+            ),
+            (
+                "lpc",
+                PciEndpointIdentity::new(0x8086, 0x2918, PciClass::new(0x06, 0x01, 0x00)),
+                platform_bdf(31, 0),
+            ),
+        ];
+        if reverse_platform {
+            platform.reverse();
+        }
+        for (id, identity, position) in platform {
+            builder
+                .add_function(
+                    PciFunctionSpec::new(function_id(id), identity)
+                        .with_bdf(ResourceRequest::Fixed(position)),
+                )
+                .unwrap();
+        }
+        builder
+            .add_function(auto_bar_function("beta", 0x1000))
+            .unwrap();
+        builder
+            .add_function(auto_bar_function("alpha", 0x2000))
+            .unwrap();
+        builder.resolve(APERTURE_BASE..APERTURE_END).unwrap()
+    };
+
+    let forward = build(false);
+    let reversed = build(true);
+
+    // Automatic placement skips fixed platform functions AND reservations:
+    // device 1 is reserved, so alpha lands on device 2 and beta jumps over
+    // the reserved device 3. Allocation follows stable node-id order across
+    // whole devices.
+    assert_eq!(
+        forward.function(&function_id("beta")).unwrap().bdf(),
+        PciBdf::new(PciSegment::new(0), 0, 4, 0).unwrap()
+    );
+    assert_eq!(
+        forward.function(&function_id("alpha")).unwrap().bdf(),
+        PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap()
+    );
+    // Declaration order never changes the resolved placement.
+    for id in ["alpha", "beta", "host-bridge", "lpc"] {
+        assert_eq!(
+            forward.function(&function_id(id)).map(|f| f.bdf()),
+            reversed.function(&function_id(id)).map(|f| f.bdf())
+        );
+    }
+}
+
+#[test]
+fn reserved_bdfs_reject_fixed_requests() {
+    let reserved = PciBdf::new(PciSegment::new(0), 0, 5, 0).unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder.reserve_bdf(reserved).unwrap();
+    builder
+        .add_function(bare_function("clash").with_bdf(ResourceRequest::Fixed(reserved)))
+        .unwrap();
+
+    match builder.resolve(APERTURE_BASE..APERTURE_END) {
+        Err(PciError::BdfReserved { bdf, .. }) => assert_eq!(bdf, reserved),
+        other => panic!("reserved placement must fail deterministically, got {other:?}"),
+    }
+}
+
+#[test]
+fn automatic_placement_reports_exhaustion_after_thirty_two_devices() {
+    // Zero-padded ids keep declaration index equal to the lexicographic
+    // node-id order the allocator follows.
+    let mut builder = PciTopologyBuilder::new();
+    for index in 0..33u8 {
+        builder
+            .add_function(bare_function(&std::format!("auto-{index:02}")))
+            .unwrap();
+    }
+
+    match builder.resolve(APERTURE_BASE..APERTURE_END) {
+        Err(PciError::BdfExhausted { function }) => assert_eq!(function, "auto-32"),
+        other => panic!("device 33 must exhaust bus-zero placement, got {other:?}"),
+    }
+}
+
+#[test]
 fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     let mut first = PciTopologyBuilder::new();
     first
@@ -451,7 +1043,7 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     first
         .add_function(auto_bar_function("alpha", 0x1000))
         .unwrap();
-    let first = Arc::new(first.resolve(host_config()).unwrap());
+    let first = Arc::new(first.resolve(APERTURE_BASE..APERTURE_END).unwrap());
 
     let mut second = PciTopologyBuilder::new();
     second
@@ -460,7 +1052,7 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     second
         .add_function(auto_bar_function("beta", 0x2000))
         .unwrap();
-    let second = second.resolve(host_config()).unwrap();
+    let second = second.resolve(APERTURE_BASE..APERTURE_END).unwrap();
 
     assert_eq!(
         first.function(&function_id("alpha")).unwrap().bdf(),
@@ -508,8 +1100,12 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     assert_eq!(read_config(&runtime, alpha, 4, AccessWidth::Word), 0);
 }
 
-fn host_config() -> PciHostBridgeConfig {
-    PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_END).unwrap()
+fn resolve_topology<const N: usize>(specs: [PciFunctionSpec; N]) -> PciResult<ResolvedPciTopology> {
+    let mut builder = PciTopologyBuilder::new();
+    for spec in specs {
+        builder.add_function(spec)?;
+    }
+    builder.resolve(APERTURE_BASE..APERTURE_END)
 }
 
 fn function_id(value: &str) -> DeviceNodeId {
@@ -548,17 +1144,19 @@ fn fixed_bar_function(id: &str, bdf: PciBdf, address: u64) -> PciFunctionSpec {
         .unwrap()
 }
 
-fn resolve_topology<const N: usize>(specs: [PciFunctionSpec; N]) -> PciResult<ResolvedPciTopology> {
-    let mut builder = PciTopologyBuilder::new();
-    for spec in specs {
-        builder.add_function(spec)?;
-    }
-    builder.resolve(host_config())
-}
-
 fn build_pci<const N: usize>(
     specs: [PciFunctionSpec; N],
     functions: [(&str, Arc<RecordingFunction>); N],
+) -> (ResolvedPciBus, DeviceRuntime) {
+    build_pci_dyn(
+        specs,
+        functions.map(|(id, function)| (id, function as Arc<dyn PciFunction>)),
+    )
+}
+
+fn build_pci_dyn<const N: usize>(
+    specs: [PciFunctionSpec; N],
+    functions: [(&str, Arc<dyn PciFunction>); N],
 ) -> (ResolvedPciBus, DeviceRuntime) {
     let host_id = function_id("pci-host");
     let host_resources = PciHostResourceRequirements::new(

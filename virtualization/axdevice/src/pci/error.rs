@@ -35,6 +35,16 @@ pub enum PciError {
         /// Diagnostic reason.
         detail: &'static str,
     },
+    /// A direct root-level config access violates width or range rules.
+    #[error("invalid direct PCI config access at offset {offset:#x} with size {size}: {detail}")]
+    InvalidDirectConfigAccess {
+        /// Byte offset into one function's config space.
+        offset: usize,
+        /// Requested access size in bytes.
+        size: usize,
+        /// Diagnostic reason.
+        detail: &'static str,
+    },
     /// The root-complex ECAM or memory aperture is malformed.
     #[error("invalid PCI host aperture: {detail}")]
     InvalidHostAperture {
@@ -86,6 +96,14 @@ pub enum PciError {
         first: String,
         /// Second stable function identity.
         second: String,
+    },
+    /// A fixed request targets a BDF reserved by the platform contract.
+    #[error("PCI BDF {bdf} is reserved and cannot be assigned to {function}")]
+    BdfReserved {
+        /// Reserved BDF that was targeted.
+        bdf: PciBdf,
+        /// Stable function identity that was rejected.
+        function: String,
     },
     /// A non-zero function has no function zero at the same device.
     #[error("PCI function {bdf} has no function zero at the same device")]

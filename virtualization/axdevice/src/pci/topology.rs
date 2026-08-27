@@ -8,16 +8,17 @@ use alloc::{
 use core::{cmp::Reverse, fmt, ops::Range};
 
 use super::{
-    PciBarIndex, PciBdf, PciError, PciFunctionSpec, PciHostBridgeConfig, PciMemoryBarWidth,
-    PciResult, bar::ResolvedBarPlan, config::PowerOnConfig,
+    PciBarIndex, PciBdf, PciError, PciFunctionSpec, PciMemoryBarWidth, PciResult,
+    bar::ResolvedBarPlan, config::PowerOnConfig,
 };
 use crate::{DeviceNodeId, ResourceRequest};
 
-const BDF_COUNT: u16 = 32 * 8;
+const DEVICE_COUNT: u16 = 32;
 
 /// Mutable PCI topology declaration sealed before VM execution.
 pub struct PciTopologyBuilder {
     functions: BTreeMap<DeviceNodeId, PciFunctionSpec>,
+    reservations: BTreeSet<PciBdf>,
 }
 
 impl fmt::Debug for PciTopologyBuilder {
@@ -25,6 +26,7 @@ impl fmt::Debug for PciTopologyBuilder {
         formatter
             .debug_struct("PciTopologyBuilder")
             .field("function_count", &self.functions.len())
+            .field("reservation_count", &self.reservations.len())
             .finish()
     }
 }
@@ -34,6 +36,7 @@ impl PciTopologyBuilder {
     pub const fn new() -> Self {
         Self {
             functions: BTreeMap::new(),
+            reservations: BTreeSet::new(),
         }
     }
 
@@ -54,6 +57,22 @@ impl PciTopologyBuilder {
         Ok(())
     }
 
+    /// Reserves a BDF so automatic placement can never assign it.
+    ///
+    /// Used for platform functions that are enumerated separately or for
+    /// positions an architecture contract keeps empty. Duplicate reservations
+    /// are accepted so several declarations can share one platform contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciError::InvalidAddress`] for segment or bus values outside
+    /// the supported single-segment, bus-zero space.
+    pub fn reserve_bdf(&mut self, bdf: PciBdf) -> PciResult {
+        validate_supported_bdf(bdf)?;
+        self.reservations.insert(bdf);
+        Ok(())
+    }
+
     /// Resolves all fixed requests, performs deterministic automatic
     /// placement, validates the complete topology, and freezes it.
     ///
@@ -61,10 +80,10 @@ impl PciTopologyBuilder {
     ///
     /// Returns a typed [`PciError`] for any BDF, BAR, capability, or aperture
     /// conflict. No partially resolved topology is published.
-    pub fn resolve(self, host: PciHostBridgeConfig) -> PciResult<ResolvedPciTopology> {
-        let bdfs = resolve_bdfs(&self.functions)?;
+    pub fn resolve(self, memory_aperture: Range<u64>) -> PciResult<ResolvedPciTopology> {
+        let bdfs = resolve_bdfs(&self.functions, &self.reservations)?;
         validate_function_zero(&bdfs)?;
-        let bar_addresses = resolve_bar_addresses(&host, &self.functions)?;
+        let bar_addresses = resolve_bar_addresses(&memory_aperture, &self.functions)?;
         let multifunction_devices = multifunction_devices(&bdfs);
         let mut functions = Vec::with_capacity(self.functions.len());
         for (id, spec) in self.functions {
@@ -76,6 +95,8 @@ impl PciTopologyBuilder {
                     index: bar.index(),
                     size: bar.size(),
                     width: bar.width(),
+                    prefetchable: bar.is_prefetchable(),
+                    policy: bar.decode_policy(),
                     address: bar_addresses[&(id.clone(), bar.index())],
                 })
                 .collect::<Vec<_>>();
@@ -93,7 +114,10 @@ impl PciTopologyBuilder {
             });
         }
         functions.sort_by_key(|function| function.bdf);
-        Ok(ResolvedPciTopology { host, functions })
+        Ok(ResolvedPciTopology {
+            memory_aperture,
+            functions,
+        })
     }
 }
 
@@ -171,11 +195,19 @@ impl ResolvedPciBar {
     pub const fn width(self) -> PciMemoryBarWidth {
         self.0.width
     }
+
+    /// Returns whether this BAR declares the prefetchable attribute.
+    ///
+    /// Firmware composers need this bit to describe prefetchable ranges;
+    /// the decode policy stays internal to the runtime root.
+    pub const fn prefetchable(self) -> bool {
+        self.0.prefetchable
+    }
 }
 
 /// Immutable PCI topology shared by firmware planning and runtime creation.
 pub struct ResolvedPciTopology {
-    host: PciHostBridgeConfig,
+    memory_aperture: Range<u64>,
     functions: Vec<ResolvedPciFunction>,
 }
 
@@ -183,16 +215,17 @@ impl fmt::Debug for ResolvedPciTopology {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ResolvedPciTopology")
-            .field("host", &self.host)
+            .field("memory_aperture", &self.memory_aperture)
             .field("functions", &self.functions)
             .finish()
     }
 }
 
 impl ResolvedPciTopology {
-    /// Returns the host bridge aperture descriptor.
-    pub const fn host(&self) -> &PciHostBridgeConfig {
-        &self.host
+    /// Returns the CPU-visible PCI memory aperture used for BAR placement
+    /// and runtime decode.
+    pub const fn memory_aperture(&self) -> &Range<u64> {
+        &self.memory_aperture
     }
 
     /// Returns functions in BDF order.
@@ -212,12 +245,19 @@ impl ResolvedPciTopology {
 
 fn resolve_bdfs(
     functions: &BTreeMap<DeviceNodeId, PciFunctionSpec>,
+    reservations: &BTreeSet<PciBdf>,
 ) -> PciResult<BTreeMap<DeviceNodeId, PciBdf>> {
     let mut resolved = BTreeMap::new();
     let mut occupied = BTreeMap::<PciBdf, DeviceNodeId>::new();
     for (id, spec) in functions {
         if let ResourceRequest::Fixed(bdf) = spec.bdf {
             validate_supported_bdf(bdf)?;
+            if reservations.contains(&bdf) {
+                return Err(PciError::BdfReserved {
+                    bdf,
+                    function: id.to_string(),
+                });
+            }
             if let Some(existing) = occupied.insert(bdf, id.clone()) {
                 return Err(PciError::DuplicateBdf {
                     bdf,
@@ -230,9 +270,15 @@ fn resolve_bdfs(
     }
     for (id, spec) in functions {
         if spec.bdf == ResourceRequest::Auto {
-            let bdf = (0..BDF_COUNT)
-                .map(PciBdf::bus_zero)
-                .find(|candidate| !occupied.contains_key(candidate))
+            // Automatic placement is device-granular: every automatically
+            // placed function owns the next free device's function 0, so
+            // unrelated endpoints never merge into one multi-function
+            // device and explicit sibling functions stay declaration-owned.
+            let bdf = (0..DEVICE_COUNT)
+                .map(|device| PciBdf::bus_zero(device * 8))
+                .find(|candidate| {
+                    !occupied.contains_key(candidate) && !reservations.contains(candidate)
+                })
                 .ok_or_else(|| PciError::BdfExhausted {
                     function: id.to_string(),
                 })?;
@@ -284,7 +330,7 @@ fn multifunction_devices(bdfs: &BTreeMap<DeviceNodeId, PciBdf>) -> BTreeSet<u8> 
 }
 
 fn resolve_bar_addresses(
-    host: &PciHostBridgeConfig,
+    memory_aperture: &Range<u64>,
     functions: &BTreeMap<DeviceNodeId, PciFunctionSpec>,
 ) -> PciResult<BTreeMap<(DeviceNodeId, PciBarIndex), u64>> {
     let mut fixed = Vec::new();
@@ -322,7 +368,7 @@ fn resolve_bar_addresses(
         let ResourceRequest::Fixed(address) = placement.request else {
             unreachable!("fixed placement list contains only fixed requests");
         };
-        let range = checked_bar_range(host, &placement, address)?;
+        let range = checked_bar_range(memory_aperture, &placement, address)?;
         if overlaps_any(&occupied, &range) {
             return Err(PciError::BarConflict {
                 function: placement.function.to_string(),
@@ -336,14 +382,14 @@ fn resolve_bar_addresses(
     }
     for placement in automatic {
         let address =
-            first_fit(host.memory_aperture(), placement.size, &occupied).ok_or_else(|| {
+            first_fit(memory_aperture.clone(), placement.size, &occupied).ok_or_else(|| {
                 PciError::BarApertureExhausted {
                     function: placement.function.to_string(),
                     bar: placement.index,
                     size: placement.size,
                 }
             })?;
-        let range = checked_bar_range(host, &placement, address)?;
+        let range = checked_bar_range(memory_aperture, &placement, address)?;
         occupied.push(range);
         resolved.insert((placement.function, placement.index), address);
     }
@@ -359,7 +405,7 @@ struct BarPlacement {
 }
 
 fn checked_bar_range(
-    host: &PciHostBridgeConfig,
+    memory_aperture: &Range<u64>,
     placement: &BarPlacement,
     address: u64,
 ) -> PciResult<Range<u64>> {
@@ -375,8 +421,7 @@ fn checked_bar_range(
             bar: placement.index,
             detail: "BAR range overflows u64".into(),
         })?;
-    let aperture = host.memory_aperture();
-    if address < aperture.start || end > aperture.end {
+    if address < memory_aperture.start || end > memory_aperture.end {
         return Err(PciError::InvalidBar {
             bar: placement.index,
             detail: "fixed address lies outside the host memory aperture".into(),

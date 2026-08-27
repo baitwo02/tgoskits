@@ -17,7 +17,33 @@ use crate::DeviceNodeId;
 const LEGACY_CONFIG_END: usize = 0x100;
 const CAPABILITY_START: usize = 0x40;
 const COMMAND_MEMORY_ENABLE: u8 = 0x02;
+const COMMAND_BUS_MASTER_ENABLE: u8 = 0x04;
+/// PCI Interrupt Disable is command bit 10: bit 2 of the high byte of the
+/// little-endian 16-bit command field at offset 4.
+const COMMAND_INTX_DISABLE_HIGH: u8 = 0x04;
 const STATUS_CAPABILITY_LIST: u8 = 0x10;
+
+/// Standard PCI command state owned by the root config image.
+///
+/// Endpoints observe transitions through the root's out-of-lock effect
+/// dispatch instead of owning their own header copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PciCommandState {
+    pub(crate) memory_space_enabled: bool,
+    pub(crate) bus_master_enabled: bool,
+    pub(crate) intx_disabled: bool,
+}
+
+impl PciCommandState {
+    /// Reads the modeled command bits from one config image.
+    pub(crate) fn from_config(config: &[u8; CONFIG_SPACE_SIZE]) -> Self {
+        Self {
+            memory_space_enabled: config[4] & COMMAND_MEMORY_ENABLE != 0,
+            bus_master_enabled: config[4] & COMMAND_BUS_MASTER_ENABLE != 0,
+            intx_disabled: config[5] & COMMAND_INTX_DISABLE_HIGH != 0,
+        }
+    }
+}
 
 /// One conventional PCI capability body.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +132,10 @@ pub(crate) struct PowerOnConfig {
 }
 
 impl PowerOnConfig {
+    pub(crate) fn command_state(&self) -> PciCommandState {
+        PciCommandState::from_config(&self.bytes)
+    }
+
     pub(crate) fn build(
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
@@ -121,7 +151,8 @@ impl PowerOnConfig {
         let mut write_mask = Box::new([0; CONFIG_SPACE_SIZE]);
         bytes[0..2].copy_from_slice(&identity.vendor_id().to_le_bytes());
         bytes[2..4].copy_from_slice(&identity.device_id().to_le_bytes());
-        write_mask[4] = COMMAND_MEMORY_ENABLE;
+        write_mask[4] = COMMAND_MEMORY_ENABLE | COMMAND_BUS_MASTER_ENABLE;
+        write_mask[5] = COMMAND_INTX_DISABLE_HIGH;
         let class = identity.class();
         bytes[8] = identity.revision();
         bytes[9] = class.programming_interface();
@@ -222,6 +253,16 @@ impl FunctionState {
         self.config[4] & COMMAND_MEMORY_ENABLE != 0
     }
 
+    /// Returns the standard command state of this function's config image.
+    pub(crate) fn command_state(&self) -> PciCommandState {
+        PciCommandState::from_config(&self.config)
+    }
+
+    /// Returns the power-on standard command state this function resets to.
+    pub(crate) fn power_on_command_state(&self) -> PciCommandState {
+        self.power_on.command_state()
+    }
+
     pub(crate) fn bars(&self) -> &[BarState] {
         &self.bars
     }
@@ -241,15 +282,22 @@ impl FunctionState {
         value: u64,
     ) -> Option<BarWriteAction> {
         let (bar, high) = self.bar_dword(offset)?;
-        if size == 4 && offset.is_multiple_of(4) && value as u32 == u32::MAX {
-            return Some(BarWriteAction::Probe { bar, high });
-        }
+        // Classify only after merging the write into the full BAR dword: one
+        // policy application point per access, whatever the width. For the
+        // typed config accesses reachable today this coincides with
+        // classifying the raw value (an aligned BAR base can never complete
+        // an all-ones dword from a partial write); composing frontends such
+        // as CF8/CFC data-port bytes rely on the merged classification.
         let mut dword = self.bars[bar].committed_dword(high).to_le_bytes();
         merge_bytes(&mut dword, offset % 4, size, value, &[u8::MAX; 4]);
+        let merged = u32::from_le_bytes(dword);
+        if merged == u32::MAX {
+            return Some(BarWriteAction::Probe { bar, high });
+        }
         Some(BarWriteAction::Relocate {
             bar,
             high,
-            candidate: self.bars[bar].candidate_address(high, u32::from_le_bytes(dword)),
+            candidate: self.bars[bar].candidate_address(high, merged),
         })
     }
 
@@ -323,11 +371,8 @@ fn validate_capability(id: u8, body: &[u8], write_mask: &[u8]) -> PciResult {
 fn write_initial_bars(bytes: &mut [u8; CONFIG_SPACE_SIZE], bars: &[ResolvedBarPlan]) {
     for bar in bars {
         let offset = usize::from(bar.index.config_offset());
-        let type_bits = match bar.width {
-            PciMemoryBarWidth::Bits32 => 0,
-            PciMemoryBarWidth::Bits64 => 0x4,
-        };
-        let low = (bar.address as u32 & 0xffff_fff0) | type_bits;
+        let low = (bar.address as u32 & 0xffff_fff0)
+            | super::bar::bar_attributes(bar.width, bar.prefetchable);
         bytes[offset..offset + 4].copy_from_slice(&low.to_le_bytes());
         if bar.width == PciMemoryBarWidth::Bits64 {
             bytes[offset + 4..offset + 8]
