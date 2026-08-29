@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ignore unavailable FDT reserved-memory children when deriving guest reservations.
+- Materialize AArch64 PCI hosts only for typed endpoints and select their ECAM and memory aperture from available MMIO below 4 GiB.
 - Clear newly allocated IVC shared regions before publishing channel identity.
 
 ## [0.6.2](https://github.com/rcore-os/tgoskits/compare/axvm-v0.6.1...axvm-v0.6.2) - 2026-08-27

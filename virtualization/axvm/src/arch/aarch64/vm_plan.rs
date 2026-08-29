@@ -12,7 +12,7 @@ use crate::{config::*, machine::*, vm::prepare::device_plan::*, *};
 pub(crate) struct Aarch64VmPlan {
     devices: VmDevicePlan,
     firmware: Aarch64FirmwarePlan,
-    pci: Aarch64PciPlan,
+    pci: Option<Aarch64PciPlan>,
 }
 
 impl Aarch64VmPlan {
@@ -49,7 +49,7 @@ impl Aarch64VmPlan {
             replacement_ranges.push(serial_range(config.serial_profile())?);
         }
 
-        let devices = VmDevicePlan::with_pci_host_for_vm(
+        let devices = VmDevicePlan::with_optional_pci_host_for_vm(
             config,
             nodes,
             &replacement_ranges,
@@ -89,8 +89,8 @@ impl Aarch64VmPlan {
         self.firmware.timer()
     }
 
-    pub(crate) const fn pci_firmware(&self) -> Option<crate::boot::fdt::core::pci::GuestPciHost> {
-        self.pci.firmware()
+    pub(crate) fn pci_firmware(&self) -> Option<crate::boot::fdt::core::pci::GuestPciHost> {
+        self.pci.as_ref().map(Aarch64PciPlan::firmware)
     }
 }
 

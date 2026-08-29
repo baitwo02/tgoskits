@@ -101,19 +101,27 @@ impl DeviceModel for Aarch64PciHostModel {
 
 #[derive(Debug)]
 pub(super) struct Aarch64PciPlan {
-    firmware: Option<GuestPciHost>,
+    firmware: GuestPciHost,
 }
 
 impl Aarch64PciPlan {
-    pub(super) fn resolve(config: &AxVMConfig, graph: &ResolvedDeviceGraph) -> AxVmResult<Self> {
+    pub(super) fn resolve(
+        config: &AxVMConfig,
+        graph: &ResolvedDeviceGraph,
+    ) -> AxVmResult<Option<Self>> {
+        let Some(topology) = graph.pci_topology(&host_key()) else {
+            return Ok(None);
+        };
         let host_id = DeviceNodeId::new(PCI_HOST_ID)?;
-        let topology = graph.pci_topology(&host_key()).ok_or_else(|| {
-            AxVmError::invalid_config("AArch64 device graph has no resolved PCI host")
-        })?;
-        let has_endpoint = topology
+        if !topology
             .functions()
-            .any(|function| function.owner() != &host_id);
-        if has_endpoint && config.image_config().dtb_load_gpa.is_none() {
+            .any(|function| function.owner() != &host_id)
+        {
+            return Err(AxVmError::invalid_config(
+                "AArch64 device graph materialized a PCI host without endpoints",
+            ));
+        }
+        if config.image_config().dtb_load_gpa.is_none() {
             return Err(AxVmError::unsupported(
                 "create AArch64 virtual PCI host",
                 "configured PCI endpoints require a guest DTB; UEFI/ACPI PCI is not implemented",
@@ -123,13 +131,11 @@ impl Aarch64PciPlan {
         let resources = graph.resources_for(&host_id)?;
         let ecam = resources.mmio(&ResourceSlot::new(ECAM_SLOT)?)?;
         let memory = resources.mmio(&ResourceSlot::new(MEMORY_SLOT)?)?;
-        let firmware = has_endpoint
-            .then(|| GuestPciHost::new(ecam, memory))
-            .transpose()?;
-        Ok(Self { firmware })
+        let firmware = GuestPciHost::new(ecam, memory)?;
+        Ok(Some(Self { firmware }))
     }
 
-    pub(super) const fn firmware(&self) -> Option<GuestPciHost> {
+    pub(super) const fn firmware(&self) -> GuestPciHost {
         self.firmware
     }
 }
@@ -140,7 +146,10 @@ mod tests {
     use axvm_types::GuestPhysAddr;
 
     use super::*;
-    use crate::config::{AxVMConfigParams, PhysCpuList, VMImageConfig};
+    use crate::{
+        config::{AxVMConfigParams, PhysCpuList, VMImageConfig},
+        vm::prepare::device_plan::VmDevicePlan,
+    };
 
     struct TestEndpointModel;
     struct TestFunction;
@@ -227,39 +236,56 @@ mod tests {
         })
     }
 
-    fn resolved_graph(with_endpoint: bool) -> ResolvedDeviceGraph {
+    #[cfg(target_arch = "aarch64")]
+    fn auto_mmio_search() -> core::ops::Range<u64> {
+        super::super::resource_pools::AUTO_MMIO_SEARCH.clone()
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn auto_mmio_search() -> core::ops::Range<u64> {
+        0x0b00_0000..0x1_0000_0000
+    }
+
+    fn device_plan(
+        with_endpoint: bool,
+        reservations: &[(&str, core::ops::Range<u64>)],
+    ) -> AxVmResult<VmDevicePlan> {
         let controller = DeviceNodeId::new("vgic").unwrap();
-        let mut graph = DeviceGraphBuilder::new();
-        graph
-            .add(DeviceNodeSpec::firmware_only(controller.clone()))
-            .unwrap();
+        let mut nodes = std::vec![DeviceNodeSpec::firmware_only(controller.clone())];
         if with_endpoint {
-            graph
-                .add(DeviceNodeSpec::virtual_device(
-                    DeviceNodeId::new("endpoint0").unwrap(),
-                    Arc::new(TestEndpointModel),
-                ))
-                .unwrap();
+            nodes.push(DeviceNodeSpec::virtual_device(
+                DeviceNodeId::new("endpoint0").unwrap(),
+                Arc::new(TestEndpointModel),
+            ));
         }
-        graph
-            .register_pci_host(provider(&controller).unwrap())
-            .unwrap();
         let mut pools = ResourcePools::new();
-        pools.add_auto_mmio(0x0b00_0000..0x1100_0000).unwrap();
-        graph.declare().unwrap().resolve(pools).unwrap()
+        pools.add_auto_mmio(auto_mmio_search())?;
+        for (owner, range) in reservations {
+            pools.reserve_mmio((*owner).to_string(), range.clone())?;
+        }
+        VmDevicePlan::with_optional_pci_host_for_vm(
+            &config(with_endpoint),
+            nodes,
+            &[],
+            pools,
+            provider(&controller)?,
+        )
     }
 
     #[test]
     fn endpoint_resolves_one_generic_ecam_firmware_view_and_runtime_root() {
-        let graph = resolved_graph(true);
+        let devices = device_plan(true, &[]).unwrap();
+        let graph = devices.graph();
         let ids = graph
             .nodes()
             .map(|node| node.id().as_str())
             .collect::<std::vec::Vec<_>>();
         assert_eq!(ids, ["vgic", "pci-host", "endpoint0"]);
 
-        let plan = Aarch64PciPlan::resolve(&config(true), &graph).unwrap();
-        let firmware = plan.firmware().unwrap();
+        let plan = Aarch64PciPlan::resolve(&config(true), graph)
+            .unwrap()
+            .unwrap();
+        let firmware = plan.firmware();
         assert_eq!(firmware.ecam_base(), 0x0b00_0000);
         assert_eq!(firmware.memory_base(), 0x0c00_0000);
         assert_eq!(firmware.memory_size(), PCI_MEMORY_APERTURE_SIZE);
@@ -274,16 +300,63 @@ mod tests {
     }
 
     #[test]
-    fn host_without_endpoints_reserves_no_firmware_node() {
-        let graph = resolved_graph(false);
-        let plan = Aarch64PciPlan::resolve(&config(false), &graph).unwrap();
-        assert!(plan.firmware().is_none());
+    fn host_without_endpoints_is_not_materialized() {
+        let devices = device_plan(false, &[]).unwrap();
+        let ids = devices
+            .graph()
+            .nodes()
+            .map(|node| node.id().as_str())
+            .collect::<std::vec::Vec<_>>();
+
+        assert_eq!(ids, ["vgic"]);
+        assert!(
+            Aarch64PciPlan::resolve(&config(false), devices.graph())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn endpoint_aperture_skips_active_low_mmio_reservations() {
+        let devices = device_plan(
+            true,
+            &[
+                ("active-minidump", 0x0c00_0000..0x0e00_0000),
+                ("active-cma", 0x1000_0000..0x2000_0000),
+            ],
+        )
+        .unwrap();
+        let resources = devices
+            .graph()
+            .resources_for(&DeviceNodeId::new(PCI_HOST_ID).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            resources.mmio(&ResourceSlot::new(MEMORY_SLOT).unwrap()),
+            Ok((0x2000_0000, PCI_MEMORY_APERTURE_SIZE))
+        );
+    }
+
+    #[test]
+    fn endpoint_aperture_fails_when_no_aligned_window_exists_below_four_gib() {
+        let error = device_plan(
+            true,
+            &[("occupied-32-bit-mmio", 0x0c00_0000..auto_mmio_search().end)],
+        )
+        .err()
+        .expect("the PCI aperture must not move above 4 GiB");
+
+        let AxVmError::Device { detail, .. } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(detail.contains("mmio auto pool is exhausted"));
+        assert!(detail.contains("slot memory-aperture for pci-host"));
     }
 
     #[test]
     fn endpoint_without_guest_dtb_is_rejected() {
-        let graph = resolved_graph(true);
-        let error = Aarch64PciPlan::resolve(&config(false), &graph).unwrap_err();
+        let devices = device_plan(true, &[]).unwrap();
+        let error = Aarch64PciPlan::resolve(&config(false), devices.graph()).unwrap_err();
         assert!(matches!(error, AxVmError::Unsupported { .. }));
         assert!(error.to_string().contains("require a guest DTB"));
     }
