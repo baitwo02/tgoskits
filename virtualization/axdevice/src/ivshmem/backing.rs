@@ -75,6 +75,37 @@ impl SharedBarBacking {
         Ok(())
     }
 
+    /// Privileged byte access for link-managed regions (state table).
+    ///
+    /// Guests reach the same bytes only through their BAR access path; this
+    /// entry point exists so the link can publish state without going
+    /// through a width-encoded BAR write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::SharedMemoryOutOfRange`] when `offset +
+    /// bytes.len()` leaves the region.
+    pub(crate) fn write_bytes(&self, offset: u64, bytes: &[u8]) -> Result<(), IvshmemError> {
+        let range = self.byte_range(offset, bytes.len() as u64)?;
+        let mut backing = self.bytes.lock_irqsave();
+        backing[range].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn byte_range(&self, offset: u64, len: u64) -> Result<Range<usize>, IvshmemError> {
+        let out_of_range = || IvshmemError::SharedMemoryOutOfRange {
+            offset,
+            width: len as usize,
+            size: self.size,
+        };
+        let end = offset.checked_add(len).ok_or_else(out_of_range)?;
+        if end > self.size {
+            return Err(out_of_range());
+        }
+        let start = usize::try_from(offset).map_err(|_| out_of_range())?;
+        Ok(start..start + len as usize)
+    }
+
     fn access_range(&self, offset: u64, width: usize) -> Result<Range<usize>, IvshmemError> {
         if !matches!(width, 1 | 2 | 4 | 8) {
             return Err(IvshmemError::InvalidSharedMemoryWidth { width });

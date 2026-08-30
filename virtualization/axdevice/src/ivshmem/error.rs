@@ -88,6 +88,12 @@ pub enum IvshmemError {
         /// The shared region size that defines the valid range.
         size: u64,
     },
+    /// The BAR2 size cannot host the requested layout.
+    #[error("ivshmem BAR2 layout is invalid: {detail}")]
+    InvalidLayout {
+        /// Diagnostic detail describing the rejected derivation.
+        detail: String,
+    },
     /// An event sink could not record one delivered event.
     #[error("ivshmem event delivery failed for {operation}: {detail}")]
     EventDeliveryFailed {

@@ -24,6 +24,7 @@ use super::{
     SharedBarBacking,
     doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink},
     error::IvshmemError,
+    layout::IvshmemMemoryLayout,
 };
 
 /// Maximum peers of the current device profile.
@@ -134,6 +135,7 @@ pub struct IvshmemLink {
     id: LinkId,
     max_peers: u16,
     backing: SharedBarBacking,
+    layout: IvshmemMemoryLayout,
     peers: SpinLock<LinkPeers>,
     ignored_doorbell: IgnoredDoorbellCounters,
 }
@@ -141,10 +143,15 @@ pub struct IvshmemLink {
 impl IvshmemLink {
     fn new(id: LinkId, max_peers: u16) -> Result<Self, IvshmemError> {
         let backing = SharedBarBacking::try_new(super::SHARED_MEMORY_SIZE)?;
+        // The profile freezes bar2_size and peer count, so this derivation
+        // cannot fail today; the fallible signature constrains the later
+        // configuration-driven layout feature (F8).
+        let layout = IvshmemMemoryLayout::derive(super::SHARED_MEMORY_SIZE, max_peers)?;
         Ok(Self {
             id,
             max_peers,
             backing,
+            layout,
             peers: SpinLock::new(LinkPeers {
                 next_attachment_generation: 0,
                 slots: vec![PeerSlot::Vacant; usize::from(max_peers)].into_boxed_slice(),
@@ -172,6 +179,32 @@ impl IvshmemLink {
     /// Returns the BAR2 size of the link profile.
     pub const fn bar2_size(&self) -> u64 {
         self.backing.size()
+    }
+
+    /// Returns the frozen BAR2 layout of this link.
+    pub const fn layout(&self) -> &IvshmemMemoryLayout {
+        &self.layout
+    }
+
+    /// Publishes the peer's BAR0 State value into its state-table entry.
+    ///
+    /// Called by the owning endpoint's BAR0 State write path, outside the
+    /// endpoint register lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::PeerOutOfProfile`] for an unknown peer and
+    /// [`IvshmemError::SharedMemoryOutOfRange`] if the entry write would
+    /// leave the backing (a layout bug, not a guest condition).
+    pub fn publish_state(&self, peer: PeerId, value: u32) -> Result<(), IvshmemError> {
+        let offset = self.layout.state_entry_offset(peer, self.max_peers)?;
+        self.backing.write_bytes(offset, &value.to_le_bytes())
+    }
+
+    /// Clears the peer's state-table entry; called from endpoint reset.
+    /// The same errors as `publish_state()` apply.
+    pub fn clear_state(&self, peer: PeerId) -> Result<(), IvshmemError> {
+        self.publish_state(peer, 0)
     }
 
     /// Routes one doorbell from the writing endpoint to the target peer.
@@ -858,6 +891,44 @@ mod tests {
         attachment.set_event_sink(probe.clone()).unwrap();
         link.deliver_doorbell(PeerId::new(1), doorbell(0, 0));
         assert!(!probe.lock_observed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn state_writes_publish_into_the_shared_state_table() {
+        let (peer0, peer1) = attached_pair();
+        let link0 = Arc::clone(peer0.link());
+        let link1 = Arc::clone(peer1.link());
+
+        link0.publish_state(PeerId::new(0), 0x0001_0002).unwrap();
+        // The owning link sees the entry through its own backing, and the
+        // other peer's link is the same object: one shared state table.
+        assert_eq!(link0.backing().read(0, 4).unwrap(), 0x0001_0002);
+        assert_eq!(link1.backing().read(0, 4).unwrap(), 0x0001_0002);
+        // The second peer's entry stays untouched.
+        assert_eq!(link1.backing().read(4, 4).unwrap(), 0);
+
+        // Reserved bytes inside the state-table page read zero even after
+        // entries are published.
+        assert_eq!(link0.backing().read(0x8, 4).unwrap(), 0);
+        assert_eq!(link0.backing().read(0xffc, 4).unwrap(), 0);
+
+        // Clearing zeroes the entry without touching the shared region.
+        link0.clear_state(PeerId::new(0)).unwrap();
+        assert_eq!(link0.backing().read(0, 4).unwrap(), 0);
+    }
+
+    #[test]
+    fn state_publish_rejects_unknown_peers() {
+        let registry = registry();
+        let reservation = registry.reserve(1, 0).unwrap();
+        let link = Arc::clone(reservation.link());
+        assert_eq!(
+            link.publish_state(PeerId::new(2), 0),
+            Err(IvshmemError::PeerOutOfProfile {
+                peer: 2,
+                max_peers: MAX_PEERS
+            })
+        );
     }
 
     #[test]

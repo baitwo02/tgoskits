@@ -179,6 +179,17 @@ int main(int argc, char **argv)
     }
     exchange_payload(shared);
 
+    /* The BAR0 State write must surface in the shared state table: this
+     * peer's entry sits at BAR2 offset `peer_id * 4` inside the first page
+     * (F4 layout). The remote-peer observation joins the case together with
+     * the dual-peer run. */
+    const volatile uint32_t *state_table = (const volatile uint32_t *)shared;
+    ivshmem_write_reg32(dev, IVSHMEM_REG_STATE, 0x00010002u);
+    if (state_table[peer_id] != 0x00010002u) {
+        fail("state", "BAR0 state write did not surface in the state table");
+    }
+    checkpoint("state");
+
     result = ivshmem_backend_open(dev, IVSHMEM_BACKEND_POLLING, &backend);
     if (result != IVSHMEM_OK) {
         fail_err("backend", result);

@@ -336,18 +336,46 @@ impl PciFunction for IvshmemPciFunction {
                     self.deliver_doorbell(value);
                     return Ok(());
                 }
-                let mut registers = self.lock_registers("write ivshmem BAR0 registers")?;
-                registers
-                    .write(access.offset(), value)
-                    .map_err(bar_access_error)
+                {
+                    let mut registers = self.lock_registers("write ivshmem BAR0 registers")?;
+                    registers
+                        .write(access.offset(), value)
+                        .map_err(bar_access_error)?;
+                }
+                // The local register is the first state transition; the
+                // state-table publish follows outside the register lock, so
+                // the register and backing locks never nest. Between the two
+                // steps another peer may observe a briefly stale table entry;
+                // the state table remains the source of truth.
+                if access.offset() == STATE_OFFSET {
+                    self.attachment
+                        .link()
+                        .publish_state(self.attachment.peer_id(), value)
+                        .map_err(|error| DeviceError::InvalidState {
+                            operation: "publish ivshmem state",
+                            detail: error.to_string(),
+                        })?;
+                }
+                Ok(())
             }
             MSIX_BAR_INDEX => Ok(()),
-            SHARED_MEMORY_BAR_INDEX => self
-                .attachment
-                .link()
-                .backing()
-                .write(access.offset(), access.width().size(), value)
-                .map_err(bar_access_error),
+            SHARED_MEMORY_BAR_INDEX => {
+                // The state table is host-maintained: BAR0 State writes are
+                // its only write path, BAR2 writes are a guest protocol
+                // violation rejected with AccessDenied.
+                if self.attachment.link().layout().region(access.offset()) == Bar2Region::StateTable
+                {
+                    return Err(DeviceError::AccessDenied {
+                        operation: "write ivshmem BAR2",
+                        detail: "the state table is read-only from BAR2".into(),
+                    });
+                }
+                self.attachment
+                    .link()
+                    .backing()
+                    .write(access.offset(), access.width().size(), value)
+                    .map_err(bar_access_error)
+            }
             _ => Err(DeviceError::OutOfRange {
                 addr: access.offset(),
             }),
@@ -355,9 +383,17 @@ impl PciFunction for IvshmemPciFunction {
     }
 
     fn reset(&self) -> DeviceResult {
-        // Endpoint reset clears only local registers; the shared BAR2 backing
-        // stays intact for the other peer.
+        // Endpoint reset clears the local registers and zeroes this peer's
+        // state-table entry; the rest of the shared backing stays intact for
+        // the other peer.
         self.lock_registers("reset ivshmem endpoint")?.reset();
+        self.attachment
+            .link()
+            .clear_state(self.attachment.peer_id())
+            .map_err(|error| DeviceError::InvalidState {
+                operation: "reset ivshmem endpoint",
+                detail: error.to_string(),
+            })?;
         Ok(())
     }
 }
@@ -370,7 +406,9 @@ mod tests {
 
     const APERTURE_BASE: u64 = 0x0c00_0000;
     const APERTURE_SIZE: u64 = 0x0400_0000;
-    const TEST_OFFSET: u64 = 0x120;
+    // Shared-region scratch offset. F4 reserves the first BAR2 page for the
+    // host-maintained state table, so test payloads live past 0x1000.
+    const TEST_OFFSET: u64 = 0x1100;
     const TEST_VALUE: u64 = 0x4956_5348_4d45_4d31;
 
     fn id(value: &str) -> DeviceNodeId {
@@ -937,6 +975,151 @@ mod tests {
                 .read_bar(peer1.shared_bar + TEST_OFFSET, AccessWidth::Qword)
                 .unwrap(),
             TEST_VALUE
+        );
+    }
+
+    #[test]
+    fn state_writes_propagate_into_the_shared_state_table() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // The BAR0 State write publishes into the state-table entry, which
+        // is readable through every peer's BAR2 mapping.
+        peer0.write_register(STATE_OFFSET, 0x0001_0002).unwrap();
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar, AccessWidth::Dword)
+                .unwrap(),
+            0x0001_0002
+        );
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar, AccessWidth::Dword)
+                .unwrap(),
+            0x0001_0002
+        );
+
+        // Each peer owns its own entry: peer 1 writes its state and both
+        // peers observe the same values at the same offsets.
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + 4, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+        peer1.write_register(STATE_OFFSET, 2).unwrap();
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 4, AccessWidth::Dword)
+                .unwrap(),
+            2
+        );
+
+        // Reserved bytes inside the state-table page read zero.
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 8, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 0xffc, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn state_table_writes_from_bar2_are_denied() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Entry 0 (peer 0) and the last word of the state-table page both
+        // reject direct BAR2 writes.
+        for offset in [0, 0xffc] {
+            let denied =
+                peer0
+                    .binding
+                    .write_bar(peer0.shared_bar + offset, AccessWidth::Dword, 0x1234);
+            assert!(
+                matches!(denied, Err(DeviceError::AccessDenied { .. })),
+                "offset {offset:#x} must be rejected with AccessDenied"
+            );
+        }
+        // The denied writes did not corrupt the entries.
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+        // Shared-region writes keep working past the state-table page.
+        peer0
+            .binding
+            .write_bar(peer0.shared_bar + 0x1000, AccessWidth::Dword, 0xaa)
+            .unwrap();
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + 0x1000, AccessWidth::Dword)
+                .unwrap(),
+            0xaa
+        );
+    }
+
+    #[test]
+    fn endpoint_reset_clears_only_the_owning_state_entry() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        peer0.write_register(STATE_OFFSET, 0x11).unwrap();
+        peer1.write_register(STATE_OFFSET, 0x22).unwrap();
+        peer0
+            .binding
+            .write_bar(peer0.shared_bar + 0x1000, AccessWidth::Dword, 0x33)
+            .unwrap();
+
+        peer0.binding.reset().unwrap();
+        peer0.enable_memory();
+
+        // Peer 0's entry is zero; peer 1's entry and the shared bytes stay.
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + 4, AccessWidth::Dword)
+                .unwrap(),
+            0x22
+        );
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + 0x1000, AccessWidth::Dword)
+                .unwrap(),
+            0x33
         );
     }
 

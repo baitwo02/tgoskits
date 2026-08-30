@@ -21,7 +21,9 @@ const PCI_BAR2_OFFSET: usize = 0x18;
 const PCI_COMMAND_MEMORY_ENABLE: u16 = 1 << 1;
 const IVSHMEM_PCI_ID: u32 = 0x1110_1af4;
 const IVSHMEM_BAR_SIZE: usize = 0x1_0000;
-const TEST_OFFSET: usize = 0x120;
+// F4 reserves the first BAR2 page for the state table; test payloads live in
+// the shared region past 0x1000.
+const TEST_OFFSET: usize = 0x1100;
 const TEST_VALUE: u64 = 0x4956_5348_4d45_4d31;
 
 #[cfg(feature = "arceos")]
