@@ -2,9 +2,12 @@ features = []
 log = "Info"
 target = "aarch64-unknown-none-softfloat"
 vm_configs = [
-  "test-suit/axvisor/normal/qemu-ivshmem-pci/configs/arceos-ivshmem-pci.toml",
+  "test-suit/axvisor/normal/qemu-ivshmem-pci/configs/linux-ivshmem-pci.toml",
 ]
-pre_build_cmds = [
-  "cargo xtask arceos build -p arceos-ivshmem-pci -c apps/arceos/build-aarch64-ivshmem-pci.toml",
-  "\"${LLVM_OBJCOPY:-$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy}\" --strip-all -O binary target/aarch64-unknown-linux-musl/release/arceos-ivshmem-pci target/aarch64-unknown-linux-musl/release/arceos-ivshmem-pci.bin",
-]
+
+[env]
+AXVISOR_TEST_BUSYBOX_INITRAMFS = "tmp/axbuild/axvisor/qemu-ivshmem-pci/initramfs-aarch64.cpio.gz"
+# Only this case consumes the pciutils-enabled rootfs: the generated BusyBox
+# initramfs extracts lspci, libpci and pci.ids from it so the guest can prove
+# enumeration with the standard pciutils tool.
+AXVISOR_TEST_ROOTFS_IMAGE = "rootfs-aarch64-alpine-ivc-message-v1.img"

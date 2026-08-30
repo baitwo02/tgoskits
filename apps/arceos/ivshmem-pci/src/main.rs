@@ -10,6 +10,11 @@ use ax_std::os::arceos::modules::ax_hal::mem::PhysAddr;
 
 const ECAM_BASE: usize = 0x0b00_0000;
 const ECAM_SIZE: usize = 0x10_0000;
+// The AArch64 vPCI provider reserves 00:00.0 for the root complex, so the
+// ivshmem endpoint enumerates at bus 0, device 1, function 0 (0000:00:01.0).
+// ECAM reserves 4 KiB per function and 8 functions per device, so device 1
+// starts at offset 8 * 0x1000 = 0x8000.
+const IVSHMEM_ECAM_OFFSET: usize = 0x8000;
 const PCI_ID_OFFSET: usize = 0x00;
 const PCI_COMMAND_OFFSET: usize = 0x04;
 const PCI_BAR2_OFFSET: usize = 0x18;
@@ -34,22 +39,22 @@ fn main() {}
 #[cfg(feature = "arceos")]
 fn run() -> Result<(), String> {
     let ecam = map_device_range(ECAM_BASE, ECAM_SIZE, "ECAM")?;
-    let identity = read_u32(ecam, PCI_ID_OFFSET);
+    let identity = read_u32(ecam, IVSHMEM_ECAM_OFFSET + PCI_ID_OFFSET);
     if identity != IVSHMEM_PCI_ID {
         return Err(format!(
             "unexpected PCI identity {identity:#010x}, expected {IVSHMEM_PCI_ID:#010x}"
         ));
     }
 
-    let bar2 = usize::try_from(read_u32(ecam, PCI_BAR2_OFFSET) & 0xffff_fff0)
+    let bar2 = usize::try_from(read_u32(ecam, IVSHMEM_ECAM_OFFSET + PCI_BAR2_OFFSET) & 0xffff_fff0)
         .map_err(|_| "BAR2 address does not fit usize".to_string())?;
     if bar2 == 0 {
         return Err("BAR2 was not assigned".into());
     }
-    let command = read_u16(ecam, PCI_COMMAND_OFFSET);
+    let command = read_u16(ecam, IVSHMEM_ECAM_OFFSET + PCI_COMMAND_OFFSET);
     write_u16(
         ecam,
-        PCI_COMMAND_OFFSET,
+        IVSHMEM_ECAM_OFFSET + PCI_COMMAND_OFFSET,
         command | PCI_COMMAND_MEMORY_ENABLE,
     );
 

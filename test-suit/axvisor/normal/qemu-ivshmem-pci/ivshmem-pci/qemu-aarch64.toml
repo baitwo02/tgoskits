@@ -7,13 +7,15 @@ args = [
   "-smp",
   "4",
   "-m",
-  "4g",
+  "8g",
 ]
 fail_regex = [
   "(?i)\\bpanic(?:ked)?\\b",
-  "(?m)^ARCEOS_IVSHMEM_PCI_FAIL(?:\\s|$)",
+  "(?m)^AXVISOR_AARCH64_VPCI_ENUMERATION_FAILED(?:\\s|$)",
 ]
-success_regex = ["(?m)^ARCEOS_IVSHMEM_PCI_PASS\\s*$"]
-timeout = 120
+success_regex = [
+  "(?m)^AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED\\s*$",
+]
+timeout = 240
 to_bin = true
 uefi = false

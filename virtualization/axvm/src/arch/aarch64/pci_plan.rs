@@ -22,11 +22,14 @@ pub(super) fn provider(controller: &DeviceNodeId) -> DeviceManagerResult<PciHost
         host_id: host_id.clone(),
     });
     let node = DeviceNodeSpec::virtual_device(host_id, model).with_dependency(controller.clone());
-    Ok(PciHostProvider::new(
-        host_key(),
-        node,
-        ResourceSlot::new(MEMORY_SLOT)?,
-    ))
+    Ok(
+        PciHostProvider::new(host_key(), node, ResourceSlot::new(MEMORY_SLOT)?)
+            // Endpoints must not take 00:00.0: the root-complex slot stays unoccupied
+            // so the first endpoint lands at 00:01.0, matching the conventional QEMU
+            // virt layout and leaving room for a future host-bridge function
+            // (`.notes/ivshmem/01-pci-enumeration.md` §3.5).
+            .with_reserved_bdf(PciBdf::new(PciSegment::new(0), 0, 0, 0)?),
+    )
 }
 
 struct Aarch64PciHostModel {
@@ -289,6 +292,18 @@ mod tests {
         assert_eq!(firmware.ecam_base(), 0x0b00_0000);
         assert_eq!(firmware.memory_base(), 0x0c00_0000);
         assert_eq!(firmware.memory_size(), PCI_MEMORY_APERTURE_SIZE);
+
+        // The AArch64 provider reserves 00:00.0, so the first auto-placed
+        // endpoint must land on the conventional 00:01.0 slot.
+        let endpoint = graph
+            .pci_topology(&host_key())
+            .unwrap()
+            .function(&DeviceNodeId::new("endpoint0").unwrap())
+            .unwrap();
+        assert_eq!(
+            endpoint.bdf(),
+            PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap()
+        );
 
         let mut runtime = DeviceRuntimeBuilder::new(RuntimeAccessPorts::new());
         for node in graph.nodes() {

@@ -20,7 +20,28 @@ use crate::{axvisor::rootfs, context::ResolvedAxvisorRequest, rootfs::inject::re
 
 const OUTPUT_ENV: &str = "AXVISOR_TEST_BUSYBOX_INITRAMFS";
 const OVMF_OUTPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_OUTPUT";
+/// Names a non-default managed rootfs image for cases whose generated
+/// initramfs needs extra guest tools (for example pciutils for the ivshmem
+/// PCI enumeration case). Other cases keep the architecture default image.
+const ROOTFS_IMAGE_ENV: &str = "AXVISOR_TEST_ROOTFS_IMAGE";
+
+/// Resolves the managed rootfs image a build group selects through
+/// `AXVISOR_TEST_ROOTFS_IMAGE`, if any.
+pub(super) fn configured_rootfs_image_path(
+    cargo: &Cargo,
+    workspace_root: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    cargo
+        .env
+        .get(ROOTFS_IMAGE_ENV)
+        .map(|image_name| crate::image::storage::rootfs_image_path(workspace_root, image_name))
+        .transpose()
+}
 const BUSYBOX_PATH: &str = "/bin/busybox";
+const LSPCI_PATH: &str = "/usr/bin/lspci";
+const LIBPCI_PATH: &str = "/usr/lib/libpci.so.3.14.0";
+const LIBPCI_SONAME_PATH: &str = "/usr/lib/libpci.so.3";
+const PCI_IDS_PATH: &str = "/usr/share/hwdata/pci.ids";
 // These bounds are the fixed Q35 guest aperture used by the x86 AxVM provider;
 // the end bound is exclusive.
 // Keep them synchronized with `virtualization/axvm/src/arch/x86_64/pci_config.rs`.
@@ -73,20 +94,120 @@ __AXVISOR_PCI_CAPABILITY_VALIDATOR__
 run_pci_enumeration_check() {
   success_marker=$1
   failed=0
-  # The managed rootfs images ship no pciutils, so this check consumes the
-  # kernel-published sysfs PCI state directly (the same source `lspci` reads).
+  case "$guest_arch" in
+    aarch64)
+      # The AArch64 aperture is auto-placed per VM, so the test configuration
+      # pins the expected window on the kernel command line instead of baking
+      # build-time constants into this script.
+      aperture_arg=
+      for arg in $cmdline; do
+        case "$arg" in
+          axvisor.pci_aperture=*) aperture_arg=${arg#axvisor.pci_aperture=} ;;
+        esac
+      done
+      if [ -z "$aperture_arg" ]; then
+        echo "kernel cmdline is missing axvisor.pci_aperture=START-END"
+        echo "${success_marker%PASSED}FAILED"
+        return
+      fi
+      pci_aperture_start=${aperture_arg%-*}
+      pci_aperture_end=${aperture_arg#*-}
+      ;;
+    x86_64)
+      pci_aperture_start=__AXVISOR_PCI_MEMORY_APERTURE_START__
+      pci_aperture_end=__AXVISOR_PCI_MEMORY_APERTURE_END__
+      ;;
+    *)
+      echo "unsupported guest architecture for the PCI enumeration check: $guest_arch"
+      echo "${success_marker%PASSED}FAILED"
+      return
+      ;;
+  esac
+  # Print the topology directly from Linux's standard sysfs ABI while finding
+  # the ivshmem endpoint. This is guest evidence, not a hypervisor prepare-time
+  # view or a private guest interface.
   bdf=""
   count=0
+  topology_count=0
+  topology_failed=0
+  echo "PCI_TOPOLOGY_BEGIN source=/sys/bus/pci/devices"
   for dev in /sys/bus/pci/devices/*; do
     [ -d "$dev" ] || continue
-    vendor=$(/bin/busybox cat "$dev/vendor")
-    device=$(/bin/busybox cat "$dev/device")
-    class=$(/bin/busybox cat "$dev/class")
+    function_bdf=${dev##*/}
+    vendor=$(/bin/busybox cat "$dev/vendor" 2>/dev/null) || {
+      echo "PCI topology: cannot read vendor for $function_bdf"
+      failed=1
+      topology_failed=1
+      continue
+    }
+    device=$(/bin/busybox cat "$dev/device" 2>/dev/null) || {
+      echo "PCI topology: cannot read device for $function_bdf"
+      failed=1
+      topology_failed=1
+      continue
+    }
+    class=$(/bin/busybox cat "$dev/class" 2>/dev/null) || {
+      echo "PCI topology: cannot read class for $function_bdf"
+      failed=1
+      topology_failed=1
+      continue
+    }
+    revision=$(/bin/busybox od -An -tx1 -j 8 -N 1 "$dev/config" 2>/dev/null | /bin/busybox tr -d ' \n')
+    if [ -z "$revision" ]; then
+      echo "PCI topology: cannot read revision for $function_bdf"
+      failed=1
+      topology_failed=1
+      continue
+    fi
+    printf 'PCI_FUNCTION bdf=%s vendor=%s device=%s class=%s revision=0x%s\n' \
+      "$function_bdf" "$vendor" "$device" "$class" "$revision"
+
+    bar=0
+    while [ "$bar" -lt 6 ] && read -r start end flags; do
+      start=${start#0x}
+      end=${end#0x}
+      flags=${flags#0x}
+      case "$start$end$flags" in
+        *[!0-9a-fA-F]*)
+          echo "PCI topology: malformed BAR$bar resource for $function_bdf"
+          failed=1
+          topology_failed=1
+          break
+          ;;
+      esac
+      start_value=$((0x$start))
+      end_value=$((0x$end))
+      if [ "$start_value" -ne 0 ] || [ "$end_value" -ne 0 ]; then
+        if [ "$end_value" -lt "$start_value" ]; then
+          echo "PCI topology: inverted BAR$bar resource for $function_bdf"
+          failed=1
+          topology_failed=1
+          break
+        fi
+        size=$((end_value - start_value + 1))
+        printf 'PCI_BAR bdf=%s index=%s start=0x%x end=0x%x size=0x%x flags=0x%x\n' \
+          "$function_bdf" "$bar" "$start_value" "$end_value" "$size" "$((0x$flags))"
+      fi
+      bar=$((bar + 1))
+    done < "$dev/resource"
+    if [ "$bar" -ne 6 ]; then
+      echo "PCI topology: expected six BAR resources for $function_bdf, found $bar"
+      failed=1
+      topology_failed=1
+    fi
+    topology_count=$((topology_count + 1))
+
     if [ "$vendor" = "0x1af4" ] && [ "$device" = "0x1110" ] && [ "$class" = "0x050000" ]; then
-      bdf=${dev##*/}
+      bdf=$function_bdf
       count=$((count + 1))
     fi
   done
+  if [ "$topology_failed" -eq 0 ]; then
+    topology_status=ok
+  else
+    topology_status=failed
+  fi
+  echo "PCI_TOPOLOGY_END functions=$topology_count status=$topology_status"
   echo "guest kernel: $(/bin/busybox uname -r)"
   if [ "$count" -ne 1 ]; then
     echo "expected exactly one 0500:1af4:1110 function, found $count"
@@ -97,30 +218,65 @@ run_pci_enumeration_check() {
       echo "vPCI endpoint unexpectedly bound to a driver"
       failed=1
     fi
+    if [ "$bdf" != "0000:00:01.0" ]; then
+      echo "vPCI endpoint enumerated at $bdf instead of the reserved 0000:00:01.0 slot"
+      failed=1
+    fi
     # The kernel publishes `resource` entries as bare hex columns; tolerate an
     # optional 0x prefix and turn malformed input into an explicit failure so
     # the case reports FAILED instead of dying inside arithmetic.
     resource_line=$(/bin/busybox sed -n '3p' "$endpoint/resource")
-    if ! validate_pci_bar_resource "$resource_line" __AXVISOR_PCI_MEMORY_APERTURE_START__ __AXVISOR_PCI_MEMORY_APERTURE_END__; then
+    if ! validate_pci_bar_resource "$resource_line" "$pci_aperture_start" "$pci_aperture_end"; then
       failed=1
       echo "BAR2 is not a valid 64 KiB memory resource"
     fi
     if ! validate_pci_capabilities "$endpoint/config"; then
       failed=1
     fi
+    if [ "$guest_arch" = "aarch64" ]; then
+      # The AArch64 ivshmem surface freezes the revision byte; the x86
+      # vpci-test fixture keeps its own identity and skips this check.
+      revision=$(/bin/busybox od -An -tx1 -j 8 -N 1 "$endpoint/config" 2>/dev/null | /bin/busybox tr -d ' \n')
+      if [ "$revision" != "01" ]; then
+        echo "ivshmem revision reads '$revision', expected 01"
+        failed=1
+      fi
     fi
+    fi
+  if [ -x /usr/bin/lspci ]; then
+    echo "PCI_LSPCI_BEGIN"
+    lspci_output=$(/usr/bin/lspci -nn)
+    printf '%s\n' "$lspci_output"
+    echo "PCI_LSPCI_END"
+    case "$lspci_output" in
+      *1af4:1110*) ;;
+      *)
+        echo "lspci did not report the ivshmem-pci identity 1af4:1110"
+        failed=1
+        ;;
+    esac
+  else
+    echo "lspci is unavailable in the BusyBox initramfs"
+    failed=1
+  fi
   if [ "$failed" -ne 0 ]; then
-    echo AXVISOR_X86_VPCI_ENUMERATION_FAILED
+    echo "${success_marker%PASSED}FAILED"
   else
     echo "$success_marker"
   fi
 }
 
 cmdline=$(/bin/busybox cat /proc/cmdline)
+guest_arch=$(/bin/busybox uname -m)
 case "$cmdline" in
   *axvisor.acpi_case=direct*) run_x86_acpi_check AXVISOR_X86_DIRECT_ACPI_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=ovmf*) run_x86_acpi_check AXVISOR_X86_OVMF_ACPI_PASSED; exec /bin/busybox sh -i ;;
-  *axvisor.pci_case=enumeration*) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED; exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=enumeration*)
+    case "$guest_arch" in
+      aarch64) run_pci_enumeration_check AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED ;;
+      *) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED ;;
+    esac
+    exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=off*)
     if [ -d /sys/firmware/acpi/tables ]; then
       echo AXVISOR_X86_ACPI_FAILED
@@ -340,7 +496,14 @@ pub(super) async fn prepare_configured_busybox_initramfs(
 ) -> anyhow::Result<()> {
     if let Some(configured_output) = cargo.env.get(OUTPUT_ENV) {
         let output_path = resolve_output_path(workspace_root, configured_output, OUTPUT_ENV)?;
-        let rootfs_path = rootfs::qemu_rootfs_path(request, workspace_root, None)?;
+        let rootfs_path = match configured_rootfs_image_path(cargo, workspace_root)? {
+            Some(path) => {
+                crate::image::storage::ensure_managed_rootfs(workspace_root, &request.arch, &path)
+                    .await?;
+                path
+            }
+            None => rootfs::qemu_rootfs_path(request, workspace_root, None)?,
+        };
         prepare_busybox_initramfs(&rootfs_path, &output_path, &request.arch)?;
         println!(
             "prepared Axvisor QEMU test initramfs: {}",
@@ -383,7 +546,11 @@ fn prepare_busybox_initramfs(
     let busybox = required_rootfs_file(rootfs_path, BUSYBOX_PATH)?;
     let loader_path = musl_loader_path(arch)?;
     let loader = required_rootfs_file(rootfs_path, loader_path)?;
-    let archive = build_busybox_initramfs(&busybox, loader_path, &loader)?;
+    let lspci = required_rootfs_file(rootfs_path, LSPCI_PATH)?;
+    let libpci = required_rootfs_file(rootfs_path, LIBPCI_PATH)?;
+    let pci_ids = required_rootfs_file(rootfs_path, PCI_IDS_PATH)?;
+    let archive =
+        build_busybox_initramfs(&busybox, loader_path, &loader, &lspci, &libpci, &pci_ids)?;
 
     let output_parent = output_path.parent().with_context(|| {
         format!(
@@ -438,6 +605,9 @@ fn build_busybox_initramfs(
     busybox: &[u8],
     loader_path: &str,
     loader: &[u8],
+    lspci: &[u8],
+    libpci: &[u8],
+    pci_ids: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let init_script = init_script();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -453,12 +623,22 @@ fn build_busybox_initramfs(
         ]);
         let loader_archive_path = archive_path(loader_path)?;
         add_parent_directories(loader_archive_path, &mut directories);
+        let lspci_archive_path = archive_path(LSPCI_PATH)?;
+        add_parent_directories(lspci_archive_path, &mut directories);
+        let libpci_archive_path = archive_path(LIBPCI_PATH)?;
+        add_parent_directories(libpci_archive_path, &mut directories);
+        let pci_ids_archive_path = archive_path(PCI_IDS_PATH)?;
+        add_parent_directories(pci_ids_archive_path, &mut directories);
         for directory in directories {
             archive.append_directory(&directory)?;
         }
 
         archive.append_regular("bin/busybox", busybox)?;
         archive.append_regular(loader_archive_path, loader)?;
+        archive.append_regular(lspci_archive_path, lspci)?;
+        archive.append_regular(libpci_archive_path, libpci)?;
+        archive.append_symlink(archive_path(LIBPCI_SONAME_PATH)?, "libpci.so.3.14.0")?;
+        archive.append_regular(pci_ids_archive_path, pci_ids)?;
         archive.append_regular("init", &init_script)?;
         for applet in [
             "cat", "date", "dmesg", "grep", "mount", "od", "sed", "sh", "sleep",
@@ -591,8 +771,15 @@ mod tests {
 
     #[test]
     fn generated_archive_contains_busybox_loader_and_shell_applets() {
-        let compressed =
-            build_busybox_initramfs(b"busybox", "/lib/ld-musl-test.so.1", b"loader").unwrap();
+        let compressed = build_busybox_initramfs(
+            b"busybox",
+            "/lib/ld-musl-test.so.1",
+            b"loader",
+            b"lspci",
+            b"libpci",
+            b"pci-ids",
+        )
+        .unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
@@ -601,8 +788,15 @@ mod tests {
 
         assert_eq!(entries.get("bin/busybox").unwrap(), b"busybox");
         assert_eq!(entries.get("lib/ld-musl-test.so.1").unwrap(), b"loader");
+        assert_eq!(entries.get("usr/bin/lspci").unwrap(), b"lspci");
+        assert_eq!(entries.get("usr/lib/libpci.so.3.14.0").unwrap(), b"libpci");
+        assert_eq!(entries.get("usr/share/hwdata/pci.ids").unwrap(), b"pci-ids");
         let init = entries.get("init").unwrap();
         assert!(init.starts_with(b"#!/bin/busybox sh"));
+        assert!(
+            init.windows(b"PCI_TOPOLOGY_BEGIN".len())
+                .any(|window| window == b"PCI_TOPOLOGY_BEGIN")
+        );
         assert!(
             init.windows(b"validate_pci_bar_resource".len())
                 .any(|window| window == b"validate_pci_bar_resource")
@@ -646,14 +840,44 @@ mod tests {
                 .any(|window| window == b"AXVISOR_X86_VPCI_ENUMERATION_PASSED")
         );
         assert!(
-            init.windows(b"AXVISOR_X86_VPCI_ENUMERATION_FAILED".len())
-                .any(|window| window == b"AXVISOR_X86_VPCI_ENUMERATION_FAILED")
+            init.windows(b"AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED".len())
+                .any(|window| window == b"AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED")
+        );
+        // Failure markers are derived from the success marker so every
+        // architecture gets a correctly tagged FAILED line.
+        assert!(
+            init.windows(b"${success_marker%PASSED}FAILED".len())
+                .any(|window| window == b"${success_marker%PASSED}FAILED")
+        );
+        assert!(
+            init.windows(b"PCI_LSPCI_BEGIN".len())
+                .any(|window| window == b"PCI_LSPCI_BEGIN")
+        );
+        assert!(
+            init.windows(b"lspci did not report the ivshmem-pci identity".len())
+                .any(|window| window == b"lspci did not report the ivshmem-pci identity")
         );
         for applet in [
             "cat", "date", "dmesg", "grep", "mount", "od", "sed", "sh", "sleep",
         ] {
             assert_eq!(entries.get(&format!("bin/{applet}")).unwrap(), b"busybox");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_script_passes_shell_syntax_check() {
+        let tempdir = tempdir().unwrap();
+        let path = tempdir.path().join("init");
+        fs::write(&path, init_script()).unwrap();
+
+        let output = Command::new("sh").arg("-n").arg(&path).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "init script has shell syntax errors: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]

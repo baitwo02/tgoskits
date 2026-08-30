@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add an AArch64 generic ECAM host provider and conditionally emit its FDT node from graph-resolved resources when the topology contains an endpoint.
 - Add an initial `ivshmem-pci` endpoint with a private 64 KiB BAR2 aperture for vPCI integration validation.
 
+### Changed
+
+- Complete the `ivshmem-pci` config surface with BAR0 (register block) and BAR1 (MSI-X region) inventory placeholders that read zero, plus the ivshmem revision byte.
+- Reserve BDF 00:00.0 on the AArch64 PCI host provider so auto-placed endpoints enumerate from 00:01.0, matching the conventional root-complex slot layout.
+
 ### Fixed
 
 - Ignore unavailable FDT reserved-memory children when deriving guest reservations.

@@ -19,6 +19,19 @@ const MODEL: &str = "ivshmem-pci";
 const HOST_KEY: &str = "aarch64-ecam";
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
+/// Device revision of the ivshmem BAR/register model this surface is building
+/// toward (`.notes/ivshmem/01-pci-enumeration.md` §3.4). The value is frozen
+/// here with a unit-test assertion; re-verify against the pinned QEMU and
+/// Jailhouse revisions before claiming interop with real ivshmem drivers.
+const IVSHMEM_REVISION: u8 = 1;
+/// BAR0 hosts the control register block and BAR1 the MSI-X region. Both are
+/// declared so guests enumerate the full BAR inventory and reserve their
+/// address ranges; the register semantics arrive with the register-model (F2)
+/// and MSI-X (F7) features and read as zero until then.
+const REGISTER_BAR_INDEX: u8 = 0;
+const REGISTER_BAR_SIZE: u64 = 0x100;
+const MSIX_BAR_INDEX: u8 = 1;
+const MSIX_BAR_SIZE: u64 = 0x100;
 const SHARED_MEMORY_BAR_INDEX: u8 = 2;
 const SHARED_MEMORY_SIZE: usize = 0x1_0000;
 
@@ -66,7 +79,10 @@ struct IvshmemPciModel;
 
 impl DeviceModel for IvshmemPciModel {
     fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
-        let bar = PciMemoryBar::new(
+        let register_bar =
+            PciMemoryBar::new(PciBarIndex::new(REGISTER_BAR_INDEX)?, REGISTER_BAR_SIZE)?;
+        let msix_bar = PciMemoryBar::new(PciBarIndex::new(MSIX_BAR_INDEX)?, MSIX_BAR_SIZE)?;
+        let shared_memory_bar = PciMemoryBar::new(
             PciBarIndex::new(SHARED_MEMORY_BAR_INDEX)?,
             SHARED_MEMORY_SIZE as u64,
         )?;
@@ -76,9 +92,12 @@ impl DeviceModel for IvshmemPciModel {
                 IVSHMEM_VENDOR_ID,
                 IVSHMEM_DEVICE_ID,
                 PciClass::new(0x05, 0x00, 0x00),
-            ),
+            )
+            .with_revision(IVSHMEM_REVISION),
         )
-        .with_bar(bar)?;
+        .with_bar(register_bar)?
+        .with_bar(msix_bar)?
+        .with_bar(shared_memory_bar)?;
         DeviceRequirements::new().with_pci_function(function)
     }
 
@@ -129,6 +148,28 @@ impl IvshmemPciFunction {
             })?;
         Ok(start..end)
     }
+
+    fn read_shared_memory(&self, access: PciBarAccess) -> DeviceResult<u64> {
+        let range = Self::access_range(access)?;
+        let bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
+            operation: "read ivshmem BAR2",
+            detail: "BAR backing lock is poisoned".into(),
+        })?;
+        let mut value = [0u8; 8];
+        value[..range.len()].copy_from_slice(&bytes[range]);
+        Ok(u64::from_le_bytes(value))
+    }
+
+    fn write_shared_memory(&self, access: PciBarAccess, value: u64) -> DeviceResult {
+        let range = Self::access_range(access)?;
+        let width = range.len();
+        let mut bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
+            operation: "write ivshmem BAR2",
+            detail: "BAR backing lock is poisoned".into(),
+        })?;
+        bytes[range].copy_from_slice(&value.to_le_bytes()[..width]);
+        Ok(())
+    }
 }
 
 impl Device for IvshmemPciFunction {
@@ -166,14 +207,17 @@ impl PciFunction for IvshmemPciFunction {
         access: PciBarAccess,
         _context: &mut dyn DeviceContext,
     ) -> DeviceResult<u64> {
-        let range = Self::access_range(access)?;
-        let bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
-            operation: "read ivshmem BAR2",
-            detail: "BAR backing lock is poisoned".into(),
-        })?;
-        let mut value = [0u8; 8];
-        value[..range.len()].copy_from_slice(&bytes[range]);
-        Ok(u64::from_le_bytes(value))
+        match access.bar().value() {
+            // BAR0/BAR1 are declared inventory placeholders until the
+            // register-model (F2) and MSI-X (F7) features define their
+            // semantics; reads stay zero so guest probes observe a defined
+            // value instead of a routing error.
+            REGISTER_BAR_INDEX | MSIX_BAR_INDEX => Ok(0),
+            SHARED_MEMORY_BAR_INDEX => self.read_shared_memory(access),
+            _ => Err(DeviceError::OutOfRange {
+                addr: access.offset(),
+            }),
+        }
     }
 
     fn write_bar(
@@ -182,14 +226,13 @@ impl PciFunction for IvshmemPciFunction {
         value: u64,
         _context: &mut dyn DeviceContext,
     ) -> DeviceResult {
-        let range = Self::access_range(access)?;
-        let width = range.len();
-        let mut bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
-            operation: "write ivshmem BAR2",
-            detail: "BAR backing lock is poisoned".into(),
-        })?;
-        bytes[range].copy_from_slice(&value.to_le_bytes()[..width]);
-        Ok(())
+        match access.bar().value() {
+            REGISTER_BAR_INDEX | MSIX_BAR_INDEX => Ok(()),
+            SHARED_MEMORY_BAR_INDEX => self.write_shared_memory(access, value),
+            _ => Err(DeviceError::OutOfRange {
+                addr: access.offset(),
+            }),
+        }
     }
 }
 
@@ -213,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn requirements_declare_aarch64_bar2_function() {
+    fn requirements_declare_the_full_bar_inventory() {
         let requirements = IvshmemPciModel.requirements().unwrap();
         let function = requirements.pci_function().unwrap();
         let expected = PciFunctionRequirement::new(
@@ -222,8 +265,21 @@ mod tests {
                 IVSHMEM_VENDOR_ID,
                 IVSHMEM_DEVICE_ID,
                 PciClass::new(0x05, 0, 0),
-            ),
+            )
+            .with_revision(IVSHMEM_REVISION),
         )
+        .with_bar(
+            PciMemoryBar::new(
+                PciBarIndex::new(REGISTER_BAR_INDEX).unwrap(),
+                REGISTER_BAR_SIZE,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_bar(
+            PciMemoryBar::new(PciBarIndex::new(MSIX_BAR_INDEX).unwrap(), MSIX_BAR_SIZE).unwrap(),
+        )
+        .unwrap()
         .with_bar(
             PciMemoryBar::new(
                 PciBarIndex::new(SHARED_MEMORY_BAR_INDEX).unwrap(),
@@ -326,6 +382,12 @@ mod tests {
         let bar = function
             .bar(PciBarIndex::new(SHARED_MEMORY_BAR_INDEX).unwrap())
             .unwrap();
+        let register_bar = function
+            .bar(PciBarIndex::new(REGISTER_BAR_INDEX).unwrap())
+            .unwrap();
+        let msix_bar = function
+            .bar(PciBarIndex::new(MSIX_BAR_INDEX).unwrap())
+            .unwrap();
         root.write_config(
             function.bdf(),
             ConfigOffset::new(4).unwrap(),
@@ -347,8 +409,29 @@ mod tests {
                 .unwrap(),
             0x4956_5348_4d45_4d31
         );
+
+        // BAR0/BAR1 are inventory placeholders: reads stay zero and writes
+        // are ignored until the register-model and MSI-X features land.
         assert_eq!(
-            binding.read_bar(bar.address() + SHARED_MEMORY_SIZE as u64, AccessWidth::Byte),
+            binding
+                .read_bar(register_bar.address(), AccessWidth::Word)
+                .unwrap(),
+            0
+        );
+        binding
+            .write_bar(register_bar.address(), AccessWidth::Word, 0xffff)
+            .unwrap();
+        assert_eq!(
+            binding
+                .read_bar(register_bar.address(), AccessWidth::Word)
+                .unwrap(),
+            0
+        );
+
+        // The declared BARs place contiguously, so the first unrouted byte
+        // is one past the end of the highest declared BAR (BAR1).
+        assert_eq!(
+            binding.read_bar(msix_bar.address() + MSIX_BAR_SIZE, AccessWidth::Byte),
             Err(DeviceError::NotFound)
         );
     }

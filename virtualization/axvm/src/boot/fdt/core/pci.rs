@@ -272,6 +272,23 @@ mod tests {
             }]
         );
         let node = fdt.node(pci.id()).unwrap();
+        // The remaining properties the generic ECAM driver expects from
+        // `add_host_node` (`.notes/ivshmem/01-pci-enumeration.md` §3.6).
+        assert_eq!(
+            node.get_property("device_type").unwrap().as_str(),
+            Some("pci")
+        );
+        for (property, value) in [
+            ("#address-cells", 3u32),
+            ("#size-cells", 2),
+            ("#interrupt-cells", 1),
+        ] {
+            assert_eq!(
+                node.get_property(property).unwrap().get_u32(),
+                Some(value),
+                "unexpected {property}"
+            );
+        }
         assert_eq!(
             node.get_property("linux,pci-domain").unwrap().get_u32(),
             Some(0)

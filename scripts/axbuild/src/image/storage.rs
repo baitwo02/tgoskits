@@ -462,7 +462,10 @@ fn unpack_archive(
         .with_context(|| format!("failed to extract into {}", extract_dir.display()))
 }
 
-fn rootfs_image_path(workspace_root: &Path, image_name: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn rootfs_image_path(
+    workspace_root: &Path,
+    image_name: &str,
+) -> anyhow::Result<PathBuf> {
     ensure_rootfs_image_name(image_name)?;
     let config = ImageConfig::read_config(workspace_root)?;
     Ok(config.extract_dir.join(image_name))

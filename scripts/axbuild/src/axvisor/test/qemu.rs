@@ -17,7 +17,7 @@ use super::{
         discover_test_group_names, qemu_list_error_is_ignorable, test_suite_dir, test_suite_root,
     },
     host_probe,
-    initramfs::prepare_configured_busybox_initramfs,
+    initramfs::{configured_rootfs_image_path, prepare_configured_busybox_initramfs},
     parse_target,
     types::{AxvisorHttpProbeConfig, PreparedAxvisorQemuCase},
 };
@@ -141,17 +141,27 @@ impl Axvisor {
         // embedded VM configuration, so a later build would otherwise replace
         // the executable belonging to an earlier group.
         for (index, build_group) in build_groups.iter_mut().enumerate() {
-            let group_rootfs = rootfs::managed_rootfs_path_from_qemu_cases(
-                build_group.group.cases.iter().map(|case| &case.qemu),
+            build_group.cargo = build::load_cargo_config(&build_group.request)?;
+            // A case may name a non-default managed rootfs (for example the
+            // pciutils image used by the ivshmem-pci case). Prefer it over both
+            // drive-referenced images and the architecture default so the run
+            // does not touch the default registry for an image it never boots.
+            let group_rootfs = match configured_rootfs_image_path(
+                &build_group.cargo,
                 self.app.workspace_root(),
-            )?;
+            )? {
+                Some(path) => Some(path),
+                None => rootfs::managed_rootfs_path_from_qemu_cases(
+                    build_group.group.cases.iter().map(|case| &case.qemu),
+                    self.app.workspace_root(),
+                )?,
+            };
             rootfs::ensure_qemu_rootfs_ready(
                 &build_group.request,
                 self.app.workspace_root(),
                 group_rootfs.as_deref(),
             )
             .await?;
-            build_group.cargo = build::load_cargo_config(&build_group.request)?;
             prepare_configured_busybox_initramfs(
                 &build_group.request,
                 &build_group.cargo,
