@@ -336,7 +336,9 @@ mod tests {
         ));
         let mut vm_config = build_axvm_config(
             &crate_config,
-            &alloc::sync::Arc::new(IvshmemLinkRegistry::new()),
+            &alloc::sync::Arc::new(IvshmemLinkRegistry::new(
+                axvm::host::shared_backing::platform_shared_backing_allocator(),
+            )),
         )
         .unwrap();
 

@@ -421,9 +421,49 @@ impl PciFunction for IvshmemPciFunction {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Layout;
+
+    use axdevice::{BackingAllocation, SharedBackingAllocator};
     use axvmconfig::VirtualDeviceRequest;
 
     use super::*;
+
+    /// Page-aligned heap allocator for adapter tests: the returned HPA is
+    /// the virtual address, which pure derivation paths never dereference.
+    #[derive(Default)]
+    struct TestBackingAllocator;
+
+    impl SharedBackingAllocator for TestBackingAllocator {
+        fn allocate(&self, size: u64) -> Result<BackingAllocation, IvshmemError> {
+            let layout = Layout::from_size_align(size as usize, 0x1000).map_err(|_| {
+                IvshmemError::AllocationFailed {
+                    operation: "test backing layout",
+                }
+            })?;
+            let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+            if pointer.is_null() {
+                return Err(IvshmemError::AllocationFailed {
+                    operation: "test backing alloc",
+                });
+            }
+            Ok(BackingAllocation::from_parts(
+                pointer as usize as u64,
+                size,
+                pointer,
+            ))
+        }
+
+        fn release(&self, allocation: BackingAllocation) {
+            let layout = Layout::from_size_align(allocation.size() as usize, 0x1000).unwrap();
+            // SAFETY: the pointer came from alloc_zeroed with the same
+            // layout and every allocation is released exactly once.
+            unsafe { std::alloc::dealloc(allocation.virtual_base(), layout) };
+        }
+    }
+
+    fn test_registry() -> Arc<IvshmemLinkRegistry> {
+        Arc::new(IvshmemLinkRegistry::new(Arc::new(TestBackingAllocator)))
+    }
 
     const APERTURE_BASE: u64 = 0x0c00_0000;
     const APERTURE_SIZE: u64 = 0x0400_0000;
@@ -468,7 +508,7 @@ mod tests {
 
     #[test]
     fn requirements_declare_the_full_bar_inventory() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let requirements = model_for(&registry, 7, 1).requirements().unwrap();
         let function = requirements.pci_function().unwrap();
         let expected = PciFunctionRequirement::new(
@@ -505,7 +545,7 @@ mod tests {
 
     #[test]
     fn options_require_link_and_peer_identity() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let catalog = registered_catalog();
         let context =
             DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
@@ -554,7 +594,7 @@ mod tests {
 
     #[test]
     fn duplicate_peer_reservations_fail_the_second_vm() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let catalog = registered_catalog();
         let context =
             DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
@@ -724,7 +764,7 @@ mod tests {
 
     #[test]
     fn graph_routes_shared_backing_across_two_roots() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -852,7 +892,7 @@ mod tests {
 
     #[test]
     fn endpoint_reset_clears_registers_but_not_shared_backing() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -898,7 +938,7 @@ mod tests {
 
     #[test]
     fn doorbell_sets_only_the_target_event_status() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -928,7 +968,7 @@ mod tests {
 
     #[test]
     fn doorbell_ignores_inactive_targets_and_unsupported_vectors() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -955,7 +995,7 @@ mod tests {
 
     #[test]
     fn doorbell_leaves_other_registers_and_shared_bytes_untouched() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -1001,7 +1041,7 @@ mod tests {
 
     #[test]
     fn state_writes_propagate_into_the_shared_state_table() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -1062,7 +1102,7 @@ mod tests {
 
     #[test]
     fn output_section_permissions_follow_the_owner_matrix() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -1130,7 +1170,7 @@ mod tests {
 
     #[test]
     fn state_table_writes_from_bar2_are_denied() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -1172,7 +1212,7 @@ mod tests {
 
     #[test]
     fn endpoint_reset_clears_only_the_owning_state_entry() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();
@@ -1214,7 +1254,7 @@ mod tests {
 
     #[test]
     fn doorbell_reads_stay_zero_and_reset_clears_pending_events() {
-        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let registry = test_registry();
         let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
         let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
         peer0.enable_memory();

@@ -33,7 +33,11 @@ impl AxvmManager {
     pub fn ivshmem_registry() -> Arc<axvm::IvshmemLinkRegistry> {
         static IVSHMEM_REGISTRY: OnceLock<Arc<axvm::IvshmemLinkRegistry>> = OnceLock::new();
         IVSHMEM_REGISTRY
-            .get_or_init(|| Arc::new(axvm::IvshmemLinkRegistry::new()))
+            .get_or_init(|| {
+                Arc::new(axvm::IvshmemLinkRegistry::new(
+                    axvm::host::shared_backing::platform_shared_backing_allocator(),
+                ))
+            })
             .clone()
     }
 

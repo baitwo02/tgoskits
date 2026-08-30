@@ -22,6 +22,7 @@ use ax_sync::SpinLock;
 
 use super::{
     SharedBarBacking,
+    backing::SharedBackingAllocator,
     doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink},
     error::IvshmemError,
     layout::IvshmemMemoryLayout,
@@ -141,8 +142,12 @@ pub struct IvshmemLink {
 }
 
 impl IvshmemLink {
-    fn new(id: LinkId, max_peers: u16) -> Result<Self, IvshmemError> {
-        let backing = SharedBarBacking::try_new(super::SHARED_MEMORY_SIZE)?;
+    fn new(
+        id: LinkId,
+        max_peers: u16,
+        allocator: Arc<dyn SharedBackingAllocator>,
+    ) -> Result<Self, IvshmemError> {
+        let backing = SharedBarBacking::try_new(super::SHARED_MEMORY_SIZE, allocator)?;
         // The profile freezes bar2_size and peer count, so this derivation
         // cannot fail today; the fallible signature constrains the later
         // configuration-driven layout feature (F8).
@@ -493,15 +498,22 @@ impl fmt::Debug for PeerAttachment {
 /// The AxVisor assembly creates exactly one registry and injects it into all
 /// VM configuration builds. Locking stays on the configuration path with the
 /// `registry -> link` order; runtime BAR access never touches the registry.
-#[derive(Default)]
 pub struct IvshmemLinkRegistry {
     links: SpinLock<BTreeMap<LinkId, Weak<IvshmemLink>>>,
+    allocator: Arc<dyn SharedBackingAllocator>,
 }
 
 impl IvshmemLinkRegistry {
-    /// Creates an empty registry.
-    pub fn new() -> Self {
-        Self::default()
+    /// Creates an empty registry over the given backing allocator.
+    ///
+    /// Every link created through this registry reserves its shared memory
+    /// through `allocator`; the allocator must outlive all links, which the
+    /// registry guarantees by holding one clone itself.
+    pub fn new(allocator: Arc<dyn SharedBackingAllocator>) -> Self {
+        Self {
+            links: SpinLock::new(BTreeMap::new()),
+            allocator,
+        }
     }
 
     /// Reserves one peer of the named link, creating the link on first use.
@@ -522,7 +534,11 @@ impl IvshmemLinkRegistry {
         let link = match links.get(&id).and_then(Weak::upgrade) {
             Some(link) => link,
             None => {
-                let link = Arc::new(IvshmemLink::new(id, MAX_PEERS)?);
+                let link = Arc::new(IvshmemLink::new(
+                    id,
+                    MAX_PEERS,
+                    Arc::clone(&self.allocator),
+                )?);
                 links.insert(id, Arc::downgrade(&link));
                 link
             }
@@ -547,10 +563,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::ivshmem::{IvshmemRegisters, SHARED_MEMORY_SIZE};
+    use crate::ivshmem::{IvshmemRegisters, SHARED_MEMORY_SIZE, backing::test_allocator};
 
     fn registry() -> IvshmemLinkRegistry {
-        IvshmemLinkRegistry::new()
+        IvshmemLinkRegistry::new(test_allocator())
     }
 
     /// Records every delivered event for routing assertions.

@@ -19,7 +19,7 @@ mod layout;
 mod link;
 mod registers;
 
-pub use backing::SharedBarBacking;
+pub use backing::{BackingAllocation, SharedBackingAllocator, SharedBarBacking};
 pub use doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink};
 pub use error::IvshmemError;
 pub use layout::{Bar2Section, IvshmemMemoryLayout, SectionDesc};
