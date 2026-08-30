@@ -22,7 +22,7 @@ mod registers;
 pub use backing::SharedBarBacking;
 pub use doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink};
 pub use error::IvshmemError;
-pub use layout::{Bar2Region, IvshmemMemoryLayout, SectionDesc};
+pub use layout::{Bar2Section, IvshmemMemoryLayout, SectionDesc};
 pub use link::{
     IvshmemLink, IvshmemLinkRegistry, LinkId, MAX_PEERS, PeerAttachment, PeerId, PeerReservation,
 };

@@ -23,9 +23,12 @@
 
 #include "ivshmem.h"
 
-/* Payload lives well past the register page in the shared region and away
- * from the state-table area the device owns. */
-#define SMOKE_PAYLOAD_OFFSET 0x1000
+/* Payload lives inside this peer's output section. The frozen F5 BAR2
+ * layout gives every peer one 28 KiB output page-range starting after the
+ * state-table page (peer N: 0x1000 + N * 0x7000), so the smoke writes only
+ * bytes it owns. */
+#define SMOKE_OUTPUT_SECTION_BASE 0x1000
+#define SMOKE_OUTPUT_SECTION_STRIDE 0x7000
 #define SMOKE_PAYLOAD_SIZE 0x100
 
 static const uint32_t EXPECTED_MAX_PEERS = 2;
@@ -92,10 +95,12 @@ static uint32_t payload_checksum(const uint8_t *payload, size_t size)
     return checksum;
 }
 
-static void exchange_payload(void *shared)
+static void exchange_payload(void *shared, uint32_t peer_id)
 {
+    size_t payload_offset =
+        SMOKE_OUTPUT_SECTION_BASE + (size_t)peer_id * SMOKE_OUTPUT_SECTION_STRIDE;
     uint8_t payload[SMOKE_PAYLOAD_SIZE];
-    volatile uint8_t *remote = (volatile uint8_t *)shared + SMOKE_PAYLOAD_OFFSET;
+    volatile uint8_t *remote = (volatile uint8_t *)shared + payload_offset;
     uint32_t written_checksum;
     uint32_t readback_checksum;
     size_t index;
@@ -115,7 +120,8 @@ static void exchange_payload(void *shared)
     if (written_checksum != readback_checksum) {
         fail("shared-memory", "BAR2 payload checksum mismatch");
     }
-    checkpoint("payload");
+    printf("ivshmem checkpoint payload offset=%zx\n", payload_offset);
+    fflush(stdout);
 }
 
 int main(int argc, char **argv)
@@ -177,7 +183,7 @@ int main(int argc, char **argv)
     if (ivshmem_shared_memory(dev, &shared_size) != shared) {
         fail("map-shared", "shared-memory mapping is not cached");
     }
-    exchange_payload(shared);
+    exchange_payload(shared, peer_id);
 
     /* The BAR0 State write must surface in the shared state table: this
      * peer's entry sits at BAR2 offset `peer_id * 4` inside the first page

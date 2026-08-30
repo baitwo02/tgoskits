@@ -228,6 +228,22 @@ impl IvshmemPciFunction {
     }
 }
 
+/// Builds the denial error for one rejected BAR2 write.
+///
+/// The address is valid and the width legal; the peer simply may not write
+/// the owning section. The root layer records this as a guest protocol
+/// violation instead of a VM abort.
+fn bar2_denial_error(offset: u64, peer: PeerId, section: Bar2Section) -> DeviceError {
+    DeviceError::AccessDenied {
+        operation: "write ivshmem BAR2",
+        detail: format!(
+            "peer {} may not write {} at offset {offset:#x}",
+            peer.value(),
+            section.name()
+        ),
+    }
+}
+
 fn bar_access_error(error: IvshmemError) -> DeviceError {
     match error {
         IvshmemError::SharedMemoryOutOfRange { offset, .. } => {
@@ -360,15 +376,20 @@ impl PciFunction for IvshmemPciFunction {
             }
             MSIX_BAR_INDEX => Ok(()),
             SHARED_MEMORY_BAR_INDEX => {
-                // The state table is host-maintained: BAR0 State writes are
-                // its only write path, BAR2 writes are a guest protocol
-                // violation rejected with AccessDenied.
-                if self.attachment.link().layout().region(access.offset()) == Bar2Region::StateTable
-                {
-                    return Err(DeviceError::AccessDenied {
-                        operation: "write ivshmem BAR2",
-                        detail: "the state table is read-only from BAR2".into(),
-                    });
+                // One unified permission decision for every BAR2 write: the
+                // state table denies, other peers' outputs deny, the own
+                // output and a common section allow, and the reserved tail
+                // is silently ignored without touching the backing.
+                let section = self.attachment.link().layout().classify(access.offset());
+                if section == Bar2Section::Reserved {
+                    return Ok(());
+                }
+                if !section.allows_write(self.attachment.peer_id()) {
+                    return Err(bar2_denial_error(
+                        access.offset(),
+                        self.attachment.peer_id(),
+                        section,
+                    ));
                 }
                 self.attachment
                     .link()
@@ -1034,6 +1055,74 @@ mod tests {
             peer0
                 .binding
                 .read_bar(peer0.shared_bar + 0xffc, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn output_section_permissions_follow_the_owner_matrix() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Peer 0 writes its own output section (0x1000..0x8000); peer 1
+        // reads the same bytes through its own BAR2.
+        peer0
+            .binding
+            .write_bar(peer0.shared_bar + 0x1000, AccessWidth::Dword, 0x0aa0)
+            .unwrap();
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + 0x1000, AccessWidth::Dword)
+                .unwrap(),
+            0x0aa0
+        );
+
+        // Peer 1 may not write peer 0's output: the write is denied and the
+        // owner's data stays intact.
+        let denied =
+            peer1
+                .binding
+                .write_bar(peer1.shared_bar + 0x1000, AccessWidth::Dword, 0x0bad_0bad);
+        let Err(DeviceError::AccessDenied { detail, .. }) = denied else {
+            panic!("cross-peer output write must be denied");
+        };
+        assert!(detail.contains("peer 1 may not write output section"));
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 0x1000, AccessWidth::Dword)
+                .unwrap(),
+            0x0aa0
+        );
+
+        // Peer 1's own output section starts at 0x8000 and is writable.
+        peer1
+            .binding
+            .write_bar(peer1.shared_bar + 0x8000, AccessWidth::Dword, 0x0bb1)
+            .unwrap();
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 0x8000, AccessWidth::Dword)
+                .unwrap(),
+            0x0bb1
+        );
+
+        // The reserved tail is silently ignored: the write succeeds without
+        // touching the backing, so reads still observe zeroes.
+        peer0
+            .binding
+            .write_bar(peer0.shared_bar + 0xf000, AccessWidth::Dword, 0x0cc2)
+            .unwrap();
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + 0xf000, AccessWidth::Dword)
                 .unwrap(),
             0
         );

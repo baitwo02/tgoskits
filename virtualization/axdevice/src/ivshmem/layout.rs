@@ -1,13 +1,53 @@
 //! Static BAR2 layout of one ivshmem link.
 //!
 //! The layout object is the single source of truth for how BAR2 is divided:
-//! F4's state table, F5's common/output sections, and F6's stage-2 mapping
-//! plans all derive from it. It lives in `axdevice::ivshmem` because every
-//! peer of one link must observe the same division.
+//! the state table, the optional common section, and the per-peer output
+//! sections all derive from it, and F6's stage-2 mapping plans read the same
+//! object. It lives in `axdevice::ivshmem` because every peer of one link
+//! must observe the same division.
 
-use alloc::{format, string::String};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
+use core::fmt;
 
 use super::{error::IvshmemError, link::PeerId};
+
+/// Owner-aware classification of one BAR2 offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Bar2Section {
+    /// Host-owned state table; guests read it, BAR0 State writes move it.
+    StateTable,
+    /// Read/write area shared by every peer; absent in the F5 profile.
+    Common,
+    /// The output section of one peer; read-only for everyone else.
+    Output(PeerId),
+    /// Page-rounded leftover; reads zero, writes are ignored.
+    Reserved,
+}
+
+impl Bar2Section {
+    /// Returns whether `peer` may write this section.
+    ///
+    /// StateTable is never writable through BAR2, Common is writable by
+    /// every peer, `Output(p)` only by `p`, Reserved never (the caller
+    /// ignores those writes silently instead of denying them).
+    pub const fn allows_write(self, peer: PeerId) -> bool {
+        match self {
+            Bar2Section::StateTable | Bar2Section::Reserved => false,
+            Bar2Section::Common => true,
+            Bar2Section::Output(owner) => owner.value() == peer.value(),
+        }
+    }
+
+    /// Returns the stable section name used in diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Bar2Section::StateTable => "state table",
+            Bar2Section::Common => "common section",
+            Bar2Section::Output(_) => "output section",
+            Bar2Section::Reserved => "reserved region",
+        }
+    }
+}
 
 /// One aligned section of the shared BAR2 region.
 ///
@@ -22,7 +62,7 @@ pub struct SectionDesc {
 
 impl SectionDesc {
     /// The alignment every section must keep (stage-2 page granularity).
-    const ALIGNMENT: u64 = 0x1000;
+    pub(crate) const ALIGNMENT: u64 = 0x1000;
 
     /// Creates one section, rejecting unaligned bounds, a size of zero and
     /// overflow of `offset + size`.
@@ -72,54 +112,92 @@ impl SectionDesc {
     }
 }
 
-/// Coarse classification of one BAR2 offset before F5 freezes full sections.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Bar2Region {
-    /// Host-owned state table; guests read it, only BAR0 State writes move it.
-    StateTable,
-    /// Every byte outside the state table; shared read/write across peers.
-    Shared,
-}
-
 /// Static layout of the shared BAR2 region of one link.
-#[derive(Clone, Copy, Debug)]
 pub struct IvshmemMemoryLayout {
     state_table: SectionDesc,
+    common: Option<SectionDesc>,
+    outputs: Box<[SectionDesc]>,
     bar2_size: u64,
+}
+
+impl fmt::Debug for IvshmemMemoryLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IvshmemMemoryLayout")
+            .field("state_table", &self.state_table)
+            .field("common", &self.common)
+            .field("outputs", &self.outputs)
+            .field("bar2_size", &self.bar2_size)
+            .finish()
+    }
 }
 
 impl IvshmemMemoryLayout {
     /// Size of one peer's state-table entry in bytes.
     const STATE_ENTRY_SIZE: u64 = 4;
 
-    /// Derives the F4 layout: one 4 KiB state-table page at offset 0.
+    /// Derives the F5 layout from the profile constants.
+    ///
+    /// Rules: one state-table page at offset 0; no common section; the
+    /// remaining pages split evenly across peers, rounded down to a whole
+    /// page per peer; leftover pages become Reserved. Every section is
+    /// 4 KiB aligned and page sized.
     ///
     /// # Errors
     ///
-    /// Returns [`IvshmemError::InvalidLayout`] when `bar2_size` is smaller
-    /// than one page or cannot hold `max_peers` 32-bit entries.
+    /// Returns [`IvshmemError::InvalidLayout`] when `bar2_size` cannot hold
+    /// the state-table page plus at least one page per peer.
     pub fn derive(bar2_size: u64, max_peers: u16) -> Result<Self, IvshmemError> {
-        let state_table = SectionDesc::new(0, SectionDesc::ALIGNMENT)?;
-        let entries_end = state_table.offset + u64::from(max_peers) * Self::STATE_ENTRY_SIZE;
-        if bar2_size < state_table.size() {
-            return Err(IvshmemError::InvalidLayout {
-                detail: format!(
-                    "BAR2 size {bar2_size:#x} cannot host the {:#x} state-table page",
-                    state_table.size()
-                ),
-            });
+        let reject = |detail: String| IvshmemError::InvalidLayout { detail };
+        if max_peers == 0 {
+            return Err(reject("a link needs at least one peer".into()));
         }
+        if !bar2_size.is_multiple_of(SectionDesc::ALIGNMENT) {
+            return Err(reject(format!(
+                "BAR2 size {bar2_size:#x} is not {:#x}-aligned",
+                SectionDesc::ALIGNMENT
+            )));
+        }
+        let state_table = SectionDesc::new(0, SectionDesc::ALIGNMENT)?;
+        if bar2_size < state_table.size() {
+            return Err(reject(format!(
+                "BAR2 size {bar2_size:#x} cannot host the {:#x} state-table page",
+                state_table.size()
+            )));
+        }
+        let entries_end = state_table.offset + u64::from(max_peers) * Self::STATE_ENTRY_SIZE;
         if entries_end > state_table.size() {
-            return Err(IvshmemError::InvalidLayout {
-                detail: format!(
-                    "{max_peers} state entries end at {entries_end:#x} beyond the {:#x} \
-                     state-table page",
-                    state_table.size()
-                ),
-            });
+            return Err(reject(format!(
+                "{max_peers} state entries end at {entries_end:#x} beyond the {:#x} state-table \
+                 page",
+                state_table.size()
+            )));
+        }
+        let remaining_pages = (bar2_size - state_table.size()) / SectionDesc::ALIGNMENT;
+        let per_peer_pages = remaining_pages / u64::from(max_peers);
+        if per_peer_pages == 0 {
+            return Err(reject(format!(
+                "BAR2 size {bar2_size:#x} cannot host one output page per peer for {max_peers} \
+                 peers"
+            )));
+        }
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(usize::from(max_peers))
+            .map_err(|_| IvshmemError::AllocationFailed {
+                operation: "derive ivshmem BAR2 layout",
+            })?;
+        for peer in 0..u64::from(max_peers) {
+            let offset = state_table.size() + peer * per_peer_pages * SectionDesc::ALIGNMENT;
+            let size = per_peer_pages * SectionDesc::ALIGNMENT;
+            outputs.push(SectionDesc::new(offset, size)?);
         }
         Ok(Self {
             state_table,
+            // The current profile has no common section; F8's configuration
+            // may introduce one behind this already-absence-safe field.
+            common: None,
+            outputs: outputs.into_boxed_slice(),
             bar2_size,
         })
     }
@@ -127,6 +205,17 @@ impl IvshmemMemoryLayout {
     /// Returns the state-table section.
     pub const fn state_table(&self) -> SectionDesc {
         self.state_table
+    }
+
+    /// Returns the common section, or `None` while the profile has none.
+    pub const fn common(&self) -> Option<SectionDesc> {
+        self.common
+    }
+
+    /// Returns the per-peer output sections indexed by `PeerId::value()`;
+    /// the slice length always equals the peer count of the profile.
+    pub fn outputs(&self) -> &[SectionDesc] {
+        &self.outputs
     }
 
     /// Returns the total BAR2 size this layout was derived from.
@@ -153,49 +242,187 @@ impl IvshmemMemoryLayout {
         Ok(self.state_table.offset() + u64::from(peer.value()) * Self::STATE_ENTRY_SIZE)
     }
 
-    /// Classifies one BAR2 offset for F4 semantics.
-    pub const fn region(&self, offset: u64) -> Bar2Region {
+    /// Classifies one BAR2 offset into its owning section.
+    ///
+    /// Pure lookup: no locking, no allocation, and the same result for every
+    /// peer of the link (ownership is applied afterwards via
+    /// [`Bar2Section::allows_write`]). Offsets past the classified sections
+    /// classify as `Reserved`.
+    pub fn classify(&self, offset: u64) -> Bar2Section {
         if self.state_table.contains(offset) {
-            Bar2Region::StateTable
-        } else {
-            Bar2Region::Shared
+            return Bar2Section::StateTable;
         }
+        if let Some(common) = self.common
+            && common.contains(offset)
+        {
+            return Bar2Section::Common;
+        }
+        for (index, section) in self.outputs.iter().enumerate() {
+            if section.contains(offset) {
+                return Bar2Section::Output(PeerId::new(index as u16));
+            }
+        }
+        Bar2Section::Reserved
+    }
+
+    /// Re-checks the frozen invariants of this layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::InvalidLayout`] when sections overlap, are
+    /// misaligned, or leave `bar2_size`. The peer-count crosscheck of
+    /// `outputs.len()` joins with F8's profile-driven derivation, which is
+    /// the first caller that can construct a layout with a wrong count.
+    pub fn validate(&self) -> Result<(), IvshmemError> {
+        let reject = |detail: String| IvshmemError::InvalidLayout { detail };
+        let mut sections = Vec::new();
+        sections
+            .try_reserve_exact(2 + self.outputs.len())
+            .map_err(|_| IvshmemError::AllocationFailed {
+                operation: "validate ivshmem BAR2 layout",
+            })?;
+        sections.push((self.state_table, "state table"));
+        if let Some(common) = self.common {
+            sections.push((common, "common section"));
+        }
+        for (index, output) in self.outputs.iter().enumerate() {
+            sections.push((
+                *output,
+                Bar2Section::Output(PeerId::new(index as u16)).name(),
+            ));
+        }
+        for (section, name) in &sections {
+            if section.offset() + section.size() > self.bar2_size {
+                return Err(reject(format!(
+                    "{name} at {:#x}..{:#x} leaves the {:#x} BAR2",
+                    section.offset(),
+                    section.offset() + section.size(),
+                    self.bar2_size
+                )));
+            }
+        }
+        for (index, (section, name)) in sections.iter().enumerate() {
+            for (other, other_name) in sections.iter().skip(index + 1) {
+                if section.offset() < other.offset() + other.size()
+                    && other.offset() < section.offset() + section.size()
+                {
+                    return Err(reject(format!(
+                        "{name} at {:#x}..{:#x} overlaps {other_name} at {:#x}..{:#x}",
+                        section.offset(),
+                        section.offset() + section.size(),
+                        other.offset(),
+                        other.offset() + other.size(),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::{format, string::ToString};
+    use alloc::{string::ToString, vec};
 
     use super::*;
     use crate::ivshmem::SHARED_MEMORY_SIZE;
 
-    #[test]
-    fn derives_the_state_table_page_at_offset_zero() {
-        let layout = IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap();
-        assert_eq!(layout.bar2_size(), SHARED_MEMORY_SIZE);
-        assert_eq!(layout.state_table().offset(), 0);
-        assert_eq!(layout.state_table().size(), 0x1000);
-        // Both peer entries fit inside the page.
-        assert_eq!(layout.state_entry_offset(PeerId::new(0), 2).unwrap(), 0);
-        assert_eq!(layout.state_entry_offset(PeerId::new(1), 2).unwrap(), 4);
+    fn two_peer_layout() -> IvshmemMemoryLayout {
+        IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap()
     }
 
     #[test]
-    fn rejects_bar2_sizes_that_cannot_host_the_state_table() {
-        // Smaller than one page.
-        let small = IvshmemMemoryLayout::derive(0x800, 2).unwrap_err();
-        assert!(small.to_string().contains("cannot host"));
-        // Enough pages, but not enough room for the peer entries.
-        let crowded = IvshmemMemoryLayout::derive(0x1000, 1025).unwrap_err();
-        assert!(crowded.to_string().contains("state entries end at"));
-        // Exactly the entries the profile needs still derives.
-        IvshmemMemoryLayout::derive(0x1000, 1024).unwrap();
+    fn derives_the_frozen_two_peer_profile() {
+        let layout = two_peer_layout();
+        assert_eq!(layout.bar2_size(), SHARED_MEMORY_SIZE);
+        assert_eq!(layout.state_table().offset(), 0);
+        assert_eq!(layout.state_table().size(), 0x1000);
+        assert_eq!(layout.common(), None);
+        let outputs = layout.outputs();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].offset(), 0x1000);
+        assert_eq!(outputs[0].size(), 0x7000);
+        assert_eq!(outputs[1].offset(), 0x8000);
+        assert_eq!(outputs[1].size(), 0x7000);
+        // Both peer entries fit inside the state-table page.
+        assert_eq!(layout.state_entry_offset(PeerId::new(0), 2).unwrap(), 0);
+        assert_eq!(layout.state_entry_offset(PeerId::new(1), 2).unwrap(), 4);
+        layout.validate().unwrap();
+    }
+
+    #[test]
+    fn classifies_every_offset_boundary_into_its_section() {
+        let layout = two_peer_layout();
+        let expectations: &[(u64, Bar2Section)] = &[
+            (0, Bar2Section::StateTable),
+            (4, Bar2Section::StateTable),
+            (0xfff, Bar2Section::StateTable),
+            (0x1000, Bar2Section::Output(PeerId::new(0))),
+            (0x7fff, Bar2Section::Output(PeerId::new(0))),
+            (0x8000, Bar2Section::Output(PeerId::new(1))),
+            (0xefff, Bar2Section::Output(PeerId::new(1))),
+            (0xf000, Bar2Section::Reserved),
+            (0xffff, Bar2Section::Reserved),
+        ];
+        for (offset, expected) in expectations {
+            assert_eq!(layout.classify(*offset), *expected, "offset {offset:#x}");
+        }
+    }
+
+    #[test]
+    fn write_permissions_follow_the_owner_matrix() {
+        let peer0 = PeerId::new(0);
+        let peer1 = PeerId::new(1);
+        // The state table is never writable through BAR2.
+        assert!(!Bar2Section::StateTable.allows_write(peer0));
+        assert!(!Bar2Section::StateTable.allows_write(peer1));
+        // Common would be writable by everyone (absent in this profile).
+        assert!(Bar2Section::Common.allows_write(peer0));
+        assert!(Bar2Section::Common.allows_write(peer1));
+        // Output sections are writable by their owner only.
+        assert!(Bar2Section::Output(peer0).allows_write(peer0));
+        assert!(!Bar2Section::Output(peer0).allows_write(peer1));
+        assert!(Bar2Section::Output(peer1).allows_write(peer1));
+        assert!(!Bar2Section::Output(peer1).allows_write(peer0));
+        // Reserved writes are ignored by the caller, never granted.
+        assert!(!Bar2Section::Reserved.allows_write(peer0));
+        // Section names are stable, non-empty diagnostics.
+        assert!(!Bar2Section::StateTable.name().is_empty());
+        assert_eq!(Bar2Section::Output(peer1).name(), "output section");
+    }
+
+    #[test]
+    fn rejects_bar2_sizes_that_cannot_host_the_sections() {
+        // Zero bytes cannot host the state-table page (any page-aligned size
+        // below one page is zero).
+        assert!(
+            IvshmemMemoryLayout::derive(0, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot host")
+        );
+        // Not enough pages for one output section per peer.
+        assert!(
+            IvshmemMemoryLayout::derive(0x2000, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("one output page per peer")
+        );
+        // Unaligned BAR2 size.
+        assert!(IvshmemMemoryLayout::derive(0x1800, 2).is_err());
+        // Empty peer profile.
+        assert!(IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 0).is_err());
+        // The smallest workable profile still derives: state page + 1 page
+        // per peer.
+        let tight = IvshmemMemoryLayout::derive(0x3000, 2).unwrap();
+        assert_eq!(tight.outputs()[0].size(), 0x1000);
+        assert_eq!(tight.outputs()[1].size(), 0x1000);
+        assert_eq!(tight.classify(0x3000), Bar2Section::Reserved);
     }
 
     #[test]
     fn rejects_entries_outside_the_derived_profile() {
-        let layout = IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap();
+        let layout = two_peer_layout();
         assert_eq!(
             layout.state_entry_offset(PeerId::new(2), 2),
             Err(IvshmemError::PeerOutOfProfile {
@@ -203,17 +430,6 @@ mod tests {
                 max_peers: 2
             })
         );
-    }
-
-    #[test]
-    fn classifies_state_table_and_shared_offsets() {
-        let layout = IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap();
-        for offset in [0, 4, 0x800, 0xfff] {
-            assert_eq!(layout.region(offset), Bar2Region::StateTable);
-        }
-        for offset in [0x1000, 0x1004, SHARED_MEMORY_SIZE - 4] {
-            assert_eq!(layout.region(offset), Bar2Region::Shared);
-        }
     }
 
     #[test]
@@ -235,10 +451,6 @@ mod tests {
             SectionDesc::new(0, 0),
             Err(expected_detail("section size is zero"))
         );
-        assert!(
-            format!("{}", SectionDesc::new(0x800, 0x1000).unwrap_err())
-                .contains("not 0x1000-aligned")
-        );
     }
 
     #[test]
@@ -248,5 +460,55 @@ mod tests {
         assert!(section.contains(0x2fff));
         assert!(!section.contains(0xfff));
         assert!(!section.contains(0x3000));
+    }
+
+    #[test]
+    fn validate_rejects_overlaps_and_sections_leaving_the_bar2() {
+        // A hand-built layout whose second output extends past the BAR2.
+        let layout = IvshmemMemoryLayout {
+            state_table: SectionDesc::new(0, 0x1000).unwrap(),
+            common: None,
+            outputs: vec![
+                SectionDesc::new(0x1000, 0x7000).unwrap(),
+                SectionDesc::new(0x8000, 0x9000).unwrap(),
+            ]
+            .into_boxed_slice(),
+            bar2_size: SHARED_MEMORY_SIZE,
+        };
+        let error = layout.validate().unwrap_err();
+        assert!(error.to_string().contains("leaves the"));
+        assert_eq!(layout.classify(0xf000), Bar2Section::Output(PeerId::new(1)));
+
+        // A hand-built layout with overlapping sections.
+        let layout = IvshmemMemoryLayout {
+            state_table: SectionDesc::new(0, 0x1000).unwrap(),
+            common: Some(SectionDesc::new(0x1000, 0x2000).unwrap()),
+            outputs: vec![SectionDesc::new(0x2000, 0x1000).unwrap()].into_boxed_slice(),
+            bar2_size: SHARED_MEMORY_SIZE,
+        };
+        let error = layout.validate().unwrap_err();
+        assert!(error.to_string().contains("overlaps"));
+    }
+
+    #[test]
+    fn validate_accepts_a_common_section_between_outputs() {
+        let layout = IvshmemMemoryLayout {
+            state_table: SectionDesc::new(0, 0x1000).unwrap(),
+            common: Some(SectionDesc::new(0x1000, 0x1000).unwrap()),
+            outputs: vec![
+                SectionDesc::new(0x2000, 0x1000).unwrap(),
+                SectionDesc::new(0x3000, 0x1000).unwrap(),
+            ]
+            .into_boxed_slice(),
+            bar2_size: SHARED_MEMORY_SIZE,
+        };
+        layout.validate().unwrap();
+        assert_eq!(layout.classify(0x1000), Bar2Section::Common);
+        assert_eq!(layout.classify(0x2000), Bar2Section::Output(peer(0)));
+        assert_eq!(layout.classify(0x3000), Bar2Section::Output(peer(1)));
+    }
+
+    fn peer(value: u16) -> PeerId {
+        PeerId::new(value)
     }
 }
