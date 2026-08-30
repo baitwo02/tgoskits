@@ -14,6 +14,7 @@ mod link;
 mod tests;
 mod types;
 
+pub(crate) use compile::cc_for_arch;
 use compile::{archive_static_lib, compile_dir_c_sources};
 use features::{c_compiler_features, dynamic_pie_for_c_app, map_c_app_features};
 use flags::{CFlagsInput, cflags, write_pthread_mutex_header};

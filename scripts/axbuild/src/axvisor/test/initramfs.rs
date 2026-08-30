@@ -277,6 +277,13 @@ case "$cmdline" in
       *) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED ;;
     esac
     exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-polling*)
+    # The full enumeration evidence must still hold; its failure marker is a
+    # case-level fail_regex entry, and the smoke program carries the success
+    # marker so the polling backend cannot be skipped.
+    run_pci_enumeration_check IVSHMEM_POLLING_ENUMERATION_PASSED
+    /bin/ivshmem-bar2-smoke --backend polling
+    exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=off*)
     if [ -d /sys/firmware/acpi/tables ]; then
       echo AXVISOR_X86_ACPI_FAILED
@@ -504,7 +511,19 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             }
             None => rootfs::qemu_rootfs_path(request, workspace_root, None)?,
         };
-        prepare_busybox_initramfs(&rootfs_path, &output_path, &request.arch)?;
+        let smoke_binary = match cargo.env.get(super::ivshmem_smoke::IVSHMEM_SMOKE_ENV) {
+            Some(_) => Some(super::ivshmem_smoke::build_smoke_binary(
+                workspace_root,
+                &request.arch,
+            )?),
+            None => None,
+        };
+        prepare_busybox_initramfs(
+            &rootfs_path,
+            &output_path,
+            &request.arch,
+            smoke_binary.as_deref(),
+        )?;
         println!(
             "prepared Axvisor QEMU test initramfs: {}",
             output_path.display()
@@ -542,6 +561,7 @@ fn prepare_busybox_initramfs(
     rootfs_path: &Path,
     output_path: &Path,
     arch: &str,
+    smoke_binary: Option<&[u8]>,
 ) -> anyhow::Result<()> {
     let busybox = required_rootfs_file(rootfs_path, BUSYBOX_PATH)?;
     let loader_path = musl_loader_path(arch)?;
@@ -549,8 +569,15 @@ fn prepare_busybox_initramfs(
     let lspci = required_rootfs_file(rootfs_path, LSPCI_PATH)?;
     let libpci = required_rootfs_file(rootfs_path, LIBPCI_PATH)?;
     let pci_ids = required_rootfs_file(rootfs_path, PCI_IDS_PATH)?;
-    let archive =
-        build_busybox_initramfs(&busybox, loader_path, &loader, &lspci, &libpci, &pci_ids)?;
+    let archive = build_busybox_initramfs(
+        &busybox,
+        loader_path,
+        &loader,
+        &lspci,
+        &libpci,
+        &pci_ids,
+        smoke_binary,
+    )?;
 
     let output_parent = output_path.parent().with_context(|| {
         format!(
@@ -608,6 +635,7 @@ fn build_busybox_initramfs(
     lspci: &[u8],
     libpci: &[u8],
     pci_ids: &[u8],
+    smoke_binary: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
     let init_script = init_script();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -639,6 +667,12 @@ fn build_busybox_initramfs(
         archive.append_regular(libpci_archive_path, libpci)?;
         archive.append_symlink(archive_path(LIBPCI_SONAME_PATH)?, "libpci.so.3.14.0")?;
         archive.append_regular(pci_ids_archive_path, pci_ids)?;
+        if let Some(smoke_binary) = smoke_binary {
+            // The ivshmem polling case runs the adapter smoke program from
+            // the guest; it is added only when the case requests it so other
+            // groups keep a toolchain-free initramfs.
+            archive.append_regular(super::ivshmem_smoke::SMOKE_ARCHIVE_PATH, smoke_binary)?;
+        }
         archive.append_regular("init", &init_script)?;
         for applet in [
             "cat", "date", "dmesg", "grep", "mount", "od", "sed", "sh", "sleep",
@@ -758,6 +792,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_archive_carries_the_smoke_binary_when_requested() {
+        let compressed = build_busybox_initramfs(
+            b"busybox",
+            "/lib/ld-musl-test.so.1",
+            b"loader",
+            b"lspci",
+            b"libpci",
+            b"pci-ids",
+            Some(b"smoke-binary-bytes"),
+        )
+        .unwrap();
+        let mut archive = Vec::new();
+        GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut archive)
+            .unwrap();
+        let entries = parse_newc_entries(&archive);
+
+        assert_eq!(
+            entries.get("bin/ivshmem-bar2-smoke").unwrap(),
+            b"smoke-binary-bytes"
+        );
+    }
+
+    #[test]
     fn configured_output_must_stay_inside_workspace() {
         let root = tempdir().unwrap();
 
@@ -778,6 +836,7 @@ mod tests {
             b"lspci",
             b"libpci",
             b"pci-ids",
+            None,
         )
         .unwrap();
         let mut archive = Vec::new();
@@ -843,6 +902,16 @@ mod tests {
             init.windows(b"AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED".len())
                 .any(|window| window == b"AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED")
         );
+        assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-polling".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-polling")
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-bar2-smoke --backend polling".len())
+                .any(|window| window == b"/bin/ivshmem-bar2-smoke --backend polling")
+        );
+        // Cases that do not request the smoke binary must not carry it.
+        assert!(!entries.contains_key("bin/ivshmem-bar2-smoke"));
         // Failure markers are derived from the success marker so every
         // architecture gets a correctly tagged FAILED line.
         assert!(

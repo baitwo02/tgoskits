@@ -12,9 +12,15 @@ args = [
 fail_regex = [
   "(?i)\\bpanic(?:ked)?\\b",
   "(?m)^AXVISOR_AARCH64_VPCI_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^IVSHMEM_POLLING_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^ivshmem polling failed(?:\\s|$)",
 ]
+# The polling marker is printed by the ivshmem adapter smoke program after
+# discovery, mapping, profile registers, the BAR2 payload round-trip, and
+# two doorbell/Event Status cycles all passed (04-linux-uio-driver-path.md
+# marker contract).
 success_regex = [
-  "(?m)^AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED\\s*$",
+  "(?m)^ivshmem polling pass\\s*$",
 ]
 timeout = 240
 to_bin = true

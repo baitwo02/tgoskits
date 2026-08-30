@@ -67,7 +67,7 @@ fn source_arch_hint(cflags: &[String]) -> &str {
     }
 }
 
-pub(super) fn cc_for_arch(arch: &str) -> String {
+pub(crate) fn cc_for_arch(arch: &str) -> String {
     format!("{arch}-linux-musl-gcc")
 }
 

@@ -11,3 +11,5 @@ AXVISOR_TEST_BUSYBOX_INITRAMFS = "tmp/axbuild/axvisor/qemu-ivshmem-pci/initramfs
 # initramfs extracts lspci, libpci and pci.ids from it so the guest can prove
 # enumeration with the standard pciutils tool.
 AXVISOR_TEST_ROOTFS_IMAGE = "rootfs-aarch64-alpine-ivc-message-v1.img"
+# Cross-build the ivshmem adapter smoke binary into the generated initramfs.
+AXVISOR_TEST_IVSHMEM_SMOKE = "1"
