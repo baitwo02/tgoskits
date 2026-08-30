@@ -57,6 +57,17 @@ impl IvshmemRegisters {
         *self = Self::new();
     }
 
+    /// Sets the pending bit (bit 0) of the event status register.
+    ///
+    /// Multiple pending doorbells merge into this single bit by design;
+    /// shared-memory protocol state remains the source of truth. A plain
+    /// write suffices: the release-order contract requires producers to
+    /// finish shared-memory writes before ringing the doorbell, so no
+    /// register-level atomic is needed here.
+    pub fn record_event(&mut self) {
+        self.event_status |= 1;
+    }
+
     /// Reads one aligned Dword of the BAR0 register page.
     pub fn read(&self, offset: u64, peer: PeerId, max_peers: u16) -> Result<u32, IvshmemError> {
         Self::validate_access(offset)?;
@@ -74,8 +85,9 @@ impl IvshmemRegisters {
 
     /// Writes one aligned Dword of the BAR0 register page.
     ///
-    /// Doorbell writes stay inert in the register model; routing them to the
-    /// target peer is a link concern that arrives with the doorbell feature.
+    /// Doorbell writes never reach this method: the endpoint adapter routes
+    /// them through the link before any register lock is taken, so this
+    /// state machine only sees the registers it owns.
     pub fn write(&mut self, offset: u64, value: u32) -> Result<(), IvshmemError> {
         Self::validate_access(offset)?;
         match offset {
@@ -182,12 +194,55 @@ mod tests {
                 .unwrap(),
             0
         );
+        registers.record_event();
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            1
+        );
+        // Writing zero does not clear the pending bit (W1C semantics).
+        registers.write(EVENT_STATUS_OFFSET, 0).unwrap();
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            1
+        );
         registers.write(EVENT_STATUS_OFFSET, 0xffff_ffff).unwrap();
         assert_eq!(
             registers
                 .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn recorded_events_merge_into_one_pending_bit() {
+        let mut registers = IvshmemRegisters::new();
+        registers.record_event();
+        registers.record_event();
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            1
+        );
+        // Recording after a W1C clear pends the bit again.
+        registers.write(EVENT_STATUS_OFFSET, 1).unwrap();
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            0
+        );
+        registers.record_event();
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            1
         );
     }
 
@@ -233,7 +288,14 @@ mod tests {
         let mut registers = IvshmemRegisters::new();
         registers.write(INTERRUPT_CONTROL_OFFSET, 1).unwrap();
         registers.write(STATE_OFFSET, 0x1234).unwrap();
+        registers.record_event();
         registers.reset();
         assert_eq!(registers, IvshmemRegisters::new());
+        assert_eq!(
+            registers
+                .read(EVENT_STATUS_OFFSET, PEER, MAX_PEERS)
+                .unwrap(),
+            0
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! Typed failures of ivshmem link configuration and BAR semantics.
 
+use alloc::string::String;
+
 /// Errors reported while reserving peers or accessing ivshmem BARs.
 ///
 /// Configuration failures happen before any VM runs; guest BAR accesses map
@@ -85,5 +87,13 @@ pub enum IvshmemError {
         width: usize,
         /// The shared region size that defines the valid range.
         size: u64,
+    },
+    /// An event sink could not record one delivered event.
+    #[error("ivshmem event delivery failed for {operation}: {detail}")]
+    EventDeliveryFailed {
+        /// The sink operation that failed.
+        operation: &'static str,
+        /// Diagnostic detail from the sink.
+        detail: String,
     },
 }

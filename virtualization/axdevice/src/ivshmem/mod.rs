@@ -8,15 +8,18 @@
 //!
 //! Locking: the registry is only taken on the configuration path with the
 //! `registry -> link` order. Register and backing locks are independent and
-//! are never nested; callbacks outside these locks arrive with later
-//! features and must keep that order.
+//! are never nested; doorbell events cross these locks as value objects and
+//! are delivered to target sinks outside every lock, so neither the link
+//! peer-table lock nor a register lock is ever held while a sink runs.
 
 mod backing;
+mod doorbell;
 mod error;
 mod link;
 mod registers;
 
 pub use backing::SharedBarBacking;
+pub use doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink};
 pub use error::IvshmemError;
 pub use link::{
     IvshmemLink, IvshmemLinkRegistry, LinkId, MAX_PEERS, PeerAttachment, PeerId, PeerReservation,

@@ -143,10 +143,21 @@ impl DeviceModel for IvshmemPciModel {
                     operation: "build ivshmem PCI endpoint",
                     detail: error.to_string(),
                 })?;
-        let function = Arc::new(IvshmemPciFunction {
+        let registers = Arc::new(Mutex::new(IvshmemRegisters::new()));
+        let function = IvshmemPciFunction {
             attachment,
-            registers: Mutex::new(IvshmemRegisters::new()),
-        });
+            registers: Arc::clone(&registers),
+        };
+        // The sink shares the endpoint's register lock, so events routed by
+        // the link land in exactly the registers BAR0 exposes.
+        function
+            .attachment
+            .set_event_sink(Arc::new(RegisterEventSink::new(registers)))
+            .map_err(|error| DeviceManagerError::InvalidState {
+                operation: "build ivshmem PCI endpoint",
+                detail: error.to_string(),
+            })?;
+        let function = Arc::new(function);
         let mut bundle = DeviceBundle::new();
         bundle.add_pci_function(function)?;
         Ok(bundle)
@@ -155,7 +166,40 @@ impl DeviceModel for IvshmemPciModel {
 
 struct IvshmemPciFunction {
     attachment: PeerAttachment,
-    registers: Mutex<IvshmemRegisters>,
+    registers: Arc<Mutex<IvshmemRegisters>>,
+}
+
+/// The endpoint's event sink: doorbells routed by the link record the event
+/// in this endpoint's register page.
+///
+/// The sink shares the endpoint's register `Mutex` instead of owning state,
+/// so the Event Status observed through BAR0 and the events recorded by the
+/// link cannot diverge.
+struct RegisterEventSink {
+    registers: Arc<Mutex<IvshmemRegisters>>,
+}
+
+impl RegisterEventSink {
+    fn new(registers: Arc<Mutex<IvshmemRegisters>>) -> Self {
+        Self { registers }
+    }
+}
+
+impl IvshmemEventSink for RegisterEventSink {
+    fn deliver(&self, event: DoorbellEvent) -> Result<(), IvshmemError> {
+        let Ok(mut registers) = self.registers.lock() else {
+            return Err(IvshmemError::EventDeliveryFailed {
+                operation: "record doorbell event",
+                detail: format!(
+                    "peer {} register lock is poisoned while recording a doorbell from peer {}",
+                    event.target().value(),
+                    event.source().value()
+                ),
+            });
+        };
+        registers.record_event();
+        Ok(())
+    }
 }
 
 impl IvshmemPciFunction {
@@ -169,6 +213,18 @@ impl IvshmemPciFunction {
                 operation,
                 detail: "ivshmem register lock is poisoned".into(),
             })
+    }
+
+    /// Decodes one doorbell write and hands it to the link router.
+    ///
+    /// Inactive targets and unsupported vectors are specification no-ops
+    /// inside the link, so this write always succeeds from the guest's point
+    /// of view.
+    fn deliver_doorbell(&self, value: u32) {
+        let doorbell = Doorbell::from_write(value);
+        self.attachment
+            .link()
+            .deliver_doorbell(self.attachment.peer_id(), doorbell);
     }
 }
 
@@ -273,6 +329,13 @@ impl PciFunction for IvshmemPciFunction {
                     operation: "write ivshmem BAR0 registers",
                     detail: REGISTER_ACCESS_WIDTH_DETAIL.into(),
                 })?;
+                // The doorbell routes through the link before any register
+                // lock is taken: the writing endpoint must not hold its own
+                // register lock while the target sink locks its registers.
+                if access.offset() == DOORBELL_OFFSET {
+                    self.deliver_doorbell(value);
+                    return Ok(());
+                }
                 let mut registers = self.lock_registers("write ivshmem BAR0 registers")?;
                 registers
                     .write(access.offset(), value)
@@ -499,6 +562,10 @@ mod tests {
     }
 
     struct TestEndpoint {
+        // A live VM keeps its planned device graph (and with it the peer
+        // reservations inside the endpoint models) for its whole lifetime;
+        // holding the graph here mirrors that ownership.
+        _graph: ResolvedDeviceGraph,
         _runtime: DeviceRuntime,
         binding: Arc<PciRootBinding>,
         root: Arc<PciRootState>,
@@ -570,25 +637,29 @@ mod tests {
             .next()
             .unwrap();
         let root = root_slot.lock().unwrap().clone().unwrap();
-        let function = graph
-            .pci_topology(&host_key())
-            .unwrap()
-            .function(&id(node_id))
-            .unwrap();
+        let resolved = graph.pci_topology(&host_key()).unwrap();
+        let resolved_function = resolved.function(&id(node_id)).unwrap();
+        let bdf = resolved_function.bdf();
         let bar = |index: u8| {
-            function
+            resolved_function
                 .bar(PciBarIndex::new(index).unwrap())
                 .unwrap()
                 .address()
         };
+        let (register_bar, msix_bar, shared_bar) = (
+            bar(REGISTER_BAR_INDEX),
+            bar(MSIX_BAR_INDEX),
+            bar(SHARED_MEMORY_BAR_INDEX),
+        );
         TestEndpoint {
+            _graph: graph,
             _runtime: runtime,
             binding,
             root,
-            bdf: function.bdf(),
-            register_bar: bar(REGISTER_BAR_INDEX),
-            msix_bar: bar(MSIX_BAR_INDEX),
-            shared_bar: bar(SHARED_MEMORY_BAR_INDEX),
+            bdf,
+            register_bar,
+            msix_bar,
+            shared_bar,
         }
     }
 
@@ -754,5 +825,148 @@ mod tests {
                 .unwrap(),
             TEST_VALUE
         );
+    }
+
+    const fn doorbell(target: u32, vector: u32) -> u32 {
+        (target << 16) | vector
+    }
+
+    fn event_status(endpoint: &TestEndpoint) -> u64 {
+        endpoint
+            .read_register(EVENT_STATUS_OFFSET, AccessWidth::Dword)
+            .unwrap()
+    }
+
+    #[test]
+    fn doorbell_sets_only_the_target_event_status() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Peer 0 writes `target << 16 | vector`; peer 1 observes the event.
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer1), 1);
+        assert_eq!(event_status(&peer0), 0);
+
+        // Repeated doorbells merge into the single pending bit.
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer1), 1);
+
+        // W1C clear, then the next doorbell pends again.
+        peer1.write_register(EVENT_STATUS_OFFSET, 1).unwrap();
+        assert_eq!(event_status(&peer1), 0);
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer1), 1);
+    }
+
+    #[test]
+    fn doorbell_ignores_inactive_targets_and_unsupported_vectors() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Vector 1 is outside the current profile.
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 1))
+            .unwrap();
+        // Target 9 is outside the two-peer profile.
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(9, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer1), 0);
+
+        // A self-addressed doorbell must not deadlock: it proves the writing
+        // endpoint does not hold its register lock while the sink re-locks
+        // the very same registers.
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer0), 1);
+    }
+
+    #[test]
+    fn doorbell_leaves_other_registers_and_shared_bytes_untouched() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        peer0.write_register(STATE_OFFSET, 0x1234).unwrap();
+        peer0
+            .binding
+            .write_bar(
+                peer0.shared_bar + TEST_OFFSET,
+                AccessWidth::Qword,
+                TEST_VALUE,
+            )
+            .unwrap();
+
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+
+        assert_eq!(event_status(&peer1), 1);
+        // The doorbell write value never leaks into the writer's registers.
+        assert_eq!(
+            peer0
+                .read_register(STATE_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            0x1234
+        );
+        // The receiver's local registers and the shared bytes stay intact.
+        assert_eq!(
+            peer1
+                .read_register(STATE_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + TEST_OFFSET, AccessWidth::Qword)
+                .unwrap(),
+            TEST_VALUE
+        );
+    }
+
+    #[test]
+    fn doorbell_reads_stay_zero_and_reset_clears_pending_events() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+        // The doorbell register is write-only by specification.
+        assert_eq!(
+            peer0
+                .read_register(DOORBELL_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+
+        // Endpoint reset clears the pending event; the link and the sink
+        // keep working for the next doorbell.
+        peer1.binding.reset().unwrap();
+        peer1.enable_memory();
+        assert_eq!(event_status(&peer1), 0);
+        peer0
+            .write_register(DOORBELL_OFFSET, doorbell(1, 0))
+            .unwrap();
+        assert_eq!(event_status(&peer1), 1);
     }
 }
