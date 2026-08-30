@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
 - *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+### Added
+
+- Add `map_normal_memory` so memory-backed shared regions can be mapped with normal cacheable, shareable attributes instead of device ones.
+### Added
+
+- Add `map_normal_memory` so memory-backed shared regions can be mapped with normal cacheable, shareable attributes instead of device ones.
 
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/ax-mm-v0.5.31...ax-mm-v0.6.0) - 2026-08-20
 

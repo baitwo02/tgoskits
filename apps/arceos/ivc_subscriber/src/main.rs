@@ -486,7 +486,12 @@ mod subscriber {
     }
 
     fn shared_region(shm_base_gpa: usize, shm_size: usize) -> Option<&'static IvcRegion> {
-        let vaddr = ax_mm::iomap(PhysAddr::from_usize(shm_base_gpa), shm_size).ok()?;
+        // The hypervisor backs the shared region with host RAM and maps it at
+        // stage 2 with normal-memory attributes, and the Linux peer maps the
+        // same GPA through `memremap(MEMREMAP_WB)`. Message V1 ring indices
+        // rely on acquire/release ordering, so both peers must map the region
+        // with consistent normal cacheable attributes instead of Device ones.
+        let vaddr = ax_mm::map_normal_memory(PhysAddr::from_usize(shm_base_gpa), shm_size).ok()?;
         unsafe {
             // Axvisor maps the returned GPA to the publisher's shared region.
             // Phase 2 uses atomic ring ownership for subscriber writes.

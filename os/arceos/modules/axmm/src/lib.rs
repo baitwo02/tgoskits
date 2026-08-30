@@ -209,6 +209,22 @@ fn checked_align_up_4k(addr: usize) -> MmResult<PhysAddr> {
 }
 
 fn iomap_generic(addr: PhysAddr, size: usize, mem_flags: MappingFlags) -> MmResult<VirtAddr> {
+    map_kernel_linear(addr, size, mem_flags | MappingFlags::READ | MappingFlags::WRITE)
+}
+
+/// Maps a physical memory range into the kernel address space with normal
+/// cacheable, shareable attributes for memory-backed shared memory.
+pub fn map_normal_memory(addr: PhysAddr, size: usize) -> MmResult<VirtAddr> {
+    if size == 0 {
+        return Err(MmError::InvalidInput("mapping size is zero"));
+    }
+    addr.as_usize()
+        .checked_add(size)
+        .ok_or(MmError::InvalidInput("physical address range overflows"))?;
+    map_kernel_linear(addr, size, MappingFlags::READ | MappingFlags::WRITE)
+}
+
+fn map_kernel_linear(addr: PhysAddr, size: usize, flags: MappingFlags) -> MmResult<VirtAddr> {
     let end = addr
         .as_usize()
         .checked_add(size)
@@ -220,7 +236,6 @@ fn iomap_generic(addr: PhysAddr, size: usize, mem_flags: MappingFlags) -> MmResu
     let size_aligned = checked_align_up_4k(end)? - addr_aligned;
     let offset = addr - addr_aligned;
 
-    let flags = mem_flags | MappingFlags::READ | MappingFlags::WRITE;
     let mut tb = kernel_aspace().lock_irqsave();
 
     let mapped = if tb.contains_range(virt_aligned, size_aligned) {
@@ -237,7 +252,7 @@ fn iomap_generic(addr: PhysAddr, size: usize, mem_flags: MappingFlags) -> MmResu
     } else {
         // On platforms where `phys_to_virt()` is a hardware direct map outside
         // the page-table-backed kernel address space, allocate a separate
-        // kernel VA and map the device with PTE attributes.
+        // kernel VA and map the range with PTE attributes.
         let range = VirtAddrRange::new(tb.base(), tb.end());
         let mapped = tb
             .find_free_area(tb.base(), size_aligned, range)
