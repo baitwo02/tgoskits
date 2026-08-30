@@ -103,12 +103,13 @@ fn validate_tree(tree: &FdtTree, host: GuestPciHost) -> AxVmResult {
         let node = tree.inner().node(node_id).ok_or_else(|| {
             AxVmError::invalid_config("FDT node disappeared during PCI validation")
         })?;
-        if node.is_pci() {
+        if is_pci_bridge(node) {
             return Err(AxVmError::invalid_config(format!(
                 "guest FDT already contains PCI bridge {}",
                 tree.inner().path_of(node_id)
             )));
         }
+        validate_node_registers(tree, node_id, host)?;
     }
 
     let root = tree.inner().root_id();
@@ -125,26 +126,44 @@ fn validate_tree(tree: &FdtTree, host: GuestPciHost) -> AxVmResult {
         )));
     }
 
-    for child_id in root_node.children() {
-        let path = tree.inner().path_of(*child_id);
-        let Some(view) = tree.inner().view_typed(*child_id) else {
+    Ok(())
+}
+
+/// Recognizes PCI host bridges through the standardized `device_type = "pci"`
+/// binding and through the generic CAM/ECAM compatible strings. Linux binds
+/// `pci-host-generic` by compatible alone, so a node that omits `device_type`
+/// (non-conforming per the DT spec) is still probeable by the guest and must
+/// be treated as an existing bridge.
+fn is_pci_bridge(node: &Node) -> bool {
+    node.is_pci()
+        || node.compatibles().any(|compatible| {
+            matches!(compatible, "pci-host-ecam-generic" | "pci-host-cam-generic")
+        })
+}
+
+/// Rejects register windows of any tree node that overlap the injected PCI
+/// host apertures. The check covers the whole tree because only excluded or
+/// passthrough device ranges reach the resource pools; every other guest DTB
+/// device relies on this validation as its sole aperture-conflict guard.
+fn validate_node_registers(tree: &FdtTree, node_id: usize, host: GuestPciHost) -> AxVmResult {
+    let path = tree.inner().path_of(node_id);
+    let Some(view) = tree.inner().view_typed(node_id) else {
+        return Ok(());
+    };
+    for register in view.regs() {
+        let Some(size) = register.size.filter(|size| *size != 0) else {
             continue;
         };
-        for register in view.regs() {
-            let Some(size) = register.size.filter(|size| *size != 0) else {
-                continue;
-            };
-            let end = register.address.checked_add(size).ok_or_else(|| {
-                AxVmError::invalid_config(format!("FDT register range for {path} overflows"))
-            })?;
-            let register_range = register.address..end;
-            if ranges_overlap(&register_range, &host.ecam_range())
-                || ranges_overlap(&register_range, &host.memory_range())
-            {
-                return Err(AxVmError::invalid_config(format!(
-                    "FDT register range {register_range:#x?} for {path} conflicts with PCI host"
-                )));
-            }
+        let end = register.address.checked_add(size).ok_or_else(|| {
+            AxVmError::invalid_config(format!("FDT register range for {path} overflows"))
+        })?;
+        let register_range = register.address..end;
+        if ranges_overlap(&register_range, &host.ecam_range())
+            || ranges_overlap(&register_range, &host.memory_range())
+        {
+            return Err(AxVmError::invalid_config(format!(
+                "FDT register range {register_range:#x?} for {path} conflicts with PCI host"
+            )));
         }
     }
     Ok(())
@@ -343,6 +362,36 @@ mod tests {
 
         let error = install_pci_host(&bytes, Some(&host())).unwrap_err();
         assert!(error.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn existing_generic_compatible_bridge_is_rejected_without_device_type() {
+        let mut fdt = Fdt::from_bytes(&base_fdt()).unwrap();
+        let root = fdt.root_id();
+        let pci = fdt.add_node(root, Node::new("pcie@20000000"));
+        let mut compatible = Property::new("compatible", Vec::new());
+        compatible.set_string("pci-host-ecam-generic");
+        fdt.node_mut(pci).unwrap().set_property(compatible);
+        let bytes = fdt.encode().as_ref().to_vec();
+
+        let error = install_pci_host(&bytes, Some(&host())).unwrap_err();
+        assert!(error.to_string().contains("/pcie@20000000"));
+    }
+
+    #[test]
+    fn nested_register_range_conflict_is_rejected() {
+        let mut fdt = Fdt::from_bytes(&base_fdt()).unwrap();
+        let root = fdt.root_id();
+        let soc = fdt.add_node(root, Node::new("soc"));
+        let uart = fdt.add_node(soc, Node::new("uart@c100000"));
+        fdt.view_typed_mut(uart)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x0c10_0000, Some(0x1000))]);
+        let bytes = fdt.encode().as_ref().to_vec();
+
+        let error = install_pci_host(&bytes, Some(&host())).unwrap_err();
+        assert!(error.to_string().contains("/soc/uart@c100000"));
+        assert!(error.to_string().contains("conflicts with PCI host"));
     }
 
     #[test]
