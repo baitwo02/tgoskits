@@ -7,10 +7,12 @@ use alloc::vec::Vec;
 #[cfg(feature = "fs")]
 use alloc::{string::String, vec, vec::Vec};
 
+use alloc::sync::Arc;
 #[cfg(feature = "fs")]
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 use axvm::{AxVMRef, AxvmRuntime, VMId};
+use std::sync::OnceLock;
 
 /// AxVM top-level manager.
 ///
@@ -22,6 +24,19 @@ pub struct AxvmManager {
 }
 
 impl AxvmManager {
+    /// Returns the process-wide ivshmem link registry.
+    ///
+    /// Axvisor creates exactly one registry and passes it explicitly into
+    /// every VM configuration build, so peers of one link always share the
+    /// same backing. The registry object is not a global map; per-peer state
+    /// stays inside the registry and links disappear with their last VM.
+    pub fn ivshmem_registry() -> Arc<axvm::IvshmemLinkRegistry> {
+        static IVSHMEM_REGISTRY: OnceLock<Arc<axvm::IvshmemLinkRegistry>> = OnceLock::new();
+        IVSHMEM_REGISTRY
+            .get_or_init(|| Arc::new(axvm::IvshmemLinkRegistry::new()))
+            .clone()
+    }
+
     /// Initialize the AxVM runtime services.
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -31,7 +46,8 @@ impl AxvmManager {
 
     /// Load and initialize the default VM set.
     pub fn init_default_vms(&self) {
-        crate::config::init_guest_vms();
+        let ivshmem_registry = Self::ivshmem_registry();
+        crate::config::init_guest_vms(&ivshmem_registry);
         self.runtime.init_vms();
         self.release_host_filesystem_for_guest_passthrough();
     }
@@ -63,7 +79,9 @@ impl AxvmManager {
     /// Create one VM from a TOML config string.
     #[cfg(any(feature = "fs", feature = "http-axum"))]
     pub fn create_vm_from_toml(raw_cfg: &str) -> Result<VMId> {
-        crate::config::init_guest_vm(raw_cfg).context("create VM from TOML configuration")
+        let ivshmem_registry = Self::ivshmem_registry();
+        crate::config::init_guest_vm(raw_cfg, &ivshmem_registry)
+            .context("create VM from TOML configuration")
     }
 
     /// Start a VM by ID.

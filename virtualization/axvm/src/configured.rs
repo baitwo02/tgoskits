@@ -97,6 +97,7 @@ pub struct DeviceInstantiationContext {
     serial_profile: Option<crate::machine::GuestSerialProfile>,
     serial_backend_factory: Arc<dyn SerialBackendFactory>,
     host_console_by_default: bool,
+    ivshmem_registry: Option<Arc<IvshmemLinkRegistry>>,
 }
 
 impl DeviceInstantiationContext {
@@ -109,6 +110,7 @@ impl DeviceInstantiationContext {
             serial_profile: None,
             serial_backend_factory: Arc::new(NullSerialBackendFactory),
             host_console_by_default: false,
+            ivshmem_registry: None,
         }
     }
 
@@ -143,6 +145,17 @@ impl DeviceInstantiationContext {
 
     pub fn fixed_bindings(&self) -> &FixedDeviceBindings {
         &self.fixed
+    }
+
+    /// Injects the process-level ivshmem link registry for this VM.
+    pub fn with_ivshmem_registry(mut self, registry: Option<Arc<IvshmemLinkRegistry>>) -> Self {
+        self.ivshmem_registry = registry;
+        self
+    }
+
+    /// Returns the injected ivshmem link registry, if any.
+    pub fn ivshmem_registry(&self) -> Option<Arc<IvshmemLinkRegistry>> {
+        self.ivshmem_registry.clone()
     }
 
     pub fn firmware_binding(&self) -> &DeviceFirmwareBinding {

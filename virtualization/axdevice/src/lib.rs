@@ -35,6 +35,7 @@ mod error;
 mod fw_cfg;
 mod graph;
 mod interrupt;
+mod ivshmem;
 mod model;
 mod pci;
 // Keep the LoongArch-only implementation out of other production targets, but
@@ -69,6 +70,12 @@ pub use graph::{
     ResolvedDeviceNode,
 };
 pub use interrupt::{ControllerRegistration, InterruptRegistrationError};
+pub use ivshmem::{
+    DOORBELL_OFFSET, EVENT_STATUS_OFFSET, ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemError,
+    IvshmemLink, IvshmemLinkRegistry, IvshmemRegisters, LinkId, MAX_PEERS, MAXIMUM_PEERS_OFFSET,
+    PeerAttachment, PeerId, PeerReservation, REGISTER_PAGE_SIZE, SHARED_MEMORY_SIZE, STATE_OFFSET,
+    SharedBarBacking,
+};
 #[cfg(target_arch = "loongarch64")]
 // Reusable LoongArch device models. These are target-gated device packages,
 // not part of the architecture-neutral framework core.

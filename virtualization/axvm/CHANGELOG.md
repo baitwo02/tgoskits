@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add an AArch64 generic ECAM host provider and conditionally emit its FDT node from graph-resolved resources when the topology contains an endpoint.
-- Add an initial `ivshmem-pci` endpoint with a private 64 KiB BAR2 aperture for vPCI integration validation.
+- Add a reservation-backed `ivshmem-pci` endpoint: peers of one `link_id` share a link-owned 64 KiB BAR2 backing, and the register page exposes peer ID, maximum peers, notification control, doorbell, state, and event-status registers with Jailhouse v2-style 32-bit access rules.
+- Add the OS-agnostic `axdevice::ivshmem` link module with an explicitly injected registry, peer reservations and runtime attachments, and deterministic lifecycle tests.
 
 ### Changed
 
-- Complete the `ivshmem-pci` config surface with BAR0 (register block) and BAR1 (MSI-X region) inventory placeholders that read zero, plus the ivshmem revision byte.
+- Require `link_id` and `peer_id` options for `ivshmem-pci` and grow BAR0 from 0x100 to one page (0x1000); every VM-creation path now passes the manager-owned ivshmem link registry explicitly into the config builder.
 - Reserve BDF 00:00.0 on the AArch64 PCI host provider so auto-placed endpoints enumerate from 00:01.0, matching the conventional root-complex slot layout.
 
 ### Fixed

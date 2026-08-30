@@ -1,16 +1,20 @@
-//! Initial configured ivshmem PCI endpoint with one memory BAR.
+//! AxVM adapter for the ivshmem PCI endpoint.
 //!
-//! This model intentionally implements only a private, zero-initialized BAR2
-//! aperture. Shared backing, control registers, peer notification, and MSI-X
-//! remain outside this initial vPCI registration path.
+//! This module converts guest configuration into a reservation-backed PCI
+//! function. Link identity, register semantics, and the shared BAR2 backing
+//! live in `axdevice::ivshmem`; this file only parses options, declares PCI
+//! resources, and routes BAR accesses to the reservation's link.
 
 use std::{
-    sync::{Arc, Mutex},
-    vec::Vec,
+    format,
+    string::ToString,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use axdevice::*;
-use axdevice_base::{Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource};
+use axdevice_base::{
+    AccessWidth, Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource,
+};
 use axvmconfig::VirtualDeviceRequest;
 
 use crate::{ConfiguredDeviceError, ConfiguredModelRegistration, DeviceInstantiationContext};
@@ -24,16 +28,15 @@ const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 /// here with a unit-test assertion; re-verify against the pinned QEMU and
 /// Jailhouse revisions before claiming interop with real ivshmem drivers.
 const IVSHMEM_REVISION: u8 = 1;
-/// BAR0 hosts the control register block and BAR1 the MSI-X region. Both are
-/// declared so guests enumerate the full BAR inventory and reserve their
-/// address ranges; the register semantics arrive with the register-model (F2)
-/// and MSI-X (F7) features and read as zero until then.
+/// BAR0 is the ivshmem register page. BAR1 stays an inventory placeholder
+/// until the MSI-X feature (F7) defines its table/PBA semantics, and BAR2 is
+/// the shared memory of one link.
 const REGISTER_BAR_INDEX: u8 = 0;
-const REGISTER_BAR_SIZE: u64 = 0x100;
 const MSIX_BAR_INDEX: u8 = 1;
 const MSIX_BAR_SIZE: u64 = 0x100;
 const SHARED_MEMORY_BAR_INDEX: u8 = 2;
-const SHARED_MEMORY_SIZE: usize = 0x1_0000;
+const REGISTER_ACCESS_WIDTH_DETAIL: &str =
+    "ivshmem BAR0 registers only accept aligned 32-bit accesses";
 
 fn host_key() -> PciHostKey {
     // This module is architecture-neutral while the provider is AArch64-only.
@@ -53,38 +56,63 @@ pub(super) fn register(
     catalog.register(module_path!(), REGISTRATION)
 }
 
-#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IvshmemPciOptions {}
+struct IvshmemPciOptions {
+    /// Shared-link identity; peers of one link must use the same value.
+    link_id: u32,
+    /// Peer slot inside the link; the current profile allows 0 and 1.
+    peer_id: u16,
+}
 
 fn create_device_node(
     id: DeviceNodeId,
     request: &VirtualDeviceRequest,
-    _context: &DeviceInstantiationContext,
+    context: &DeviceInstantiationContext,
 ) -> Result<DeviceNodeSpec, ConfiguredDeviceError> {
-    request
+    let options = request
         .deserialize_options::<IvshmemPciOptions>()
         .map_err(|error| ConfiguredDeviceError::InvalidOptions {
             device: request.id.clone(),
             model: request.model.clone(),
             detail: error.to_string(),
         })?;
+    let registry =
+        context
+            .ivshmem_registry()
+            .ok_or_else(|| ConfiguredDeviceError::Instantiation {
+                device: request.id.clone(),
+                model: request.model.clone(),
+                detail: "no ivshmem link registry was injected into this VM".into(),
+            })?;
+    let reservation = registry
+        .reserve(options.link_id, options.peer_id)
+        .map_err(|error| ConfiguredDeviceError::Instantiation {
+            device: request.id.clone(),
+            model: request.model.clone(),
+            detail: match context.vm_id() {
+                Some(vm_id) => format!("vm {vm_id}: {error}"),
+                None => error.to_string(),
+            },
+        })?;
     Ok(DeviceNodeSpec::virtual_device(
         id,
-        Arc::new(IvshmemPciModel),
+        Arc::new(IvshmemPciModel { reservation }),
     ))
 }
 
-struct IvshmemPciModel;
+struct IvshmemPciModel {
+    reservation: PeerReservation,
+}
 
 impl DeviceModel for IvshmemPciModel {
     fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
         let register_bar =
-            PciMemoryBar::new(PciBarIndex::new(REGISTER_BAR_INDEX)?, REGISTER_BAR_SIZE)?;
+            PciMemoryBar::new(PciBarIndex::new(REGISTER_BAR_INDEX)?, REGISTER_PAGE_SIZE)?;
         let msix_bar = PciMemoryBar::new(PciBarIndex::new(MSIX_BAR_INDEX)?, MSIX_BAR_SIZE)?;
         let shared_memory_bar = PciMemoryBar::new(
             PciBarIndex::new(SHARED_MEMORY_BAR_INDEX)?,
-            SHARED_MEMORY_SIZE as u64,
+            self.reservation.link().bar2_size(),
         )?;
         let function = PciFunctionRequirement::new(
             host_key(),
@@ -106,7 +134,19 @@ impl DeviceModel for IvshmemPciModel {
     }
 
     fn build(&self, _context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
-        let function = Arc::new(IvshmemPciFunction::new()?);
+        // The reservation survives build retries; only one endpoint may be
+        // attached at a time, and a failed bundle drops its attachment.
+        let attachment =
+            self.reservation
+                .attach()
+                .map_err(|error| DeviceManagerError::InvalidState {
+                    operation: "build ivshmem PCI endpoint",
+                    detail: error.to_string(),
+                })?;
+        let function = Arc::new(IvshmemPciFunction {
+            attachment,
+            registers: Mutex::new(IvshmemRegisters::new()),
+        });
         let mut bundle = DeviceBundle::new();
         bundle.add_pci_function(function)?;
         Ok(bundle)
@@ -114,61 +154,38 @@ impl DeviceModel for IvshmemPciModel {
 }
 
 struct IvshmemPciFunction {
-    bytes: Mutex<Box<[u8]>>,
+    attachment: PeerAttachment,
+    registers: Mutex<IvshmemRegisters>,
 }
 
 impl IvshmemPciFunction {
-    fn new() -> DeviceManagerResult<Self> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(SHARED_MEMORY_SIZE).map_err(|_| {
-            DeviceManagerError::OutOfMemory {
-                operation: "allocate initial ivshmem BAR2 backing",
-            }
-        })?;
-        bytes.resize(SHARED_MEMORY_SIZE, 0);
-        Ok(Self {
-            bytes: Mutex::new(bytes.into_boxed_slice()),
-        })
+    fn lock_registers(
+        &self,
+        operation: &'static str,
+    ) -> DeviceResult<MutexGuard<'_, IvshmemRegisters>> {
+        self.registers
+            .lock()
+            .map_err(|_| DeviceError::InvalidState {
+                operation,
+                detail: "ivshmem register lock is poisoned".into(),
+            })
     }
+}
 
-    fn access_range(access: PciBarAccess) -> DeviceResult<core::ops::Range<usize>> {
-        if access.bar().value() != SHARED_MEMORY_BAR_INDEX {
-            return Err(DeviceError::OutOfRange {
-                addr: access.offset(),
-            });
+fn bar_access_error(error: IvshmemError) -> DeviceError {
+    match error {
+        IvshmemError::SharedMemoryOutOfRange { offset, .. } => {
+            DeviceError::OutOfRange { addr: offset }
         }
-        let start = usize::try_from(access.offset()).map_err(|_| DeviceError::OutOfRange {
-            addr: access.offset(),
-        })?;
-        let end = start
-            .checked_add(access.width().size())
-            .filter(|end| *end <= SHARED_MEMORY_SIZE)
-            .ok_or(DeviceError::OutOfRange {
-                addr: access.offset(),
-            })?;
-        Ok(start..end)
-    }
-
-    fn read_shared_memory(&self, access: PciBarAccess) -> DeviceResult<u64> {
-        let range = Self::access_range(access)?;
-        let bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
-            operation: "read ivshmem BAR2",
-            detail: "BAR backing lock is poisoned".into(),
-        })?;
-        let mut value = [0u8; 8];
-        value[..range.len()].copy_from_slice(&bytes[range]);
-        Ok(u64::from_le_bytes(value))
-    }
-
-    fn write_shared_memory(&self, access: PciBarAccess, value: u64) -> DeviceResult {
-        let range = Self::access_range(access)?;
-        let width = range.len();
-        let mut bytes = self.bytes.lock().map_err(|_| DeviceError::InvalidState {
-            operation: "write ivshmem BAR2",
-            detail: "BAR backing lock is poisoned".into(),
-        })?;
-        bytes[range].copy_from_slice(&value.to_le_bytes()[..width]);
-        Ok(())
+        IvshmemError::InvalidRegisterAccess { .. }
+        | IvshmemError::InvalidSharedMemoryWidth { .. } => DeviceError::InvalidInput {
+            operation: "access ivshmem BARs",
+            detail: error.to_string(),
+        },
+        other => DeviceError::InvalidState {
+            operation: "access ivshmem endpoint",
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -184,7 +201,7 @@ impl Device for IvshmemPciFunction {
     fn read(&self, _access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
         Err(DeviceError::Unsupported {
             operation: "access ivshmem PCI endpoint",
-            detail: "direct access is routed through BAR2".into(),
+            detail: "direct access is routed through the BARs".into(),
         })
     }
 
@@ -196,7 +213,7 @@ impl Device for IvshmemPciFunction {
     ) -> DeviceResult {
         Err(DeviceError::Unsupported {
             operation: "access ivshmem PCI endpoint",
-            detail: "direct access is routed through BAR2".into(),
+            detail: "direct access is routed through the BARs".into(),
         })
     }
 }
@@ -208,12 +225,30 @@ impl PciFunction for IvshmemPciFunction {
         _context: &mut dyn DeviceContext,
     ) -> DeviceResult<u64> {
         match access.bar().value() {
-            // BAR0/BAR1 are declared inventory placeholders until the
-            // register-model (F2) and MSI-X (F7) features define their
+            REGISTER_BAR_INDEX => {
+                if access.width() != AccessWidth::Dword {
+                    return Err(DeviceError::InvalidInput {
+                        operation: "read ivshmem BAR0 registers",
+                        detail: REGISTER_ACCESS_WIDTH_DETAIL.into(),
+                    });
+                }
+                let link = self.attachment.link();
+                let registers = self.lock_registers("read ivshmem BAR0 registers")?;
+                registers
+                    .read(access.offset(), self.attachment.peer_id(), link.max_peers())
+                    .map(u64::from)
+                    .map_err(bar_access_error)
+            }
+            // BAR1 is an inventory placeholder until MSI-X (F7) defines its
             // semantics; reads stay zero so guest probes observe a defined
             // value instead of a routing error.
-            REGISTER_BAR_INDEX | MSIX_BAR_INDEX => Ok(0),
-            SHARED_MEMORY_BAR_INDEX => self.read_shared_memory(access),
+            MSIX_BAR_INDEX => Ok(0),
+            SHARED_MEMORY_BAR_INDEX => self
+                .attachment
+                .link()
+                .backing()
+                .read(access.offset(), access.width().size())
+                .map_err(bar_access_error),
             _ => Err(DeviceError::OutOfRange {
                 addr: access.offset(),
             }),
@@ -227,25 +262,53 @@ impl PciFunction for IvshmemPciFunction {
         _context: &mut dyn DeviceContext,
     ) -> DeviceResult {
         match access.bar().value() {
-            REGISTER_BAR_INDEX | MSIX_BAR_INDEX => Ok(()),
-            SHARED_MEMORY_BAR_INDEX => self.write_shared_memory(access, value),
+            REGISTER_BAR_INDEX => {
+                if access.width() != AccessWidth::Dword {
+                    return Err(DeviceError::InvalidInput {
+                        operation: "write ivshmem BAR0 registers",
+                        detail: REGISTER_ACCESS_WIDTH_DETAIL.into(),
+                    });
+                }
+                let value = u32::try_from(value).map_err(|_| DeviceError::InvalidInput {
+                    operation: "write ivshmem BAR0 registers",
+                    detail: REGISTER_ACCESS_WIDTH_DETAIL.into(),
+                })?;
+                let mut registers = self.lock_registers("write ivshmem BAR0 registers")?;
+                registers
+                    .write(access.offset(), value)
+                    .map_err(bar_access_error)
+            }
+            MSIX_BAR_INDEX => Ok(()),
+            SHARED_MEMORY_BAR_INDEX => self
+                .attachment
+                .link()
+                .backing()
+                .write(access.offset(), access.width().size(), value)
+                .map_err(bar_access_error),
             _ => Err(DeviceError::OutOfRange {
                 addr: access.offset(),
             }),
         }
     }
+
+    fn reset(&self) -> DeviceResult {
+        // Endpoint reset clears only local registers; the shared BAR2 backing
+        // stays intact for the other peer.
+        self.lock_registers("reset ivshmem endpoint")?.reset();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use axdevice_base::AccessWidth;
+    use axvmconfig::VirtualDeviceRequest;
 
     use super::*;
 
     const APERTURE_BASE: u64 = 0x0c00_0000;
     const APERTURE_SIZE: u64 = 0x0400_0000;
+    const TEST_OFFSET: u64 = 0x120;
+    const TEST_VALUE: u64 = 0x4956_5348_4d45_4d31;
 
     fn id(value: &str) -> DeviceNodeId {
         DeviceNodeId::new(value).unwrap()
@@ -255,9 +318,36 @@ mod tests {
         ResourceSlot::new(value).unwrap()
     }
 
+    fn request(id: &str, link_id: u32, peer_id: u16) -> VirtualDeviceRequest {
+        let mut options = toml::Table::new();
+        options.insert("link_id".into(), toml::Value::Integer(link_id.into()));
+        options.insert("peer_id".into(), toml::Value::Integer(peer_id.into()));
+        VirtualDeviceRequest {
+            id: id.into(),
+            model: MODEL.into(),
+            options,
+        }
+    }
+
+    fn registered_catalog() -> crate::ConfiguredDeviceCatalog {
+        let mut catalog = crate::ConfiguredDeviceCatalog::new();
+        register(&mut catalog).unwrap();
+        catalog
+    }
+
+    fn model_for(
+        registry: &Arc<IvshmemLinkRegistry>,
+        link_id: u32,
+        peer_id: u16,
+    ) -> IvshmemPciModel {
+        let reservation = registry.reserve(link_id, peer_id).unwrap();
+        IvshmemPciModel { reservation }
+    }
+
     #[test]
     fn requirements_declare_the_full_bar_inventory() {
-        let requirements = IvshmemPciModel.requirements().unwrap();
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let requirements = model_for(&registry, 7, 1).requirements().unwrap();
         let function = requirements.pci_function().unwrap();
         let expected = PciFunctionRequirement::new(
             host_key(),
@@ -271,7 +361,7 @@ mod tests {
         .with_bar(
             PciMemoryBar::new(
                 PciBarIndex::new(REGISTER_BAR_INDEX).unwrap(),
-                REGISTER_BAR_SIZE,
+                REGISTER_PAGE_SIZE,
             )
             .unwrap(),
         )
@@ -283,7 +373,7 @@ mod tests {
         .with_bar(
             PciMemoryBar::new(
                 PciBarIndex::new(SHARED_MEMORY_BAR_INDEX).unwrap(),
-                SHARED_MEMORY_SIZE as u64,
+                SHARED_MEMORY_SIZE,
             )
             .unwrap(),
         )
@@ -292,11 +382,85 @@ mod tests {
     }
 
     #[test]
-    fn backing_is_zeroed_per_endpoint() {
-        let first = IvshmemPciFunction::new().unwrap();
-        let second = IvshmemPciFunction::new().unwrap();
-        first.bytes.lock().unwrap()[0] = 0xa5;
-        assert_eq!(second.bytes.lock().unwrap()[0], 0);
+    fn options_require_link_and_peer_identity() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let catalog = registered_catalog();
+        let context =
+            DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
+
+        let Err(missing) = catalog.instantiate_node(
+            &VirtualDeviceRequest {
+                id: "ivshmem0".into(),
+                model: MODEL.into(),
+                options: Default::default(),
+            },
+            &context,
+        ) else {
+            panic!("empty options must be rejected");
+        };
+        assert!(matches!(
+            missing,
+            ConfiguredDeviceError::InvalidOptions { .. }
+        ));
+
+        let mut unknown_options = request("ignored", 1, 0).options;
+        unknown_options.insert("peer_count".into(), toml::Value::Integer(2));
+        let Err(unknown) = catalog.instantiate_node(
+            &VirtualDeviceRequest {
+                id: "ivshmem0".into(),
+                model: MODEL.into(),
+                options: unknown_options,
+            },
+            &context,
+        ) else {
+            panic!("unknown option keys must be rejected");
+        };
+        assert!(matches!(
+            unknown,
+            ConfiguredDeviceError::InvalidOptions { .. }
+        ));
+
+        let Err(out_of_profile) = catalog.instantiate_node(&request("ivshmem0", 1, 2), &context)
+        else {
+            panic!("peer 2 must be rejected by the profile");
+        };
+        let ConfiguredDeviceError::Instantiation { detail, .. } = out_of_profile else {
+            panic!("expected an instantiation error");
+        };
+        assert!(detail.contains("outside the current profile"));
+    }
+
+    #[test]
+    fn duplicate_peer_reservations_fail_the_second_vm() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let catalog = registered_catalog();
+        let context =
+            DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
+        // The first node spec keeps its reservation alive; dropping it would
+        // retire the peer and change the second VM's error.
+        let _first = catalog
+            .instantiate_node(&request("ivshmem0", 1, 0), &context)
+            .unwrap();
+        let Err(error) = catalog.instantiate_node(&request("ivshmem1", 1, 0), &context) else {
+            panic!("a second reservation of the same peer must fail");
+        };
+        let ConfiguredDeviceError::Instantiation { detail, .. } = error else {
+            panic!("expected an instantiation error");
+        };
+        assert!(detail.contains("already reserved"));
+    }
+
+    #[test]
+    fn instantiation_requires_an_injected_registry() {
+        let catalog = registered_catalog();
+        let context = DeviceInstantiationContext::new();
+        let Err(error) = catalog.instantiate_node(&request("ivshmem0", 1, 0), &context) else {
+            panic!("a missing registry must fail instantiation");
+        };
+        let ConfiguredDeviceError::Instantiation { detail, .. } = error else {
+            panic!("expected an instantiation error");
+        };
+        assert!(detail.contains("ivshmem link registry"));
     }
 
     struct HostModel {
@@ -334,8 +498,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn graph_build_routes_private_bar_backing() {
+    struct TestEndpoint {
+        _runtime: DeviceRuntime,
+        binding: Arc<PciRootBinding>,
+        root: Arc<PciRootState>,
+        bdf: PciBdf,
+        register_bar: u64,
+        msix_bar: u64,
+        shared_bar: u64,
+    }
+
+    impl TestEndpoint {
+        fn enable_memory(&self) {
+            // Command register bit 1 is Memory Space Enable.
+            self.root
+                .write_config(
+                    self.bdf,
+                    ConfigOffset::new(4).unwrap(),
+                    AccessWidth::Word,
+                    2,
+                )
+                .unwrap();
+        }
+
+        fn read_register(&self, offset: u64, width: AccessWidth) -> DeviceResult<u64> {
+            self.binding.read_bar(self.register_bar + offset, width)
+        }
+
+        fn write_register(&self, offset: u64, value: u32) -> DeviceResult {
+            self.binding.write_bar(
+                self.register_bar + offset,
+                AccessWidth::Dword,
+                u64::from(value),
+            )
+        }
+    }
+
+    fn build_endpoint(node_id: &str, model: IvshmemPciModel) -> TestEndpoint {
         let root_slot = Arc::new(Mutex::new(None));
         let provider = PciHostProvider::new(
             host_key(),
@@ -350,10 +549,7 @@ mod tests {
         let mut builder = DeviceGraphBuilder::new();
         builder.register_pci_host(provider).unwrap();
         builder
-            .add(DeviceNodeSpec::virtual_device(
-                id("ivshmem0"),
-                Arc::new(IvshmemPciModel),
-            ))
+            .add(DeviceNodeSpec::virtual_device(id(node_id), Arc::new(model)))
             .unwrap();
         let mut pools = ResourcePools::new();
         pools
@@ -367,72 +563,196 @@ mod tests {
                 .unwrap();
         }
         let runtime = runtime_builder.finish(graph.resource_plan()).unwrap();
-        let root = root_slot.lock().unwrap().clone().unwrap();
         let binding = runtime
             .services()
             .all::<PciRootBindingKey>()
             .into_iter()
             .next()
             .unwrap();
+        let root = root_slot.lock().unwrap().clone().unwrap();
         let function = graph
             .pci_topology(&host_key())
             .unwrap()
-            .function(&id("ivshmem0"))
+            .function(&id(node_id))
             .unwrap();
-        let bar = function
-            .bar(PciBarIndex::new(SHARED_MEMORY_BAR_INDEX).unwrap())
-            .unwrap();
-        let register_bar = function
-            .bar(PciBarIndex::new(REGISTER_BAR_INDEX).unwrap())
-            .unwrap();
-        let msix_bar = function
-            .bar(PciBarIndex::new(MSIX_BAR_INDEX).unwrap())
-            .unwrap();
-        root.write_config(
-            function.bdf(),
-            ConfigOffset::new(4).unwrap(),
-            AccessWidth::Word,
-            2,
-        )
-        .unwrap();
+        let bar = |index: u8| {
+            function
+                .bar(PciBarIndex::new(index).unwrap())
+                .unwrap()
+                .address()
+        };
+        TestEndpoint {
+            _runtime: runtime,
+            binding,
+            root,
+            bdf: function.bdf(),
+            register_bar: bar(REGISTER_BAR_INDEX),
+            msix_bar: bar(MSIX_BAR_INDEX),
+            shared_bar: bar(SHARED_MEMORY_BAR_INDEX),
+        }
+    }
 
-        binding
+    #[test]
+    fn graph_routes_shared_backing_across_two_roots() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Shared BAR2 bytes cross the two roots.
+        peer0
+            .binding
             .write_bar(
-                bar.address() + 0x120,
+                peer0.shared_bar + TEST_OFFSET,
                 AccessWidth::Qword,
-                0x4956_5348_4d45_4d31,
+                TEST_VALUE,
             )
             .unwrap();
         assert_eq!(
-            binding
-                .read_bar(bar.address() + 0x120, AccessWidth::Qword)
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + TEST_OFFSET, AccessWidth::Qword)
                 .unwrap(),
-            0x4956_5348_4d45_4d31
+            TEST_VALUE
         );
 
-        // BAR0/BAR1 are inventory placeholders: reads stay zero and writes
-        // are ignored until the register-model and MSI-X features land.
+        // The register page exposes the link identity, not per-VM values.
         assert_eq!(
-            binding
-                .read_bar(register_bar.address(), AccessWidth::Word)
+            peer0.read_register(ID_OFFSET, AccessWidth::Dword).unwrap(),
+            0
+        );
+        assert_eq!(
+            peer1.read_register(ID_OFFSET, AccessWidth::Dword).unwrap(),
+            1
+        );
+        assert_eq!(
+            peer0
+                .read_register(MAXIMUM_PEERS_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            2
+        );
+
+        // BAR1 stays an inventory placeholder.
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.msix_bar, AccessWidth::Dword)
                 .unwrap(),
             0
         );
-        binding
-            .write_bar(register_bar.address(), AccessWidth::Word, 0xffff)
+
+        // State registers are endpoint-local.
+        peer0.write_register(STATE_OFFSET, 0x1234).unwrap();
+        assert_eq!(
+            peer0
+                .read_register(STATE_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            0x1234
+        );
+        assert_eq!(
+            peer1
+                .read_register(STATE_OFFSET, AccessWidth::Dword)
+                .unwrap(),
+            0
+        );
+
+        // BAR0 rejects widths other than Dword and unaligned offsets.
+        assert!(matches!(
+            peer0.read_register(ID_OFFSET, AccessWidth::Byte),
+            Err(DeviceError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            peer0.read_register(2, AccessWidth::Dword),
+            Err(DeviceError::InvalidInput { .. })
+        ));
+
+        // A different link stays isolated from this one.
+        let other = registry.reserve(2, 0).unwrap();
+        other.link().backing().write(TEST_OFFSET, 8, 0xee).unwrap();
+        assert_eq!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + TEST_OFFSET, AccessWidth::Qword)
+                .unwrap(),
+            TEST_VALUE
+        );
+
+        // Relocating BAR2 keeps the shared backing reachable through the new
+        // route, while the peer keeps its own route to the same bytes.
+        const RELOCATED_BAR2: u64 = 0x0ffe_0000;
+        peer0
+            .root
+            .write_config(
+                peer0.bdf,
+                ConfigOffset::new(0x18).unwrap(),
+                AccessWidth::Dword,
+                RELOCATED_BAR2,
+            )
             .unwrap();
         assert_eq!(
-            binding
-                .read_bar(register_bar.address(), AccessWidth::Word)
+            peer0
+                .root
+                .read_config(
+                    peer0.bdf,
+                    ConfigOffset::new(0x18).unwrap(),
+                    AccessWidth::Dword
+                )
+                .unwrap(),
+            RELOCATED_BAR2
+        );
+        peer0
+            .binding
+            .write_bar(RELOCATED_BAR2 + TEST_OFFSET, AccessWidth::Qword, TEST_VALUE)
+            .unwrap();
+        assert_eq!(
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + TEST_OFFSET, AccessWidth::Qword)
+                .unwrap(),
+            TEST_VALUE
+        );
+        assert!(matches!(
+            peer0
+                .binding
+                .read_bar(peer0.shared_bar + TEST_OFFSET, AccessWidth::Qword),
+            Err(DeviceError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn endpoint_reset_clears_registers_but_not_shared_backing() {
+        let registry = Arc::new(IvshmemLinkRegistry::new());
+        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
+        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        peer0
+            .binding
+            .write_bar(
+                peer0.shared_bar + TEST_OFFSET,
+                AccessWidth::Qword,
+                TEST_VALUE,
+            )
+            .unwrap();
+        peer0.write_register(STATE_OFFSET, 0x99).unwrap();
+
+        peer0.binding.reset().unwrap();
+        peer0.enable_memory();
+        assert_eq!(
+            peer0
+                .read_register(STATE_OFFSET, AccessWidth::Dword)
                 .unwrap(),
             0
         );
-
-        // The declared BARs place contiguously, so the first unrouted byte
-        // is one past the end of the highest declared BAR (BAR1).
+        // The peer keeps observing the shared backing after the reset.
         assert_eq!(
-            binding.read_bar(msix_bar.address() + MSIX_BAR_SIZE, AccessWidth::Byte),
-            Err(DeviceError::NotFound)
+            peer1
+                .binding
+                .read_bar(peer1.shared_bar + TEST_OFFSET, AccessWidth::Qword)
+                .unwrap(),
+            TEST_VALUE
         );
     }
 }

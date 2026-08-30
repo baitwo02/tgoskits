@@ -35,3 +35,5 @@ disabled = [
 [[devices.virtual]]
 id = "ivshmem0"
 model = "ivshmem-pci"
+link_id = 1
+peer_id = 0

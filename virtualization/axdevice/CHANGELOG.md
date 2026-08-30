@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add architecture-neutral ECAM, memory-aperture, and root lifecycle frontends for graph-resolved PCI hosts.
 - Add fixed versus relocatable 32-bit BAR decode policies and preserve prefetchable attributes across probes, partial writes, and reset.
 - Model Memory Space Enable, Bus Master Enable, and INTx Disable command state through an out-of-lock effect boundary.
+- Add the OS-agnostic `ivshmem` link module: typed link/peer identities, a process-level link registry with reservations and runtime attachments, the BAR0 register page, and the byte-copying shared BAR2 backing.
 
 ### Fixed
 
