@@ -33,7 +33,7 @@ pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{
-    EndpointRouteToken, PciBarAccess, PciFunction, PciRootBinding, PciRootBindingKey,
+    BarAssignment, EndpointRouteToken, PciBarAccess, PciFunction, PciRootBinding, PciRootBindingKey,
 };
 pub(crate) use topology::PciTopologyBuilder;
 pub use topology::{ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology};

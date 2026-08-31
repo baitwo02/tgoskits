@@ -1,6 +1,6 @@
 //! Runtime-authenticated PCI endpoint binding and BAR dispatch.
 
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 use ax_sync::SpinLock;
 use axdevice_base::{
@@ -9,8 +9,8 @@ use axdevice_base::{
 
 use super::{PciBarIndex, PciBarRoute, PciBdf, PciRootState};
 use crate::{
-    AccessWidth, DeviceManagerError, DeviceManagerResult, DeviceNodeId, ServiceCardinality,
-    ServiceKey,
+    AccessWidth, DeviceManagerError, DeviceManagerResult, DeviceNodeId, DirectMapping,
+    ServiceCardinality, ServiceKey,
 };
 
 /// Metadata passed to one endpoint BAR callback.
@@ -52,6 +52,36 @@ impl PciBarAccess {
 /// must extend that seam in its own design together with a
 /// grant-through-BAR-callback regression test. The route token itself never
 /// carries or mints capabilities.
+/// One resolved BAR handed to an endpoint at bind time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BarAssignment {
+    bar: PciBarIndex,
+    gpa: u64,
+    size: u64,
+}
+
+impl BarAssignment {
+    /// Assembles one assignment from the resolved BAR plan.
+    pub const fn new(bar: PciBarIndex, gpa: u64, size: u64) -> Self {
+        Self { bar, gpa, size }
+    }
+
+    /// Returns the BAR slot.
+    pub const fn bar(self) -> PciBarIndex {
+        self.bar
+    }
+
+    /// Returns the assigned guest-physical address.
+    pub const fn gpa(self) -> u64 {
+        self.gpa
+    }
+
+    /// Returns the fixed BAR size in bytes.
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+}
+
 pub trait PciFunction: Device {
     /// Reads one complete memory BAR access.
     fn read_bar(&self, access: PciBarAccess, context: &mut dyn DeviceContext) -> DeviceResult<u64>;
@@ -62,6 +92,44 @@ pub trait PciFunction: Device {
         value: u64,
         context: &mut dyn DeviceContext,
     ) -> DeviceResult;
+
+    /// Called once by the PCI root binding with the resolved BAR table.
+    ///
+    /// Endpoints that map BAR ranges directly into the guest stage-2 must
+    /// override this, derive their per-section mappings, and expose them via
+    /// [`direct_mappings`](Self::direct_mappings).
+    ///
+    /// # Errors
+    ///
+    /// A failing endpoint rolls the bind back.
+    fn notify_bar_assignment(&self, bars: &[BarAssignment]) -> DeviceResult {
+        let _ = bars;
+        Ok(())
+    }
+
+    /// Called after the root accepted a guest BAR relocation.
+    ///
+    /// Endpoints with direct mappings must re-derive their plan and resubmit
+    /// it through the stage-2 update port. BAR probe writes never trigger
+    /// this notification. The root state lock is not held, so
+    /// implementations may take the stage-2 update lock.
+    ///
+    /// # Errors
+    ///
+    /// A failure is logged by the root; the guest relocation itself stands.
+    fn notify_bar_relocated(&self, bar: PciBarIndex, new_gpa: u64) -> DeviceResult {
+        let _ = (bar, new_gpa);
+        Ok(())
+    }
+
+    /// Returns the direct stage-2 mappings this endpoint currently maintains.
+    ///
+    /// The runtime aggregates these per graph node for the guest
+    /// address-space build; endpoints without direct mappings use the
+    /// default.
+    fn direct_mappings(&self) -> Vec<DirectMapping> {
+        Vec::new()
+    }
 
     /// Restores endpoint-owned transport state after root state is recovered.
     ///
@@ -198,15 +266,71 @@ impl PciRootBinding {
         device: DeviceId,
         function: Arc<dyn PciFunction>,
     ) -> DeviceManagerResult<PciBindingLease> {
-        let token = self.router.activate(device, function)?;
+        self.ensure_relocation_observer();
+        let token = self.router.activate(device, function.clone())?;
         if let Err(error) = self.root.bind_endpoint(function_id, token) {
             drop(self.router.invalidate(token));
+            return Err(error.into());
+        }
+        // Direct-mapped BAR support: hand the resolved BAR table to the
+        // endpoint before the lease is returned; a failing endpoint rolls
+        // the whole bind back.
+        let assignments = self.bar_assignments(function_id);
+        if let Err(error) = function.notify_bar_assignment(&assignments) {
+            drop(self.router.invalidate(token));
+            self.root.unbind_endpoint(token);
             return Err(error.into());
         }
         Ok(PciBindingLease {
             binding: self.clone(),
             token,
         })
+    }
+
+    /// Collects the resolved BAR table of one bound function.
+    pub(crate) fn bar_assignments(&self, function_id: &DeviceNodeId) -> Vec<BarAssignment> {
+        self.root
+            .topology()
+            .function(function_id)
+            .map(|function| {
+                function
+                    .bars()
+                    .iter()
+                    .map(|bar| BarAssignment::new(bar.index, bar.address, bar.size))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Installs the root's relocation observer once, on the first bind.
+    ///
+    /// Relocations are dispatched to bound endpoints from outside the root
+    /// state lock, so the dispatch may take the stage-2 update lock.
+    fn ensure_relocation_observer(self: &Arc<Self>) {
+        if self.root.relocation_observer_installed() {
+            return;
+        }
+        let binding = Arc::downgrade(self);
+        self.root.set_bar_relocation_observer(Arc::new(
+            move |bdf: PciBdf, bar: PciBarIndex, gpa: u64| {
+                let Some(binding) = binding.upgrade() else {
+                    return;
+                };
+                binding.dispatch_relocation(bdf, bar, gpa);
+            },
+        ));
+    }
+
+    fn dispatch_relocation(&self, bdf: PciBdf, bar: PciBarIndex, gpa: u64) {
+        let Some(token) = self.root.bound_token(bdf) else {
+            return;
+        };
+        let Ok(endpoint) = self.router.endpoint(token) else {
+            return;
+        };
+        if let Err(error) = endpoint.notify_bar_relocated(bar, gpa) {
+            log::error!("PCI endpoint relocation notification failed: {error}");
+        }
     }
 
     /// Dispatches a BAR read after root lookup and token validation.

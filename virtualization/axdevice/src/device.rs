@@ -155,6 +155,9 @@ pub struct DeviceRuntime {
     services: DeviceServices,
     /// Planned controller, endpoint, and lease state.
     planned: PlannedRuntimeResources,
+    /// Direct stage-2 mappings contributed by PCI endpoints, tagged with the
+    /// owning graph node for per-owner replacement and fault diagnostics.
+    direct_mappings: Vec<(DeviceNodeId, DirectMapping)>,
     /// Devices explicitly granted access to guest memory during a routed access.
     ///
     /// The grant is intentionally narrow: the VM supplies a guest-memory port
@@ -303,6 +306,7 @@ impl DeviceContext for RuntimeDeviceContext<'_, '_> {
 impl DeviceRuntime {
     pub(crate) fn empty() -> Self {
         Self {
+            direct_mappings: Vec::new(),
             devices: Vec::new(),
             mmio_index: BTreeMap::new(),
             port_index: BTreeMap::new(),
@@ -332,6 +336,11 @@ impl DeviceRuntime {
     }
 
     /// Freezes this runtime topology after VM preparation.
+    /// Returns the direct stage-2 mappings contributed by PCI endpoints.
+    pub fn direct_mappings(&self) -> &[(DeviceNodeId, DirectMapping)] {
+        &self.direct_mappings
+    }
+
     pub(crate) fn seal(&mut self) {
         self.sealed = true;
     }
@@ -569,7 +578,21 @@ impl DeviceRuntime {
                     }
                 })?;
                 let device = DeviceId::new((self.devices.len() + function.device_index) as u32);
-                Some(binding.bind(&endpoint.function_node, device, function.function.clone())?)
+                let function_object = Arc::clone(&function.function);
+                let lease = binding.bind(
+                    &endpoint.function_node,
+                    device,
+                    Arc::clone(&function.function),
+                )?;
+                // Direct-mapped BAR support: hand the resolved BAR table to
+                // the endpoint and aggregate the mappings it derives for the
+                // guest address-space build.
+                let assignments = binding.bar_assignments(&endpoint.function_node);
+                function_object.notify_bar_assignment(&assignments)?;
+                for mapping in function_object.direct_mappings() {
+                    self.direct_mappings.push((node.id().clone(), mapping));
+                }
+                Some(lease)
             }
             (Some(_), None) => {
                 return Err(DeviceManagerError::InvalidConfig {

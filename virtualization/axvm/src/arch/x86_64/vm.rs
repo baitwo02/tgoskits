@@ -52,7 +52,17 @@ impl X86_64Arch {
             let interrupt_controller = devices
                 .devices()
                 .interrupt_controller(axdevice_base::InterruptControllerId::new(0))?;
-            resources.prepare_guest_address_space(vm.id(), config, &ARCH_OWNED_REGIONS)?;
+            resources.prepare_guest_address_space(
+                vm.id(),
+                config,
+                &ARCH_OWNED_REGIONS,
+                &devices
+                    .devices()
+                    .direct_mappings()
+                    .iter()
+                    .map(|(_, mapping)| *mapping)
+                    .collect::<Vec<_>>(),
+            )?;
             resources.map_arch_address_space()?;
             let intercepted_ports = resources.resolved_port_intercepts()?;
             let intercepted_mmio = resources.resolved_mmio_intercepts()?;
@@ -212,6 +222,7 @@ impl AxVMResources {
         if x86_requires_apic_access_page()? {
             let gpa = x86_apic_access_page_gpa()?;
             self.address_space
+                .lock()
                 .map_linear(
                     gpa,
                     x86_apic_access_page_addr()?,

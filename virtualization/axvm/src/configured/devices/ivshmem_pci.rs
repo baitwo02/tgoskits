@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use ax_std::os::arceos::sync::IrqSafeMutex;
 use axdevice::*;
 use axdevice_base::{
     AccessWidth, Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource,
@@ -133,7 +134,7 @@ impl DeviceModel for IvshmemPciModel {
         DeviceFirmwareSpec::None
     }
 
-    fn build(&self, _context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
+    fn build(&self, context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
         // The reservation survives build retries; only one endpoint may be
         // attached at a time, and a failed bundle drops its attachment.
         let attachment =
@@ -143,10 +144,22 @@ impl DeviceModel for IvshmemPciModel {
                     operation: "build ivshmem PCI endpoint",
                     detail: error.to_string(),
                 })?;
+        // BAR2 maps directly into the guest stage-2, so this endpoint needs
+        // the VM's update port.
+        let stage2_remap =
+            context
+                .stage2_remap()
+                .ok_or_else(|| DeviceManagerError::InvalidConfig {
+                    operation: "build ivshmem PCI endpoint",
+                    detail: "no stage-2 update port was injected into this VM".into(),
+                })?;
         let registers = Arc::new(Mutex::new(IvshmemRegisters::new()));
         let function = IvshmemPciFunction {
             attachment,
             registers: Arc::clone(&registers),
+            stage2_remap,
+            owner: context.node_id(),
+            direct_plan: IrqSafeMutex::new(None),
         };
         // The sink shares the endpoint's register lock, so events routed by
         // the link land in exactly the registers BAR0 exposes.
@@ -167,6 +180,14 @@ impl DeviceModel for IvshmemPciModel {
 struct IvshmemPciFunction {
     attachment: PeerAttachment,
     registers: Arc<Mutex<IvshmemRegisters>>,
+    /// Stage-2 update port; BAR2 maps directly into the guest.
+    stage2_remap: Arc<dyn Stage2Remap>,
+    /// Graph node identity of this endpoint; direct mappings register per
+    /// owner.
+    owner: DeviceNodeId,
+    /// Currently committed BAR2 plan, replaced on every BAR assignment or
+    /// relocation.
+    direct_plan: IrqSafeMutex<Option<IvshmemDirectPlan>>,
 }
 
 /// The endpoint's event sink: doorbells routed by the link record the event
@@ -225,6 +246,53 @@ impl IvshmemPciFunction {
         self.attachment
             .link()
             .deliver_doorbell(self.attachment.peer_id(), doorbell);
+    }
+
+    /// Derives this peer's BAR2 direct-mapping plan from the resolved BAR2
+    /// GPA.
+    ///
+    /// The plan splits BAR2 by F5 sections: the state table maps read-only,
+    /// the peer's own output read-write, other peers' outputs read-only, and
+    /// the reserved tail stays unmapped so stray accesses fault.
+    fn derive_plan(&self, bar2_gpa: u64) -> DeviceResult<IvshmemDirectPlan> {
+        IvshmemDirectPlan::derive(
+            self.attachment.link().layout(),
+            bar2_gpa,
+            self.attachment.link().backing().allocation(),
+            self.attachment.peer_id(),
+        )
+        .map_err(|error| DeviceError::InvalidState {
+            operation: "derive ivshmem direct-mapping plan",
+            detail: error.to_string(),
+        })
+    }
+}
+
+impl IvshmemPciFunction {
+    /// Submits one BAR2 plan through the stage-2 port and records it.
+    ///
+    /// A relocation to a different BAR2 GPA revokes the old whole-BAR2
+    /// range; re-writing the same GPA is a no-op because the committed
+    /// mappings are identical.
+    fn replace_direct_plan(&self, new_plan: IvshmemDirectPlan) -> DeviceResult {
+        let previous = self.direct_plan.lock().take();
+        let same_base = previous
+            .as_ref()
+            .is_some_and(|plan| plan.bar2_gpa() == new_plan.bar2_gpa());
+        if !same_base {
+            let revoke = previous
+                .iter()
+                .map(|plan| plan.revocation_range())
+                .collect::<Vec<_>>();
+            self.stage2_remap
+                .update(&self.owner, &revoke, new_plan.mappings())
+                .map_err(|error| DeviceError::Backend {
+                    operation: "commit ivshmem direct mappings",
+                    detail: error.to_string(),
+                })?;
+        }
+        *self.direct_plan.lock() = Some(new_plan);
+        Ok(())
     }
 }
 
@@ -291,6 +359,38 @@ impl Device for IvshmemPciFunction {
 }
 
 impl PciFunction for IvshmemPciFunction {
+    fn notify_bar_assignment(&self, bars: &[BarAssignment]) -> DeviceResult {
+        let Some(assignment) = bars
+            .iter()
+            .find(|bar| bar.bar().value() == SHARED_MEMORY_BAR_INDEX)
+        else {
+            return Err(DeviceError::InvalidState {
+                operation: "bind ivshmem PCI endpoint",
+                detail: "the shared-memory BAR was not resolved".into(),
+            });
+        };
+        let plan = self.derive_plan(assignment.gpa())?;
+        self.replace_direct_plan(plan)
+    }
+
+    fn notify_bar_relocated(&self, bar: PciBarIndex, new_gpa: u64) -> DeviceResult {
+        if bar.value() != SHARED_MEMORY_BAR_INDEX {
+            // Only BAR2 leaves the emulated path; other relocations do not
+            // affect this endpoint's mappings.
+            return Ok(());
+        }
+        let plan = self.derive_plan(new_gpa)?;
+        self.replace_direct_plan(plan)
+    }
+
+    fn direct_mappings(&self) -> Vec<DirectMapping> {
+        self.direct_plan
+            .lock()
+            .as_ref()
+            .map(|plan| plan.mappings().to_vec())
+            .unwrap_or_default()
+    }
+
     fn read_bar(
         &self,
         access: PciBarAccess,
@@ -421,7 +521,7 @@ impl PciFunction for IvshmemPciFunction {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::Layout;
+    use std::{alloc::Layout, collections::BTreeMap};
 
     use axdevice::{BackingAllocation, SharedBackingAllocator};
     use axvmconfig::VirtualDeviceRequest;
@@ -463,6 +563,45 @@ mod tests {
 
     fn test_registry() -> Arc<IvshmemLinkRegistry> {
         Arc::new(IvshmemLinkRegistry::new(Arc::new(TestBackingAllocator)))
+    }
+
+    /// In-memory stage-2 port for adapter tests: mappings are recorded, and
+    /// per-owner commits replace each other without touching page tables.
+    #[derive(Default)]
+    struct TestStage2Remap {
+        committed: Mutex<BTreeMap<DeviceNodeId, Vec<DirectMapping>>>,
+    }
+
+    impl Stage2Remap for TestStage2Remap {
+        fn update(
+            &self,
+            owner: &DeviceNodeId,
+            _revoke: &[GpaRange],
+            commit: &[DirectMapping],
+        ) -> Result<(), DeviceError> {
+            self.committed
+                .lock()
+                .unwrap()
+                .insert(owner.clone(), commit.to_vec());
+            Ok(())
+        }
+
+        fn diagnose(&self, gpa: u64) -> Option<DirectMappingFault> {
+            let committed = self.committed.lock().unwrap();
+            for (owner, mappings) in committed.iter() {
+                for mapping in mappings {
+                    let start = mapping.gpa_base();
+                    if gpa >= start && gpa < start + mapping.size() {
+                        return Some(DirectMappingFault::new(
+                            owner.clone(),
+                            mapping.label(),
+                            mapping.writable(),
+                        ));
+                    }
+                }
+            }
+            None
+        }
     }
 
     const APERTURE_BASE: u64 = 0x0c00_0000;
@@ -666,6 +805,7 @@ mod tests {
         // holding the graph here mirrors that ownership.
         _graph: ResolvedDeviceGraph,
         _runtime: DeviceRuntime,
+        stage2: Arc<TestStage2Remap>,
         binding: Arc<PciRootBinding>,
         root: Arc<PciRootState>,
         bdf: PciBdf,
@@ -700,7 +840,11 @@ mod tests {
         }
     }
 
-    fn build_endpoint(node_id: &str, model: IvshmemPciModel) -> TestEndpoint {
+    fn build_endpoint(
+        node_id: &str,
+        model: IvshmemPciModel,
+        stage2: Arc<TestStage2Remap>,
+    ) -> TestEndpoint {
         let root_slot = Arc::new(Mutex::new(None));
         let provider = PciHostProvider::new(
             host_key(),
@@ -722,7 +866,9 @@ mod tests {
             .add_auto_mmio(APERTURE_BASE..APERTURE_BASE + APERTURE_SIZE)
             .unwrap();
         let graph = builder.declare().unwrap().resolve(pools).unwrap();
-        let mut runtime_builder = DeviceRuntimeBuilder::new(RuntimeAccessPorts::new());
+        let stage2_trait: Arc<dyn Stage2Remap> = Arc::clone(&stage2) as _;
+        let mut runtime_builder =
+            DeviceRuntimeBuilder::new(RuntimeAccessPorts::new()).with_stage2_remap(stage2_trait);
         for node in graph.nodes() {
             runtime_builder
                 .build_graph_node(node, graph.resource_plan())
@@ -759,14 +905,25 @@ mod tests {
             register_bar,
             msix_bar,
             shared_bar,
+            stage2,
         }
     }
 
     #[test]
     fn graph_routes_shared_backing_across_two_roots() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -893,8 +1050,18 @@ mod tests {
     #[test]
     fn endpoint_reset_clears_registers_but_not_shared_backing() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -939,8 +1106,18 @@ mod tests {
     #[test]
     fn doorbell_sets_only_the_target_event_status() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -969,8 +1146,18 @@ mod tests {
     #[test]
     fn doorbell_ignores_inactive_targets_and_unsupported_vectors() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -996,8 +1183,18 @@ mod tests {
     #[test]
     fn doorbell_leaves_other_registers_and_shared_bytes_untouched() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -1040,10 +1237,82 @@ mod tests {
     }
 
     #[test]
+    fn bar2_derives_direct_mappings_for_each_peer_view() {
+        let registry = test_registry();
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
+        peer0.enable_memory();
+        peer1.enable_memory();
+
+        // Each endpoint committed three mappings: the read-only state table,
+        // its own writable output, and the peer's read-only output.
+        for (endpoint, own_peer) in [(&peer0, 0u16), (&peer1, 1u16)] {
+            let committed = endpoint
+                .stage2
+                .committed
+                .lock()
+                .unwrap()
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(committed.len(), 3);
+            // The state table maps read-only at the resolved BAR2 address.
+            assert_eq!(committed[0].gpa_base(), endpoint.shared_bar);
+            assert!(!committed[0].writable());
+            // The peer's own output maps read-write, the other read-only.
+            assert_eq!(committed[1].writable(), own_peer == 0);
+            assert_eq!(committed[2].writable(), own_peer == 1);
+        }
+        // Both peers map the same backing: identical HPA bases.
+        let hpa0 = peer0
+            .stage2
+            .committed
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .next()
+            .unwrap()
+            .hpa_base();
+        let hpa1 = peer1
+            .stage2
+            .committed
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .next()
+            .unwrap()
+            .hpa_base();
+        assert_eq!(hpa0, hpa1);
+    }
+
+    #[test]
     fn state_writes_propagate_into_the_shared_state_table() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -1103,8 +1372,18 @@ mod tests {
     #[test]
     fn output_section_permissions_follow_the_owner_matrix() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -1171,8 +1450,18 @@ mod tests {
     #[test]
     fn state_table_writes_from_bar2_are_denied() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -1213,8 +1502,18 @@ mod tests {
     #[test]
     fn endpoint_reset_clears_only_the_owning_state_entry() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 
@@ -1255,8 +1554,18 @@ mod tests {
     #[test]
     fn doorbell_reads_stay_zero_and_reset_clears_pending_events() {
         let registry = test_registry();
-        let peer0 = build_endpoint("ivshmem0", model_for(&registry, 1, 0));
-        let peer1 = build_endpoint("ivshmem1", model_for(&registry, 1, 1));
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        let stage2_peer1 = Arc::new(TestStage2Remap::default());
+        let peer1 = build_endpoint(
+            "ivshmem1",
+            model_for(&registry, 1, 1),
+            Arc::clone(&stage2_peer1),
+        );
         peer0.enable_memory();
         peer1.enable_memory();
 

@@ -17,10 +17,15 @@ use super::{
 };
 use crate::{AccessWidth, ConfigOffset};
 
+/// Callback invoked outside the root state lock after one BAR relocation
+/// was accepted: `(bdf, bar index, new GPA)`.
+pub(crate) type BarRelocationObserver = Arc<dyn Fn(PciBdf, PciBarIndex, u64) + Send + Sync>;
+
 /// Shared root state for one frozen PCI topology.
 pub struct PciRootState {
     topology: Arc<ResolvedPciTopology>,
     state: SpinLock<RootState>,
+    bar_relocation_observer: SpinLock<Option<BarRelocationObserver>>,
 }
 
 impl PciRootState {
@@ -39,6 +44,32 @@ impl PciRootState {
                 bindings: BTreeMap::new(),
             }),
             topology,
+            bar_relocation_observer: SpinLock::new(None),
+        }
+    }
+
+    /// Installs the BAR relocation observer (called once by the binding).
+    ///
+    /// The observer fires from outside the root state lock, after a
+    /// relocation has been accepted and applied to the decode route.
+    pub(crate) fn set_bar_relocation_observer(&self, observer: BarRelocationObserver) {
+        *self.bar_relocation_observer.lock_irqsave() = Some(observer);
+    }
+
+    /// Returns whether the relocation observer was installed.
+    pub(crate) fn relocation_observer_installed(&self) -> bool {
+        self.bar_relocation_observer.lock_irqsave().is_some()
+    }
+
+    /// Returns the route token of one bound endpoint, if bound.
+    pub(crate) fn bound_token(&self, bdf: PciBdf) -> Option<EndpointRouteToken> {
+        self.state.lock_irqsave().bindings.get(&bdf).copied()
+    }
+
+    fn dispatch_relocation(&self, bdf: PciBdf, bar: PciBarIndex, gpa: u64) {
+        let observer = self.bar_relocation_observer.lock_irqsave().clone();
+        if let Some(observer) = observer {
+            observer(bdf, bar, gpa);
         }
     }
 
@@ -91,49 +122,61 @@ impl PciRootState {
         value: u64,
     ) -> PciResult {
         let (offset, size) = offset.validate_access(width)?;
-        let mut state = self.state.lock_irqsave();
-        let Some(function_index) = state.function_index(bdf) else {
-            return Ok(());
-        };
-        let command_before = state.functions[function_index].command_state();
-        let Some(action) = state.functions[function_index].prepare_bar_write(offset, size, value)
-        else {
-            state.functions[function_index].write_non_bar(offset, size, value);
-            let command_after = state.functions[function_index].command_state();
-            drop(state);
-            if command_after != command_before {
-                dispatch_command_effect(command_after);
-            }
-            return Ok(());
-        };
-        match action {
-            BarWriteAction::Probe { bar } => state.functions[function_index].apply_probe(bar),
-            BarWriteAction::Relocate { bar, candidate } => {
-                let target = &state.functions[function_index].bars()[bar];
-                let policy = target.decode_policy();
-                let planned = target.planned_address();
-                let bar_index = target.index();
-                let accepted = match policy {
-                    PciBarDecodePolicy::Fixed => {
-                        if candidate != planned {
-                            log::warn!(
-                                "ignoring PCI BAR{bar_index} relocation to {candidate:#x}: fixed \
-                                 policy keeps the planned base {planned:#x}"
-                            );
+        let mut relocated = None;
+        {
+            let mut state = self.state.lock_irqsave();
+            let Some(function_index) = state.function_index(bdf) else {
+                return Ok(());
+            };
+            let command_before = state.functions[function_index].command_state();
+            let Some(action) =
+                state.functions[function_index].prepare_bar_write(offset, size, value)
+            else {
+                state.functions[function_index].write_non_bar(offset, size, value);
+                let command_after = state.functions[function_index].command_state();
+                drop(state);
+                if command_after != command_before {
+                    dispatch_command_effect(command_after);
+                }
+                return Ok(());
+            };
+            match action {
+                BarWriteAction::Probe { bar } => state.functions[function_index].apply_probe(bar),
+                BarWriteAction::Relocate { bar, candidate } => {
+                    let target = &state.functions[function_index].bars()[bar];
+                    let policy = target.decode_policy();
+                    let planned = target.planned_address();
+                    let bar_index = target.index();
+                    let accepted = match policy {
+                        PciBarDecodePolicy::Fixed => {
+                            if candidate != planned {
+                                log::warn!(
+                                    "ignoring PCI BAR{bar_index} relocation to {candidate:#x}: \
+                                     fixed policy keeps the planned base {planned:#x}"
+                                );
+                            }
+                            candidate == planned
                         }
-                        candidate == planned
+                        PciBarDecodePolicy::RelocatableWithinHostAperture => state
+                            .bar_address_available(
+                                self.topology.memory_aperture(),
+                                function_index,
+                                bar,
+                                candidate,
+                            ),
+                    };
+                    state.functions[function_index]
+                        .finish_relocation(bar, accepted.then_some(candidate));
+                    if accepted {
+                        relocated = Some((bdf, bar_index, candidate));
                     }
-                    PciBarDecodePolicy::RelocatableWithinHostAperture => state
-                        .bar_address_available(
-                            self.topology.memory_aperture(),
-                            function_index,
-                            bar,
-                            candidate,
-                        ),
-                };
-                state.functions[function_index]
-                    .finish_relocation(bar, accepted.then_some(candidate));
+                }
             }
+        }
+        // The relocation notification fires outside the root state lock so
+        // endpoint dispatch may take the stage-2 update lock.
+        if let Some((bdf, bar_index, gpa)) = relocated {
+            self.dispatch_relocation(bdf, bar_index, gpa);
         }
         Ok(())
     }

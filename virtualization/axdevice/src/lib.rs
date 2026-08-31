@@ -48,6 +48,7 @@ mod resources;
 mod runtime_resources;
 mod serial;
 mod service;
+mod stage2_remap;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
@@ -72,8 +73,8 @@ pub use graph::{
 pub use interrupt::{ControllerRegistration, InterruptRegistrationError};
 pub use ivshmem::{
     BackingAllocation, Bar2Section, DOORBELL_OFFSET, Doorbell, DoorbellEvent, EVENT_STATUS_OFFSET,
-    ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemError, IvshmemEventSink, IvshmemLink,
-    IvshmemLinkRegistry, IvshmemMemoryLayout, IvshmemRegisters, LinkId, MAX_PEERS,
+    ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemDirectPlan, IvshmemError, IvshmemEventSink,
+    IvshmemLink, IvshmemLinkRegistry, IvshmemMemoryLayout, IvshmemRegisters, LinkId, MAX_PEERS,
     MAXIMUM_PEERS_OFFSET, PeerAttachment, PeerId, PeerReservation, REGISTER_PAGE_SIZE,
     SHARED_MEMORY_SIZE, STATE_OFFSET, SectionDesc, SharedBackingAllocator, SharedBarBacking,
 };
@@ -89,11 +90,12 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, PCI_BUS_ZERO_ECAM_SIZE, PciBarAccess, PciBarDecodePolicy, PciBarIndex,
-    PciBarRoute, PciBdf, PciClass, PciEcamFrontend, PciEndpointIdentity, PciError, PciFunction,
-    PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider, PciMemoryBar,
-    PciMmioApertureDevice, PciResult, PciRootBinding, PciRootBindingKey, PciRootState,
-    PciRootStateLifecycle, PciSegment, ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
+    BarAssignment, ConfigOffset, PCI_BUS_ZERO_ECAM_SIZE, PciBarAccess, PciBarDecodePolicy,
+    PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEcamFrontend, PciEndpointIdentity, PciError,
+    PciFunction, PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider,
+    PciMemoryBar, PciMmioApertureDevice, PciResult, PciRootBinding, PciRootBindingKey,
+    PciRootState, PciRootStateLifecycle, PciSegment, ResolvedPciBar, ResolvedPciFunction,
+    ResolvedPciTopology,
 };
 pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{
@@ -110,6 +112,7 @@ pub use serial::{
     Uart16550, build_16550_mmio, build_16550_port, build_pl011_mmio,
 };
 pub use service::{DeviceServices, ServiceCardinality, ServiceKey};
+pub use stage2_remap::{DirectMapping, DirectMappingFault, GpaRange, Stage2Remap};
 #[cfg(target_arch = "x86_64")]
 // Reusable x86 device models and narrow typed services. These are target-gated
 // device packages, not part of the architecture-neutral framework core.

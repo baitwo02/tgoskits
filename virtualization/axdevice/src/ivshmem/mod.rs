@@ -17,6 +17,7 @@ mod doorbell;
 mod error;
 mod layout;
 mod link;
+mod plan;
 mod registers;
 
 pub use backing::{BackingAllocation, SharedBackingAllocator, SharedBarBacking};
@@ -26,6 +27,7 @@ pub use layout::{Bar2Section, IvshmemMemoryLayout, SectionDesc};
 pub use link::{
     IvshmemLink, IvshmemLinkRegistry, LinkId, MAX_PEERS, PeerAttachment, PeerId, PeerReservation,
 };
+pub use plan::IvshmemDirectPlan;
 pub use registers::{
     DOORBELL_OFFSET, EVENT_STATUS_OFFSET, ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemRegisters,
     MAXIMUM_PEERS_OFFSET, REGISTER_PAGE_SIZE, STATE_OFFSET,
