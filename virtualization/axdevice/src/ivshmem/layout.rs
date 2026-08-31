@@ -9,7 +9,10 @@
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::fmt;
 
-use super::{error::IvshmemError, link::PeerId};
+use super::{
+    error::IvshmemError,
+    link::{LinkProfile, PeerId},
+};
 
 /// Owner-aware classification of one BAR2 offset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,22 +139,22 @@ impl IvshmemMemoryLayout {
     /// Size of one peer's state-table entry in bytes.
     const STATE_ENTRY_SIZE: u64 = 4;
 
-    /// Derives the F5 layout from the profile constants.
+    /// Derives the layout from the link profile.
     ///
-    /// Rules: one state-table page at offset 0; no common section; the
-    /// remaining pages split evenly across peers, rounded down to a whole
-    /// page per peer; leftover pages become Reserved. Every section is
-    /// 4 KiB aligned and page sized.
+    /// Rules: one state-table page at offset 0 with `profile.max_peers()`
+    /// entries; a common section when `profile.common_size()` is nonzero,
+    /// placed after the state table; one output section per peer of
+    /// `profile.output_size()`, in ascending `PeerId` order; leftover pages
+    /// stay unassigned (classified as Reserved). `outputs.len()` always
+    /// equals `profile.max_peers()`.
     ///
     /// # Errors
     ///
-    /// Returns [`IvshmemError::InvalidLayout`] when `bar2_size` cannot hold
-    /// the state-table page plus at least one page per peer.
-    pub fn derive(bar2_size: u64, max_peers: u16) -> Result<Self, IvshmemError> {
+    /// Returns [`IvshmemError::InvalidLayout`] when the profile cannot fit
+    /// into `bar2_size`.
+    pub fn derive(bar2_size: u64, profile: LinkProfile) -> Result<Self, IvshmemError> {
+        let max_peers = profile.max_peers();
         let reject = |detail: String| IvshmemError::InvalidLayout { detail };
-        if max_peers == 0 {
-            return Err(reject("a link needs at least one peer".into()));
-        }
         if !bar2_size.is_multiple_of(SectionDesc::ALIGNMENT) {
             return Err(reject(format!(
                 "BAR2 size {bar2_size:#x} is not {:#x}-aligned",
@@ -173,30 +176,32 @@ impl IvshmemMemoryLayout {
                 state_table.size()
             )));
         }
-        let remaining_pages = (bar2_size - state_table.size()) / SectionDesc::ALIGNMENT;
-        let per_peer_pages = remaining_pages / u64::from(max_peers);
-        if per_peer_pages == 0 {
-            return Err(reject(format!(
-                "BAR2 size {bar2_size:#x} cannot host one output page per peer for {max_peers} \
-                 peers"
-            )));
-        }
+        let mut cursor = state_table.size();
+        let common = if profile.common_size() > 0 {
+            let common = SectionDesc::new(cursor, profile.common_size())?;
+            cursor += common.size();
+            Some(common)
+        } else {
+            None
+        };
         let mut outputs = Vec::new();
         outputs
             .try_reserve_exact(usize::from(max_peers))
             .map_err(|_| IvshmemError::AllocationFailed {
                 operation: "derive ivshmem BAR2 layout",
             })?;
-        for peer in 0..u64::from(max_peers) {
-            let offset = state_table.size() + peer * per_peer_pages * SectionDesc::ALIGNMENT;
-            let size = per_peer_pages * SectionDesc::ALIGNMENT;
-            outputs.push(SectionDesc::new(offset, size)?);
+        for _peer in 0..u64::from(max_peers) {
+            outputs.push(SectionDesc::new(cursor, profile.output_size())?);
+            cursor += profile.output_size();
+        }
+        if cursor > bar2_size {
+            return Err(reject(format!(
+                "profile sections end at {cursor:#x} beyond the {bar2_size:#x} BAR2"
+            )));
         }
         Ok(Self {
             state_table,
-            // The current profile has no common section; F8's configuration
-            // may introduce one behind this already-absence-safe field.
-            common: None,
+            common,
             outputs: outputs.into_boxed_slice(),
             bar2_size,
         })
@@ -328,7 +333,7 @@ mod tests {
     use crate::ivshmem::SHARED_MEMORY_SIZE;
 
     fn two_peer_layout() -> IvshmemMemoryLayout {
-        IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap()
+        IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, LinkProfile::baseline()).unwrap()
     }
 
     #[test]
@@ -396,25 +401,26 @@ mod tests {
         // Zero bytes cannot host the state-table page (any page-aligned size
         // below one page is zero).
         assert!(
-            IvshmemMemoryLayout::derive(0, 2)
+            IvshmemMemoryLayout::derive(0, LinkProfile::baseline())
                 .unwrap_err()
                 .to_string()
                 .contains("cannot host")
         );
-        // Not enough pages for one output section per peer.
+        // Not enough room for the baseline output sections.
         assert!(
-            IvshmemMemoryLayout::derive(0x2000, 2)
+            IvshmemMemoryLayout::derive(0x2000, LinkProfile::baseline())
                 .unwrap_err()
                 .to_string()
-                .contains("one output page per peer")
+                .contains("beyond the")
         );
         // Unaligned BAR2 size.
-        assert!(IvshmemMemoryLayout::derive(0x1800, 2).is_err());
-        // Empty peer profile.
-        assert!(IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 0).is_err());
-        // The smallest workable profile still derives: state page + 1 page
-        // per peer.
-        let tight = IvshmemMemoryLayout::derive(0x3000, 2).unwrap();
+        assert!(IvshmemMemoryLayout::derive(0x1800, LinkProfile::baseline()).is_err());
+        // Empty peer profile is rejected by the profile itself.
+        assert!(LinkProfile::new(0, 0, 0x1000).is_err());
+        // A reduced profile fits a smaller BAR2: state page plus one output
+        // page per peer, with no reserved tail.
+        let tight =
+            IvshmemMemoryLayout::derive(0x3000, LinkProfile::new(2, 0, 0x1000).unwrap()).unwrap();
         assert_eq!(tight.outputs()[0].size(), 0x1000);
         assert_eq!(tight.outputs()[1].size(), 0x1000);
         assert_eq!(tight.classify(0x3000), Bar2Section::Reserved);

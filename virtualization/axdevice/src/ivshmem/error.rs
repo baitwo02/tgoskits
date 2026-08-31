@@ -94,6 +94,33 @@ pub enum IvshmemError {
         /// Diagnostic detail describing the rejected derivation.
         detail: String,
     },
+    /// A reservation declared a different link profile than an earlier one.
+    #[error("ivshmem link {link} profile mismatch: {detail}")]
+    LinkProfileMismatch {
+        /// The link whose profile was already fixed.
+        link: u32,
+        /// Diagnostic detail comparing both profiles.
+        detail: String,
+    },
+    /// A link profile violates the validation rules of `LinkProfile::new`.
+    #[error("ivshmem link profile is invalid: {detail}")]
+    InvalidProfile {
+        /// Diagnostic detail describing the rejected field.
+        detail: String,
+    },
+    /// A reservation or attachment belongs to a previous link generation.
+    #[error(
+        "ivshmem reference to link {link} belongs to generation {reserved}, but the link is now \
+         at generation {current}"
+    )]
+    LinkGenerationChanged {
+        /// The link that changed generation.
+        link: u32,
+        /// The generation captured by the stale reference.
+        reserved: u64,
+        /// The link's current generation.
+        current: u64,
+    },
     /// An event sink could not record one delivered event.
     #[error("ivshmem event delivery failed for {operation}: {detail}")]
     EventDeliveryFailed {

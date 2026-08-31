@@ -7,12 +7,7 @@
 //! a released reservation retires the slot until the whole link is
 //! recreated, which also recreates the zeroed backing.
 
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    sync::{Arc, Weak},
-    vec,
-};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec};
 use core::{
     fmt,
     sync::atomic::{AtomicU32, Ordering},
@@ -82,6 +77,108 @@ impl fmt::Display for LinkId {
     }
 }
 
+/// Upper bound of `LinkProfile::max_peers` for the current profile revision.
+pub const MAX_PEERS_LIMIT: u16 = 64;
+
+/// Layout parameters of one link, identical across all its reservations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkProfile {
+    max_peers: u16,
+    common_size: u64,
+    output_size: u64,
+}
+
+impl LinkProfile {
+    /// The frozen double-peer baseline of F2–F7: two peers, no common
+    /// section, one 28 KiB output page-range per peer.
+    pub const fn baseline() -> Self {
+        Self {
+            max_peers: 2,
+            common_size: 0,
+            output_size: 0x7000,
+        }
+    }
+
+    /// Creates one validated profile.
+    ///
+    /// Rules: `1 <= max_peers <= MAX_PEERS_LIMIT`; `common_size` is zero or
+    /// a 4 KiB multiple; `output_size` is a positive 4 KiB multiple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::InvalidProfile`] when any rule is violated.
+    pub fn new(max_peers: u16, common_size: u64, output_size: u64) -> Result<Self, IvshmemError> {
+        const PAGE: u64 = 0x1000;
+        let reject = |detail: String| IvshmemError::InvalidProfile { detail };
+        if max_peers == 0 || max_peers > MAX_PEERS_LIMIT {
+            return Err(reject(alloc::format!(
+                "max peers {max_peers} must be within 1..={MAX_PEERS_LIMIT}"
+            )));
+        }
+        if !common_size.is_multiple_of(PAGE) {
+            return Err(reject(alloc::format!(
+                "common size {common_size:#x} is not {PAGE:#x}-aligned"
+            )));
+        }
+        if output_size == 0 || !output_size.is_multiple_of(PAGE) {
+            return Err(reject(alloc::format!(
+                "output size {output_size:#x} must be a positive {PAGE:#x} multiple"
+            )));
+        }
+        Ok(Self {
+            max_peers,
+            common_size,
+            output_size,
+        })
+    }
+
+    /// Returns the configured peer count.
+    pub const fn max_peers(self) -> u16 {
+        self.max_peers
+    }
+
+    /// Returns the configured common-section size in bytes.
+    pub const fn common_size(self) -> u64 {
+        self.common_size
+    }
+
+    /// Returns the configured per-peer output-section size in bytes.
+    pub const fn output_size(self) -> u64 {
+        self.output_size
+    }
+}
+
+/// Monotonic lifetime counter of one link object.
+///
+/// The value increments every time the link transitions from "no
+/// reservations and no attachments" back to an active reservation. Any
+/// reference captured before the transition is stale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct LinkGeneration(u64);
+
+impl LinkGeneration {
+    /// Creates the initial generation of a fresh link.
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    /// Returns the raw generation value.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the next generation.
+    const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl core::fmt::Display for LinkGeneration {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Identity of one peer slot inside a link.
 ///
 /// The range is checked against the link profile when a reservation is
@@ -125,43 +222,70 @@ enum PeerSlot {
 struct LinkPeers {
     next_attachment_generation: u64,
     slots: Box<[PeerSlot]>,
+    /// Live attachment count; a link with attachments never goes inactive.
+    attached: usize,
     /// Per-attachment event sinks; entries follow the slot lifecycle:
     /// attach clears any stale entry, `set_event_sink` fills it, detach
     /// removes it.
     sinks: BTreeMap<PeerId, Arc<dyn IvshmemEventSink>>,
 }
 
+/// Lifecycle state of one link object.
+enum LinkState {
+    /// No reservations and no attachments; the backing is zeroed and parked.
+    /// The skeleton (id, profile, generation) stays in the registry for
+    /// reattach validation.
+    Inactive { generation: LinkGeneration },
+    /// At least one reservation or attachment; backing allocated.
+    Active {
+        generation: LinkGeneration,
+        peers: LinkPeers,
+    },
+}
+
 /// Shared state of one ivshmem link: profile, backing, and peer slots.
 pub struct IvshmemLink {
     id: LinkId,
-    max_peers: u16,
-    backing: SharedBarBacking,
+    profile: LinkProfile,
     layout: IvshmemMemoryLayout,
-    peers: SpinLock<LinkPeers>,
+    state: SpinLock<LinkState>,
+    /// Backing of the current lifecycle; `None` while inactive. Zeroed on
+    /// every reactivation so old state is structurally invalid.
+    backing: SpinLock<Option<Arc<SharedBarBacking>>>,
+    allocator: Arc<dyn SharedBackingAllocator>,
     ignored_doorbell: IgnoredDoorbellCounters,
 }
 
 impl IvshmemLink {
     fn new(
         id: LinkId,
-        max_peers: u16,
+        profile: LinkProfile,
         allocator: Arc<dyn SharedBackingAllocator>,
     ) -> Result<Self, IvshmemError> {
-        let backing = SharedBarBacking::try_new(super::SHARED_MEMORY_SIZE, allocator)?;
+        let backing = Arc::new(SharedBarBacking::try_new(
+            super::SHARED_MEMORY_SIZE,
+            Arc::clone(&allocator),
+        )?);
         // The profile freezes bar2_size and peer count, so this derivation
-        // cannot fail today; the fallible signature constrains the later
-        // configuration-driven layout feature (F8).
-        let layout = IvshmemMemoryLayout::derive(super::SHARED_MEMORY_SIZE, max_peers)?;
+        // cannot fail today; the fallible signature constrains future
+        // configuration-driven layouts.
+        let layout = IvshmemMemoryLayout::derive(super::SHARED_MEMORY_SIZE, profile)?;
         Ok(Self {
             id,
-            max_peers,
-            backing,
+            profile,
             layout,
-            peers: SpinLock::new(LinkPeers {
-                next_attachment_generation: 0,
-                slots: vec![PeerSlot::Vacant; usize::from(max_peers)].into_boxed_slice(),
-                sinks: BTreeMap::new(),
+            state: SpinLock::new(LinkState::Active {
+                generation: LinkGeneration::initial(),
+                peers: LinkPeers {
+                    next_attachment_generation: 0,
+                    slots: vec![PeerSlot::Vacant; usize::from(profile.max_peers())]
+                        .into_boxed_slice(),
+                    attached: 0,
+                    sinks: BTreeMap::new(),
+                },
             }),
+            backing: SpinLock::new(Some(backing)),
+            allocator,
             ignored_doorbell: IgnoredDoorbellCounters::default(),
         })
     }
@@ -173,17 +297,42 @@ impl IvshmemLink {
 
     /// Returns the peer count of the frozen link profile.
     pub const fn max_peers(&self) -> u16 {
-        self.max_peers
+        self.profile.max_peers()
     }
 
-    /// Returns the shared BAR2 backing of this link.
-    pub fn backing(&self) -> &SharedBarBacking {
-        &self.backing
+    /// Returns the frozen link profile.
+    pub const fn profile(&self) -> LinkProfile {
+        self.profile
+    }
+
+    /// Returns the generation of the current (or most recently completed)
+    /// lifecycle.
+    pub fn generation(&self) -> LinkGeneration {
+        match &*self.state.lock_irqsave() {
+            LinkState::Inactive { generation } => *generation,
+            LinkState::Active { generation, .. } => *generation,
+        }
+    }
+
+    /// Returns the shared BAR2 backing of the active lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::PeerNotReserved`] while the link is inactive
+    /// (backing released, guest endpoints impossible).
+    pub fn backing(&self) -> Result<Arc<SharedBarBacking>, IvshmemError> {
+        self.backing
+            .lock_irqsave()
+            .clone()
+            .ok_or(IvshmemError::PeerNotReserved {
+                link: self.id.value(),
+                peer: 0,
+            })
     }
 
     /// Returns the BAR2 size of the link profile.
     pub const fn bar2_size(&self) -> u64 {
-        self.backing.size()
+        super::SHARED_MEMORY_SIZE
     }
 
     /// Returns the frozen BAR2 layout of this link.
@@ -202,8 +351,11 @@ impl IvshmemLink {
     /// [`IvshmemError::SharedMemoryOutOfRange`] if the entry write would
     /// leave the backing (a layout bug, not a guest condition).
     pub fn publish_state(&self, peer: PeerId, value: u32) -> Result<(), IvshmemError> {
-        let offset = self.layout.state_entry_offset(peer, self.max_peers)?;
-        self.backing.write_bytes(offset, &value.to_le_bytes())
+        let offset = self
+            .layout
+            .state_entry_offset(peer, self.profile.max_peers())?;
+        let backing = self.backing()?;
+        backing.write_bytes(offset, &value.to_le_bytes())
     }
 
     /// Clears the peer's state-table entry; called from endpoint reset.
@@ -222,6 +374,11 @@ impl IvshmemLink {
     /// peer-table lock.
     pub fn deliver_doorbell(&self, source: PeerId, doorbell: Doorbell) {
         let target = doorbell.target();
+        if !matches!(&*self.state.lock_irqsave(), LinkState::Active { .. }) {
+            // The only guest-triggered path stays a specification no-op
+            // while the link is inactive; sinks cannot exist anyway.
+            return;
+        }
         if doorbell.vector() != SUPPORTED_DOORBELL_VECTOR {
             if IgnoredDoorbellCounters::should_log(&self.ignored_doorbell.unsupported_vector) {
                 warn!(
@@ -233,12 +390,13 @@ impl IvshmemLink {
             }
             return;
         }
-        if usize::from(target.value()) >= usize::from(self.max_peers) {
+        if usize::from(target.value()) >= usize::from(self.max_peers()) {
             if IgnoredDoorbellCounters::should_log(&self.ignored_doorbell.out_of_profile) {
                 warn!(
                     "ivshmem link {} ignored a doorbell from peer {source}: target peer {target} \
                      is outside the profile of {} peers",
-                    self.id, self.max_peers
+                    self.id,
+                    self.max_peers()
                 );
             }
             return;
@@ -263,7 +421,10 @@ impl IvshmemLink {
     /// Returns the attached target's sink, or `None` when the doorbell must
     /// be ignored.
     fn attached_sink(&self, target: PeerId) -> Option<Arc<dyn IvshmemEventSink>> {
-        let peers = self.peers.lock_irqsave();
+        let state = self.state.lock_irqsave();
+        let LinkState::Active { peers, .. } = &*state else {
+            return None;
+        };
         let attached = matches!(
             peers.slots.get(usize::from(target.value())),
             Some(PeerSlot::Attached { .. })
@@ -273,7 +434,7 @@ impl IvshmemLink {
         } else {
             None
         };
-        drop(peers);
+        drop(state);
         if !attached && IgnoredDoorbellCounters::should_log(&self.ignored_doorbell.not_attached) {
             warn!(
                 "ivshmem link {} ignored a doorbell to peer {target}: no endpoint is attached",
@@ -283,12 +444,48 @@ impl IvshmemLink {
         sink
     }
 
+    /// Reactivates an inactive link: allocates a fresh zeroed backing and
+    /// rebuilds the peer table. The generation stays at its advanced value,
+    /// so stale reservations and attachments from the previous lifecycle are
+    /// rejected.
+    fn ensure_active(&self) -> Result<(), IvshmemError> {
+        let mut state = self.state.lock_irqsave();
+        if matches!(&*state, LinkState::Active { .. }) {
+            return Ok(());
+        }
+        let LinkState::Inactive { generation } = &*state else {
+            return Ok(());
+        };
+        let backing = Arc::new(SharedBarBacking::try_new(
+            super::SHARED_MEMORY_SIZE,
+            Arc::clone(&self.allocator),
+        )?);
+        let max_peers = self.profile.max_peers();
+        *self.backing.lock_irqsave() = Some(backing);
+        *state = LinkState::Active {
+            generation: *generation,
+            peers: LinkPeers {
+                next_attachment_generation: 0,
+                slots: vec![PeerSlot::Vacant; usize::from(max_peers)].into_boxed_slice(),
+                attached: 0,
+                sinks: BTreeMap::new(),
+            },
+        };
+        Ok(())
+    }
+
     fn reserve_slot(&self, peer: PeerId) -> Result<(), IvshmemError> {
-        let mut peers = self.peers.lock_irqsave();
+        let mut state = self.state.lock_irqsave();
+        let LinkState::Active { peers, .. } = &mut *state else {
+            return Err(IvshmemError::PeerNotReserved {
+                link: self.id.value(),
+                peer: peer.value(),
+            });
+        };
         let Some(slot) = peers.slots.get_mut(usize::from(peer.value())) else {
             return Err(IvshmemError::PeerOutOfProfile {
                 peer: peer.value(),
-                max_peers: self.max_peers,
+                max_peers: self.profile.max_peers(),
             });
         };
         match slot {
@@ -310,7 +507,13 @@ impl IvshmemLink {
     }
 
     fn attach_slot(&self, peer: PeerId) -> Result<u64, IvshmemError> {
-        let mut peers = self.peers.lock_irqsave();
+        let mut state = self.state.lock_irqsave();
+        let LinkState::Active { peers, .. } = &mut *state else {
+            return Err(IvshmemError::PeerNotReserved {
+                link: self.id.value(),
+                peer: peer.value(),
+            });
+        };
         let index = usize::from(peer.value());
         match peers.slots.get(index) {
             Some(PeerSlot::Reserved) => {}
@@ -334,6 +537,7 @@ impl IvshmemLink {
             }
         }
         peers.next_attachment_generation = peers.next_attachment_generation.wrapping_add(1);
+        peers.attached += 1;
         let generation = peers.next_attachment_generation;
         peers.slots[index] = PeerSlot::Attached { generation };
         // A re-attached slot must not keep a sink registered by a previous
@@ -342,27 +546,69 @@ impl IvshmemLink {
         Ok(generation)
     }
 
-    fn detach_slot(&self, peer: PeerId, generation: u64) {
-        let mut peers = self.peers.lock_irqsave();
+    fn detach_slot(&self, peer: PeerId, attachment_generation: u64) {
+        let mut state = self.state.lock_irqsave();
+        let current_generation = match &*state {
+            LinkState::Active { generation, .. } => *generation,
+            LinkState::Inactive { .. } => return,
+        };
+        let LinkState::Active { peers, .. } = &mut *state else {
+            return;
+        };
         let index = usize::from(peer.value());
         let is_current = match peers.slots.get(index) {
             Some(PeerSlot::Attached {
                 generation: current,
-            }) => *current == generation,
+            }) => *current == attachment_generation,
             _ => false,
         };
+        // Every attach pairs with exactly one detach: the count tracks the
+        // attachment object, not the slot state (a released reservation
+        // retires the slot before its endpoint detaches).
+        peers.attached = peers.attached.saturating_sub(1);
         if is_current {
             // A stale attachment must not clear a newer attachment's state.
             peers.slots[index] = PeerSlot::Reserved;
             // The detached endpoint stops receiving link events immediately.
             peers.sinks.remove(&peer);
         }
+        self.maybe_deactivate(&mut state, &current_generation);
     }
 
     fn release_slot(&self, peer: PeerId) {
-        let mut peers = self.peers.lock_irqsave();
+        let mut state = self.state.lock_irqsave();
+        let generation = match &mut *state {
+            LinkState::Active { generation, .. } => *generation,
+            LinkState::Inactive { .. } => return,
+        };
+        let LinkState::Active { peers, .. } = &mut *state else {
+            return;
+        };
         if let Some(slot) = peers.slots.get_mut(usize::from(peer.value())) {
             *slot = PeerSlot::Retired;
+        }
+        self.maybe_deactivate(&mut state, &generation);
+    }
+
+    /// Ends the lifecycle when the last reservation and attachment are gone:
+    /// the backing is parked zeroed (old state structurally invalid), the
+    /// peer table resets for the next lifecycle, and the generation advances.
+    fn maybe_deactivate(&self, state: &mut LinkState, generation: &LinkGeneration) {
+        let LinkState::Active { peers, .. } = state else {
+            return;
+        };
+        let lifecycle_ended = peers.attached == 0
+            && peers
+                .slots
+                .iter()
+                .all(|slot| matches!(slot, PeerSlot::Vacant | PeerSlot::Retired));
+        if lifecycle_ended {
+            if let Some(backing) = self.backing.lock_irqsave().as_ref() {
+                backing.zero();
+            }
+            *state = LinkState::Inactive {
+                generation: generation.next(),
+            };
         }
     }
 }
@@ -372,7 +618,7 @@ impl fmt::Debug for IvshmemLink {
         formatter
             .debug_struct("IvshmemLink")
             .field("id", &self.id)
-            .field("max_peers", &self.max_peers)
+            .field("max_peers", &self.profile.max_peers())
             .finish_non_exhaustive()
     }
 }
@@ -462,7 +708,13 @@ impl PeerAttachment {
     /// Returns [`IvshmemError::PeerNotReserved`] when this attachment is no
     /// longer the current generation of its peer slot.
     pub fn set_event_sink(&self, sink: Arc<dyn IvshmemEventSink>) -> Result<(), IvshmemError> {
-        let mut peers = self.link.peers.lock_irqsave();
+        let mut state = self.link.state.lock_irqsave();
+        let LinkState::Active { peers, .. } = &mut *state else {
+            return Err(IvshmemError::PeerNotReserved {
+                link: self.link.id.value(),
+                peer: self.peer.value(),
+            });
+        };
         match peers.slots.get(usize::from(self.peer.value())) {
             Some(PeerSlot::Attached { generation }) if *generation == self.generation => {}
             _ => {
@@ -499,7 +751,9 @@ impl fmt::Debug for PeerAttachment {
 /// VM configuration builds. Locking stays on the configuration path with the
 /// `registry -> link` order; runtime BAR access never touches the registry.
 pub struct IvshmemLinkRegistry {
-    links: SpinLock<BTreeMap<LinkId, Weak<IvshmemLink>>>,
+    /// Link skeletons stay alive for the registry lifetime so reattach
+    /// validation can compare generations after every peer left.
+    links: SpinLock<BTreeMap<LinkId, Arc<IvshmemLink>>>,
     allocator: Arc<dyn SharedBackingAllocator>,
 }
 
@@ -526,23 +780,50 @@ impl IvshmemLinkRegistry {
     /// slot was released earlier, and [`IvshmemError::AllocationFailed`] when
     /// the link backing cannot be allocated.
     pub fn reserve(&self, link_id: u32, peer_id: u16) -> Result<PeerReservation, IvshmemError> {
+        self.reserve_with_profile(link_id, peer_id, LinkProfile::baseline())
+    }
+
+    /// Reserves one peer, checking `profile` against the link's profile.
+    ///
+    /// The first reservation of a link fixes its profile; later reservations
+    /// must match exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IvshmemError::LinkProfileMismatch`] when the profile differs,
+    /// in addition to the existing `reserve()` error set.
+    pub fn reserve_with_profile(
+        &self,
+        link_id: u32,
+        peer_id: u16,
+        profile: LinkProfile,
+    ) -> Result<PeerReservation, IvshmemError> {
         let id = LinkId::new(link_id);
         let peer = PeerId::new(peer_id);
         // The registry lock covers link creation so two concurrent
         // configurations of the same new link cannot observe separate links.
         let mut links = self.links.lock_irqsave();
-        let link = match links.get(&id).and_then(Weak::upgrade) {
-            Some(link) => link,
+        let link = match links.get(&id).cloned() {
+            Some(link) => {
+                if link.profile() != profile {
+                    return Err(IvshmemError::LinkProfileMismatch {
+                        link: link_id,
+                        detail: alloc::format!(
+                            "existing profile is {link_profile:?}, requested {requested:?}",
+                            link_profile = link.profile(),
+                            requested = profile
+                        ),
+                    });
+                }
+                link
+            }
             None => {
-                let link = Arc::new(IvshmemLink::new(
-                    id,
-                    MAX_PEERS,
-                    Arc::clone(&self.allocator),
-                )?);
-                links.insert(id, Arc::downgrade(&link));
+                let link = Arc::new(IvshmemLink::new(id, profile, Arc::clone(&self.allocator))?);
+                links.insert(id, Arc::clone(&link));
                 link
             }
         };
+        link.ensure_active()?;
         link.reserve_slot(peer)?;
         Ok(PeerReservation { link, peer })
     }
@@ -625,7 +906,7 @@ mod tests {
         }
     }
 
-    /// Probes whether the peer-table lock is held while the sink runs.
+    /// Probes whether the link lifecycle lock is held while the sink runs.
     struct LockProbeSink {
         link: Arc<IvshmemLink>,
         lock_observed: AtomicBool,
@@ -634,7 +915,7 @@ mod tests {
     impl IvshmemEventSink for LockProbeSink {
         fn deliver(&self, _event: DoorbellEvent) -> Result<(), IvshmemError> {
             self.lock_observed
-                .store(self.link.peers.is_locked(), Ordering::Relaxed);
+                .store(self.link.state.is_locked(), Ordering::Relaxed);
             Ok(())
         }
     }
@@ -683,9 +964,17 @@ mod tests {
         let peer0 = registry.reserve(1, 0).unwrap();
         let peer1 = registry.reserve(1, 1).unwrap();
         let other = registry.reserve(2, 0).unwrap();
-        peer0.link().backing().write(0x40, 8, 0x1234).unwrap();
-        assert_eq!(peer1.link().backing().read(0x40, 8).unwrap(), 0x1234);
-        assert_eq!(other.link().backing().read(0x40, 8).unwrap(), 0);
+        peer0
+            .link()
+            .backing()
+            .unwrap()
+            .write(0x40, 8, 0x1234)
+            .unwrap();
+        assert_eq!(
+            peer1.link().backing().unwrap().read(0x40, 8).unwrap(),
+            0x1234
+        );
+        assert_eq!(other.link().backing().unwrap().read(0x40, 8).unwrap(), 0);
         assert!(!Arc::ptr_eq(peer0.link(), other.link()));
     }
 
@@ -693,10 +982,14 @@ mod tests {
     fn recreating_a_dead_link_zeroes_the_backing() {
         let registry = registry();
         let peer = registry.reserve(1, 0).unwrap();
-        peer.link().backing().write(0, 4, 0xa5a5_a5a5).unwrap();
+        peer.link()
+            .backing()
+            .unwrap()
+            .write(0, 4, 0xa5a5_a5a5)
+            .unwrap();
         drop(peer);
         let recreated = registry.reserve(1, 0).unwrap();
-        assert_eq!(recreated.link().backing().read(0, 4).unwrap(), 0);
+        assert_eq!(recreated.link().backing().unwrap().read(0, 4).unwrap(), 0);
     }
 
     #[test]
@@ -918,19 +1211,19 @@ mod tests {
         link0.publish_state(PeerId::new(0), 0x0001_0002).unwrap();
         // The owning link sees the entry through its own backing, and the
         // other peer's link is the same object: one shared state table.
-        assert_eq!(link0.backing().read(0, 4).unwrap(), 0x0001_0002);
-        assert_eq!(link1.backing().read(0, 4).unwrap(), 0x0001_0002);
+        assert_eq!(link0.backing().unwrap().read(0, 4).unwrap(), 0x0001_0002);
+        assert_eq!(link1.backing().unwrap().read(0, 4).unwrap(), 0x0001_0002);
         // The second peer's entry stays untouched.
-        assert_eq!(link1.backing().read(4, 4).unwrap(), 0);
+        assert_eq!(link1.backing().unwrap().read(4, 4).unwrap(), 0);
 
         // Reserved bytes inside the state-table page read zero even after
         // entries are published.
-        assert_eq!(link0.backing().read(0x8, 4).unwrap(), 0);
-        assert_eq!(link0.backing().read(0xffc, 4).unwrap(), 0);
+        assert_eq!(link0.backing().unwrap().read(0x8, 4).unwrap(), 0);
+        assert_eq!(link0.backing().unwrap().read(0xffc, 4).unwrap(), 0);
 
         // Clearing zeroes the entry without touching the shared region.
         link0.clear_state(PeerId::new(0)).unwrap();
-        assert_eq!(link0.backing().read(0, 4).unwrap(), 0);
+        assert_eq!(link0.backing().unwrap().read(0, 4).unwrap(), 0);
     }
 
     #[test]
@@ -945,6 +1238,97 @@ mod tests {
                 max_peers: MAX_PEERS
             })
         );
+    }
+
+    #[test]
+    fn link_profile_rejects_invalid_configurations() {
+        assert!(LinkProfile::new(0, 0, 0x1000).is_err());
+        assert!(LinkProfile::new(65, 0, 0x1000).is_err());
+        assert!(LinkProfile::new(2, 0x800, 0x1000).is_err());
+        assert!(LinkProfile::new(2, 0, 0).is_err());
+        assert!(LinkProfile::new(2, 0, 0x800).is_err());
+        // The baseline is a valid profile.
+        assert_eq!(LinkProfile::baseline().max_peers(), 2);
+        assert_eq!(LinkProfile::baseline().common_size(), 0);
+    }
+
+    #[test]
+    fn reservations_must_declare_matching_profiles() {
+        let registry = registry();
+        let _peer0 = registry
+            .reserve_with_profile(1, 0, LinkProfile::new(3, 0x1000, 0x2000).unwrap())
+            .unwrap();
+        // A different profile for the same link mismatches.
+        let error = registry
+            .reserve_with_profile(1, 1, LinkProfile::baseline())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IvshmemError::LinkProfileMismatch { link: 1, .. }
+        ));
+        // The matching profile reserves normally.
+        registry
+            .reserve_with_profile(1, 1, LinkProfile::new(3, 0x1000, 0x2000).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn generation_advances_when_the_lifecycle_ends() {
+        let registry = registry();
+        let reservation = registry
+            .reserve_with_profile(1, 0, LinkProfile::baseline())
+            .unwrap();
+        let link = Arc::clone(reservation.link());
+        assert_eq!(link.generation().value(), 0);
+        drop(reservation);
+        // The skeleton survives with an advanced generation.
+        assert_eq!(link.generation().value(), 1);
+        // Re-reserving lands in the fresh lifecycle.
+        let reattached = registry
+            .reserve_with_profile(1, 0, LinkProfile::baseline())
+            .unwrap();
+        assert_eq!(reattached.link().generation().value(), 1);
+        // The rebuilt backing is zeroed: old state is structurally invalid.
+        assert_eq!(reattached.link().backing().unwrap().read(0, 4).unwrap(), 0);
+    }
+
+    #[test]
+    fn three_peers_route_without_cross_talk() {
+        let registry = registry();
+        let profile = LinkProfile::new(3, 0, 0x2000).unwrap();
+        let reservations = [
+            registry.reserve_with_profile(1, 0, profile).unwrap(),
+            registry.reserve_with_profile(1, 1, profile).unwrap(),
+            registry.reserve_with_profile(1, 2, profile).unwrap(),
+        ];
+        let sinks = [
+            EventRecorder::new(),
+            EventRecorder::new(),
+            EventRecorder::new(),
+        ];
+        let attachments = [
+            reservations[0].attach().unwrap(),
+            reservations[1].attach().unwrap(),
+            reservations[2].attach().unwrap(),
+        ];
+        for (attachment, sink) in attachments.iter().zip(sinks.iter()) {
+            attachment.set_event_sink(sink.clone()).unwrap();
+        }
+
+        // Peer 1 rings peer 2 only.
+        attachments[1]
+            .link()
+            .deliver_doorbell(attachments[1].peer_id(), doorbell(2, 0));
+        assert_eq!(sinks[2].events().len(), 1);
+        assert!(sinks[0].events().is_empty());
+        assert!(sinks[1].events().is_empty());
+
+        // Peer 0 rings peer 0 (self) only.
+        attachments[0]
+            .link()
+            .deliver_doorbell(attachments[0].peer_id(), doorbell(0, 0));
+        assert_eq!(sinks[0].events().len(), 1);
+        assert_eq!(sinks[2].events().len(), 1);
     }
 
     #[test]

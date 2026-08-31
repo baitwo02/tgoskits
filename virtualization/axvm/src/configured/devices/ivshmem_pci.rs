@@ -60,8 +60,15 @@ pub(super) fn register(
 struct IvshmemPciOptions {
     /// Shared-link identity; peers of one link must use the same value.
     link_id: u32,
-    /// Peer slot inside the link; the current profile allows 0 and 1.
+    /// Peer slot inside the link; dense IDs within `0..max_peers`.
     peer_id: u16,
+    /// Peer count of the link; every peer of one link declares the same
+    /// value.
+    max_peers: u16,
+    /// Common-section size in bytes (0 in the current profile).
+    common_size: u64,
+    /// Per-peer output-section size in bytes.
+    output_size: u64,
 }
 
 fn create_device_node(
@@ -84,8 +91,14 @@ fn create_device_node(
                 model: request.model.clone(),
                 detail: "no ivshmem link registry was injected into this VM".into(),
             })?;
+    let profile = LinkProfile::new(options.max_peers, options.common_size, options.output_size)
+        .map_err(|error| ConfiguredDeviceError::Instantiation {
+            device: request.id.clone(),
+            model: request.model.clone(),
+            detail: error.to_string(),
+        })?;
     let reservation = registry
-        .reserve(options.link_id, options.peer_id)
+        .reserve_with_profile(options.link_id, options.peer_id, profile)
         .map_err(|error| ConfiguredDeviceError::Instantiation {
             device: request.id.clone(),
             model: request.model.clone(),
@@ -260,7 +273,14 @@ impl IvshmemPciFunction {
         IvshmemDirectPlan::derive(
             self.attachment.link().layout(),
             bar2_gpa,
-            self.attachment.link().backing().allocation(),
+            self.attachment
+                .link()
+                .backing()
+                .map_err(|error| DeviceError::InvalidState {
+                    operation: "derive ivshmem direct-mapping plan",
+                    detail: error.to_string(),
+                })?
+                .allocation(),
             self.attachment.peer_id(),
         )
         .map_err(|error| DeviceError::InvalidState {
@@ -420,12 +440,12 @@ impl PciFunction for IvshmemPciFunction {
                 .unwrap()
                 .read_bar(access.offset())
                 .map(u64::from),
-            SHARED_MEMORY_BAR_INDEX => self
-                .attachment
-                .link()
-                .backing()
-                .read(access.offset(), access.width().size())
-                .map_err(bar_access_error),
+            SHARED_MEMORY_BAR_INDEX => {
+                let backing = self.attachment.link().backing().map_err(bar_access_error)?;
+                backing
+                    .read(access.offset(), access.width().size())
+                    .map_err(bar_access_error)
+            }
             _ => Err(DeviceError::OutOfRange {
                 addr: access.offset(),
             }),
@@ -508,9 +528,8 @@ impl PciFunction for IvshmemPciFunction {
                         section,
                     ));
                 }
-                self.attachment
-                    .link()
-                    .backing()
+                let backing = self.attachment.link().backing().map_err(bar_access_error)?;
+                backing
                     .write(access.offset(), access.width().size(), value)
                     .map_err(bar_access_error)
             }
@@ -638,9 +657,23 @@ mod tests {
     }
 
     fn request(id: &str, link_id: u32, peer_id: u16) -> VirtualDeviceRequest {
+        request_with_profile(id, link_id, u32::from(peer_id), 2, 0, 0x7000)
+    }
+
+    fn request_with_profile(
+        id: &str,
+        link_id: u32,
+        peer_id: u32,
+        max_peers: i64,
+        common_size: i64,
+        output_size: i64,
+    ) -> VirtualDeviceRequest {
         let mut options = toml::Table::new();
         options.insert("link_id".into(), toml::Value::Integer(link_id.into()));
-        options.insert("peer_id".into(), toml::Value::Integer(peer_id.into()));
+        options.insert("peer_id".into(), toml::Value::Integer(peer_id as i64));
+        options.insert("max_peers".into(), toml::Value::Integer(max_peers));
+        options.insert("common_size".into(), toml::Value::Integer(common_size));
+        options.insert("output_size".into(), toml::Value::Integer(output_size));
         VirtualDeviceRequest {
             id: id.into(),
             model: MODEL.into(),
@@ -1016,7 +1049,12 @@ mod tests {
 
         // A different link stays isolated from this one.
         let other = registry.reserve(2, 0).unwrap();
-        other.link().backing().write(TEST_OFFSET, 8, 0xee).unwrap();
+        other
+            .link()
+            .backing()
+            .unwrap()
+            .write(TEST_OFFSET, 8, 0xee)
+            .unwrap();
         assert_eq!(
             peer0
                 .binding

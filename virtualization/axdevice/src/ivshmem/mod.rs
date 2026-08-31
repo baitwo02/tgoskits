@@ -25,7 +25,8 @@ pub use doorbell::{Doorbell, DoorbellEvent, IvshmemEventSink};
 pub use error::IvshmemError;
 pub use layout::{Bar2Section, IvshmemMemoryLayout, SectionDesc};
 pub use link::{
-    IvshmemLink, IvshmemLinkRegistry, LinkId, MAX_PEERS, PeerAttachment, PeerId, PeerReservation,
+    IvshmemLink, IvshmemLinkRegistry, LinkGeneration, LinkId, LinkProfile, MAX_PEERS,
+    MAX_PEERS_LIMIT, PeerAttachment, PeerId, PeerReservation,
 };
 pub use plan::IvshmemDirectPlan;
 pub use registers::{

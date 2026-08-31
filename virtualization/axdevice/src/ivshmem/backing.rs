@@ -134,6 +134,18 @@ impl SharedBarBacking {
         &self.allocation
     }
 
+    /// Clears every byte of the backing through the permanent virtual view.
+    ///
+    /// Called when a link lifecycle ends so a later reactivation cannot
+    /// observe state from the previous lifecycle.
+    pub fn zero(&self) {
+        // SAFETY: the virtual view is valid for `size` bytes; the exclusive
+        // ownership contract keeps other components from writing it.
+        unsafe {
+            core::ptr::write_bytes(self.allocation.virtual_base(), 0, self.size as usize);
+        }
+    }
+
     /// Returns the backing size in bytes.
     pub const fn size(&self) -> u64 {
         self.size

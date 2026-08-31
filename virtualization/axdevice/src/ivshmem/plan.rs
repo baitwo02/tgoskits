@@ -114,10 +114,10 @@ impl IvshmemDirectPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ivshmem::SHARED_MEMORY_SIZE;
+    use crate::ivshmem::{SHARED_MEMORY_SIZE, link::LinkProfile};
 
     fn layout() -> IvshmemMemoryLayout {
-        IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, 2).unwrap()
+        IvshmemMemoryLayout::derive(SHARED_MEMORY_SIZE, LinkProfile::baseline()).unwrap()
     }
 
     fn backing() -> BackingAllocation {
@@ -206,9 +206,10 @@ mod tests {
 
     #[test]
     fn one_page_outputs_derive_without_reserved_mappings() {
-        // A three-page BAR2 hosts the state table plus one output page per
-        // peer; nothing remains for the reserved tail.
-        let layout = IvshmemMemoryLayout::derive(0x3000, 2).unwrap();
+        // A three-page BAR2 with one output page per peer hosts the state
+        // table plus both outputs; nothing remains for the reserved tail.
+        let profile = LinkProfile::new(2, 0, 0x1000).unwrap();
+        let layout = IvshmemMemoryLayout::derive(0x3000, profile).unwrap();
         let plan =
             IvshmemDirectPlan::derive(&layout, 0x0c00_0000, &backing(), PeerId::new(0)).unwrap();
         assert_eq!(plan.mappings().len(), 3);

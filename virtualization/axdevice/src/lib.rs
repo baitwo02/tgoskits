@@ -74,9 +74,10 @@ pub use interrupt::{ControllerRegistration, InterruptRegistrationError};
 pub use ivshmem::{
     BackingAllocation, Bar2Section, DOORBELL_OFFSET, Doorbell, DoorbellEvent, EVENT_STATUS_OFFSET,
     ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemDirectPlan, IvshmemError, IvshmemEventSink,
-    IvshmemLink, IvshmemLinkRegistry, IvshmemMemoryLayout, IvshmemRegisters, LinkId, MAX_PEERS,
-    MAXIMUM_PEERS_OFFSET, PeerAttachment, PeerId, PeerReservation, REGISTER_PAGE_SIZE,
-    SHARED_MEMORY_SIZE, STATE_OFFSET, SectionDesc, SharedBackingAllocator, SharedBarBacking,
+    IvshmemLink, IvshmemLinkRegistry, IvshmemMemoryLayout, IvshmemRegisters, LinkGeneration,
+    LinkId, LinkProfile, MAX_PEERS, MAX_PEERS_LIMIT, MAXIMUM_PEERS_OFFSET, PeerAttachment, PeerId,
+    PeerReservation, REGISTER_PAGE_SIZE, SHARED_MEMORY_SIZE, STATE_OFFSET, SectionDesc,
+    SharedBackingAllocator, SharedBarBacking,
 };
 #[cfg(target_arch = "loongarch64")]
 // Reusable LoongArch device models. These are target-gated device packages,
