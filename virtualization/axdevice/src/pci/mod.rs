@@ -12,6 +12,7 @@ mod ecam;
 mod error;
 mod function;
 mod graph;
+mod msix;
 mod placement;
 mod root;
 mod runtime;
@@ -30,6 +31,7 @@ pub use ecam::{
 pub use error::{PciError, PciResult};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
 pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};
+pub use msix::{MSIX_BAR_SIZE, MsixState, MsixTableEntry, PciMsixDeclaration};
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{

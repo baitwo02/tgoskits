@@ -49,6 +49,7 @@ pub struct PciFunctionRequirement {
     pub(crate) identity: PciEndpointIdentity,
     pub(crate) bdf: ResourceRequest<PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
+    pub(crate) msix: Option<super::msix::PciMsixDeclaration>,
 }
 
 impl PciFunctionRequirement {
@@ -59,6 +60,7 @@ impl PciFunctionRequirement {
             identity,
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
+            msix: None,
         }
     }
 
@@ -84,6 +86,40 @@ impl PciFunctionRequirement {
         Ok(self)
     }
 
+    /// Declares an MSI-X capability for this function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciError::InvalidMsix`] when the capability is declared
+    /// twice. The PCI layer validates that BAR 1 is declared and at least
+    /// [`MSIX_BAR_SIZE`](super::msix::MSIX_BAR_SIZE) large, because the
+    /// Table/PBA BIR fields are frozen to BAR 1.
+    pub fn with_msix(mut self, msix: super::msix::PciMsixDeclaration) -> PciResult<Self> {
+        if self.msix.is_some() {
+            return Err(PciError::InvalidMsix {
+                detail: "the MSI-X capability is already declared".into(),
+            });
+        }
+        let bar1 = self
+            .bars
+            .iter()
+            .find(|bar| bar.index().value() == super::msix::MSIX_BAR_INDEX)
+            .ok_or(PciError::InvalidMsix {
+                detail: "MSI-X requires BAR 1 to be declared for the table/PBA window".into(),
+            })?;
+        if bar1.size() < super::msix::MSIX_BAR_SIZE {
+            return Err(PciError::InvalidMsix {
+                detail: alloc::format!(
+                    "MSI-X requires BAR 1 of at least {:#x}, got {:#x}",
+                    super::msix::MSIX_BAR_SIZE,
+                    bar1.size()
+                ),
+            });
+        }
+        self.msix = Some(msix);
+        Ok(self)
+    }
+
     /// Returns the selected host key.
     pub const fn host(&self) -> &PciHostKey {
         &self.host
@@ -93,6 +129,9 @@ impl PciFunctionRequirement {
         let mut spec = PciFunctionSpec::new(id, self.identity).with_bdf(self.bdf);
         for bar in &self.bars {
             spec = spec.with_bar(bar.clone())?;
+        }
+        if let Some(msix) = self.msix {
+            spec = spec.with_msix(msix);
         }
         Ok(spec)
     }

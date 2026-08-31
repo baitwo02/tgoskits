@@ -449,13 +449,28 @@ const PCI_CAPABILITY_VALIDATOR: &str = r#"validate_pci_capabilities() {
       return 1
     }
     capability=$((0x$capability_hex))
-    if [ "$capability" -eq 5 ] || [ "$capability" -eq 17 ]; then
-      echo "vPCI endpoint unexpectedly advertises MSI/MSI-X"
+    if [ "$capability" -eq 5 ]; then
+      echo "vPCI endpoint unexpectedly advertises MSI"
       return 1
     fi
     if [ "$capability" -eq 0 ]; then
       echo "PCI capability ID is invalid"
       return 1
+    fi
+    if [ "$capability" -eq 17 ]; then
+      # The F7 MSI-X surface is frozen: the capability advertises one vector,
+      # the table lives at BAR1 offset 0 and the PBA at BAR1 offset 0x800.
+      cap_ctrl_hex=$(read_config_byte "$config_path" $((pointer + 3))) || return 1
+      table_bir_hex=$(read_config_byte "$config_path" $((pointer + 4))) || return 1
+      pba_bir_hex=$(read_config_byte "$config_path" $((pointer + 8))) || return 1
+      if [ "$table_bir_hex" != "01" ]; then
+        echo "MSI-X Table BIR does not point at BAR1"
+        return 1
+      fi
+      if [ "$pba_bir_hex" != "01" ]; then
+        echo "MSI-X PBA BIR does not point at BAR1"
+        return 1
+      fi
     fi
     next_offset=$((pointer + 1))
     next_hex=$(read_config_byte "$config_path" "$next_offset") || {

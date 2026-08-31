@@ -106,6 +106,12 @@ pub enum PciError {
         /// Diagnostic reason.
         detail: String,
     },
+    /// An MSI-X declaration is malformed.
+    #[error("invalid MSI-X declaration: {detail}")]
+    InvalidMsix {
+        /// Diagnostic reason.
+        detail: String,
+    },
     /// A BAR overlaps an already resolved BAR.
     #[error(
         "PCI BAR range [{start:#x}, {end:#x}) for {function} BAR{bar} conflicts with another BAR"

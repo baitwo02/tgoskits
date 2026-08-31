@@ -95,7 +95,8 @@ impl PciTopologyBuilder {
                     address: bar_addresses[&(id.clone(), bar.index())],
                 })
                 .collect::<Vec<_>>();
-            let power_on = PowerOnConfig::build(spec.identity, &bars, &spec.config_bytes)?;
+            let power_on =
+                PowerOnConfig::build(spec.identity, &bars, &spec.config_bytes, spec.msix)?;
             functions.push(ResolvedPciFunction {
                 owner: id.clone(),
                 host: id.clone(),
@@ -103,6 +104,7 @@ impl PciTopologyBuilder {
                 identity: spec.identity,
                 bdf,
                 bars,
+                msix: spec.msix,
                 power_on,
             });
         }
@@ -138,6 +140,7 @@ pub struct ResolvedPciFunction {
     identity: PciEndpointIdentity,
     bdf: PciBdf,
     bars: Vec<ResolvedBarPlan>,
+    pub(crate) msix: Option<super::msix::PciMsixDeclaration>,
     pub(crate) power_on: PowerOnConfig,
 }
 
@@ -150,6 +153,11 @@ impl ResolvedPciFunction {
     /// Returns the graph node owning this function's state.
     pub const fn owner(&self) -> &DeviceNodeId {
         &self.owner
+    }
+
+    /// Returns the declared MSI-X capability, if any.
+    pub const fn msix(&self) -> Option<super::msix::PciMsixDeclaration> {
+        self.msix
     }
 
     /// Returns the graph node owning this function's PCI host.

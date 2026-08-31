@@ -7,7 +7,7 @@ use arm_vgic::{
     VgicCore, VgicMmioRegion, VgicResult, VgicV2Config, VgicV3Config,
 };
 use axdevice_base::{
-    ControllerInputId, HostIrqId, InterruptControllerId, InterruptTrigger, ItsId, LpiId,
+    ControllerInputId, HostIrqId, InterruptControllerId, InterruptTrigger, IrqError, ItsId, LpiId,
     MessageInterruptController, MsiDeviceId, MsiEventId, VirtualInterruptController,
 };
 
@@ -290,4 +290,57 @@ fn optional_dyn_msi_capability_is_present_only_when_configured() {
         .unwrap();
     assert_eq!(endpoint.message().its(), ItsId::new(3));
     assert_eq!(endpoint.message().lpi(), LpiId::new(8192));
+}
+
+#[test]
+fn message_sink_signal_table_validates_the_guest_encoding() {
+    let config = VgicV3Config::new(
+        InterruptControllerId::new(0),
+        region(0x0800_0000, 0x1_0000),
+        vec![region(0x080a_0000, 0x2_0000)],
+        0x2_0000,
+        vec![GicAffinity::new(0, 0, 0, 0)],
+    )
+    .unwrap()
+    .with_its(vec![ItsConfig::new(
+        ItsId::new(0),
+        region(0x0808_0000, 0x1_0000),
+    )])
+    .unwrap();
+    let core = Arc::new(
+        VgicCore::new_with_guest_memory(
+            ArmVgicConfig::V3(config),
+            Arc::new(SoftwareGicV3Backend),
+            Some(Arc::new(ZeroMemory)),
+        )
+        .unwrap(),
+    );
+    let message: Arc<dyn MessageInterruptController> = core;
+    let endpoint = message
+        .msi_endpoint(
+            ItsId::new(0),
+            MsiDeviceId::new(7),
+            MsiEventId::new(5),
+            LpiId::new(8192),
+        )
+        .unwrap();
+
+    // The planned encoding for a GICv3 ITS MSI: the address is the ITS
+    // instance's GITS_TRANSLATER (frame base + 0x0040) and the data is the
+    // planned EventID. A matching encoding passes the boundary validation
+    // and reaches the injection path; this minimal fixture has no
+    // initialized LPI tables, so the backend rejects the delivery with a
+    // non-encoding error.
+    let delivered = endpoint.signal_table(0x0808_0040, 5);
+    assert!(!matches!(
+        delivered,
+        Err(IrqError::MessageEncodingMismatch { .. })
+    ));
+
+    // A wrong EventID or a wrong address is refused as an encoding mismatch
+    // without injecting.
+    let error = endpoint.signal_table(0x0808_0040, 6).unwrap_err();
+    assert!(matches!(error, IrqError::MessageEncodingMismatch { .. }));
+    let error = endpoint.signal_table(0x0908_0040, 5).unwrap_err();
+    assert!(matches!(error, IrqError::MessageEncodingMismatch { .. }));
 }

@@ -101,6 +101,7 @@ pub struct PciFunctionSpec {
     pub(crate) bdf: ResourceRequest<super::PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
     pub(crate) config_bytes: Vec<PciConfigByte>,
+    pub(crate) msix: Option<super::msix::PciMsixDeclaration>,
 }
 
 impl PciFunctionSpec {
@@ -112,7 +113,19 @@ impl PciFunctionSpec {
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
             config_bytes: Vec::new(),
+            msix: None,
         }
+    }
+
+    /// Attaches one MSI-X declaration to this function spec.
+    pub const fn with_msix(mut self, msix: super::msix::PciMsixDeclaration) -> Self {
+        self.msix = Some(msix);
+        self
+    }
+
+    /// Returns the declared MSI-X capability, if any.
+    pub const fn msix(&self) -> Option<super::msix::PciMsixDeclaration> {
+        self.msix
     }
 
     /// Returns the stable function identity.

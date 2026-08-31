@@ -21,11 +21,16 @@ use crate::{AccessWidth, ConfigOffset};
 /// was accepted: `(bdf, bar index, new GPA)`.
 pub(crate) type BarRelocationObserver = Arc<dyn Fn(PciBdf, PciBarIndex, u64) + Send + Sync>;
 
+/// Callback invoked outside the root state lock after the MSI-X Message
+/// Control register changed: `(bdf, new 16-bit value)`.
+pub(crate) type MsixControlObserver = Arc<dyn Fn(PciBdf, u16) + Send + Sync>;
+
 /// Shared root state for one frozen PCI topology.
 pub struct PciRootState {
     topology: Arc<ResolvedPciTopology>,
     state: SpinLock<RootState>,
     bar_relocation_observer: SpinLock<Option<BarRelocationObserver>>,
+    msix_control_observer: SpinLock<Option<MsixControlObserver>>,
 }
 
 impl PciRootState {
@@ -35,7 +40,12 @@ impl PciRootState {
             .function_plans()
             .iter()
             .map(|function| {
-                FunctionState::new(function.bdf(), function.power_on.clone(), function.bars())
+                FunctionState::new(
+                    function.bdf(),
+                    function.power_on.clone(),
+                    function.bars(),
+                    function.msix,
+                )
             })
             .collect();
         Self {
@@ -45,6 +55,7 @@ impl PciRootState {
             }),
             topology,
             bar_relocation_observer: SpinLock::new(None),
+            msix_control_observer: SpinLock::new(None),
         }
     }
 
@@ -54,6 +65,24 @@ impl PciRootState {
     /// relocation has been accepted and applied to the decode route.
     pub(crate) fn set_bar_relocation_observer(&self, observer: BarRelocationObserver) {
         *self.bar_relocation_observer.lock_irqsave() = Some(observer);
+    }
+
+    /// Installs the MSI-X Message Control observer (called once by the
+    /// binding). The observer fires from outside the root state lock.
+    pub(crate) fn set_msix_control_observer(&self, observer: MsixControlObserver) {
+        *self.msix_control_observer.lock_irqsave() = Some(observer);
+    }
+
+    /// Returns whether the MSI-X control observer was installed.
+    pub(crate) fn msix_control_observer_installed(&self) -> bool {
+        self.msix_control_observer.lock_irqsave().is_some()
+    }
+
+    fn dispatch_msix_control(&self, bdf: PciBdf, value: u16) {
+        let observer = self.msix_control_observer.lock_irqsave().clone();
+        if let Some(observer) = observer {
+            observer(bdf, value);
+        }
     }
 
     /// Returns whether the relocation observer was installed.
@@ -123,6 +152,7 @@ impl PciRootState {
     ) -> PciResult {
         let (offset, size) = offset.validate_access(width)?;
         let mut relocated = None;
+        let mut msix_control = None;
         {
             let mut state = self.state.lock_irqsave();
             let Some(function_index) = state.function_index(bdf) else {
@@ -134,7 +164,17 @@ impl PciRootState {
             else {
                 state.functions[function_index].write_non_bar(offset, size, value);
                 let command_after = state.functions[function_index].command_state();
+                // A write crossing the MSI-X Message Control bytes must reach
+                // the bound endpoint's delivery state.
+                if state.functions[function_index].has_msix()
+                    && (offset..offset + size).contains(&(super::config::MSIX_CAP_OFFSET + 2))
+                {
+                    msix_control = state.functions[function_index].msix_message_control();
+                }
                 drop(state);
+                if let Some(value) = msix_control {
+                    self.dispatch_msix_control(bdf, value);
+                }
                 if command_after != command_before {
                     dispatch_command_effect(command_after);
                 }

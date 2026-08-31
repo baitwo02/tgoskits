@@ -7,7 +7,17 @@ use super::{
     address::CONFIG_SPACE_SIZE,
     bar::{BarState, ResolvedBarPlan},
     function::PciConfigByte,
+    msix::{MSIX_BAR_INDEX, MSIX_PBA_OFFSET, MSIX_TABLE_OFFSET},
 };
+
+/// Fixed config-space location of the MSI-X capability (frozen by design).
+pub(crate) const MSIX_CAP_OFFSET: usize = 0x40;
+/// Capability ID for MSI-X (PCI Local Bus spec, appendix H).
+const MSIIX_CAP_ID: u8 = 0x11;
+/// Status register bit 4: capability list present.
+const STATUS_CAP_LIST_PRESENT: u8 = 0x10;
+/// Writable Message Control bits: MSI-X Enable (15) and Function Mask (14).
+const MSIX_CONTROL_WRITABLE_HIGH: u8 = 0xC0;
 
 const COMMAND_MEMORY_SPACE_ENABLE: u8 = 0x02;
 const COMMAND_BUS_MASTER_ENABLE: u8 = 0x04;
@@ -43,6 +53,7 @@ impl PowerOnConfig {
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
         config_bytes: &[PciConfigByte],
+        msix: Option<super::msix::PciMsixDeclaration>,
     ) -> PciResult<Self> {
         if identity.vendor_id() == u16::MAX {
             return Err(super::PciError::InvalidEndpointIdentity {
@@ -72,6 +83,34 @@ impl PowerOnConfig {
             bytes[offset..offset + 4]
                 .copy_from_slice(&((bar.address as u32 & 0xffff_fff0) | attributes).to_le_bytes());
         }
+        if let Some(msix) = msix {
+            // The MSI-X capability sits at the frozen offset; the status
+            // register advertises the capability list and the pointer chain
+            // terminates after it.
+            bytes[6] |= STATUS_CAP_LIST_PRESENT;
+            bytes[0x34] = MSIX_CAP_OFFSET as u8;
+            bytes[MSIX_CAP_OFFSET] = MSIIX_CAP_ID;
+            bytes[MSIX_CAP_OFFSET + 1] = 0; // next pointer: last capability
+            // Message Control: table size (vectors - 1) in the low bits is
+            // read-only; Enable and Function Mask are guest-writable.
+            let table_size = msix.vectors() - 1;
+            bytes[MSIX_CAP_OFFSET + 2..MSIX_CAP_OFFSET + 4]
+                .copy_from_slice(&table_size.to_le_bytes());
+            write_mask[MSIX_CAP_OFFSET + 2] = 0;
+            write_mask[MSIX_CAP_OFFSET + 3] = MSIX_CONTROL_WRITABLE_HIGH;
+            // Table BIR/offset and PBA BIR/offset: frozen to BAR 1. The
+            // offset occupies bits 31:3 verbatim (8-byte alignment) and the
+            // low three bits carry the BIR.
+            let table_bir = MSIX_TABLE_OFFSET as u32 | u32::from(MSIX_BAR_INDEX);
+            bytes[MSIX_CAP_OFFSET + 4..MSIX_CAP_OFFSET + 8]
+                .copy_from_slice(&table_bir.to_le_bytes());
+            let pba_bir = MSIX_PBA_OFFSET as u32 | u32::from(MSIX_BAR_INDEX);
+            bytes[MSIX_CAP_OFFSET + 8..MSIX_CAP_OFFSET + 12]
+                .copy_from_slice(&pba_bir.to_le_bytes());
+            for mask in write_mask[MSIX_CAP_OFFSET + 4..MSIX_CAP_OFFSET + 12].iter_mut() {
+                *mask = 0;
+            }
+        }
         Ok(Self { bytes, write_mask })
     }
 }
@@ -81,6 +120,7 @@ pub(crate) struct FunctionState {
     power_on: PowerOnConfig,
     config: [u8; CONFIG_SPACE_SIZE],
     bars: Vec<BarState>,
+    msix: Option<super::msix::PciMsixDeclaration>,
 }
 
 pub(crate) enum BarWriteAction {
@@ -89,13 +129,35 @@ pub(crate) enum BarWriteAction {
 }
 
 impl FunctionState {
-    pub(crate) fn new(bdf: PciBdf, power_on: PowerOnConfig, bars: &[ResolvedBarPlan]) -> Self {
+    pub(crate) fn new(
+        bdf: PciBdf,
+        power_on: PowerOnConfig,
+        bars: &[ResolvedBarPlan],
+        msix: Option<super::msix::PciMsixDeclaration>,
+    ) -> Self {
         Self {
             bdf,
             config: power_on.bytes,
             power_on,
             bars: bars.iter().copied().map(BarState::new).collect(),
+            msix,
         }
+    }
+
+    /// Returns whether this function declares an MSI-X capability.
+    pub(crate) const fn has_msix(&self) -> bool {
+        self.msix.is_some()
+    }
+
+    /// Reads the MSI-X Message Control value from the config image, if the
+    /// capability is present.
+    pub(crate) fn msix_message_control(&self) -> Option<u16> {
+        self.msix.map(|_| {
+            u16::from_le_bytes([
+                self.config[MSIX_CAP_OFFSET + 2],
+                self.config[MSIX_CAP_OFFSET + 3],
+            ])
+        })
     }
 
     pub(crate) const fn bdf(&self) -> PciBdf {
@@ -213,11 +275,84 @@ mod tests {
             policy: super::super::PciBarDecodePolicy::RelocatableWithinHostAperture,
             address: 0x2000_0000,
         };
-        let power_on = PowerOnConfig::build(identity, &[plan], &[]).unwrap();
-        let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan]);
+        let power_on = PowerOnConfig::build(identity, &[plan], &[], None).unwrap();
+        let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan], None);
 
         state.write_non_bar(0, 4, 0);
 
         assert_eq!(state.read(0, 4), 0x5678_1234);
+    }
+
+    #[test]
+    fn msix_capability_is_visible_and_gated_by_the_write_mask() {
+        use super::super::{
+            PciBarDecodePolicy,
+            msix::{MSIX_BAR_SIZE, PciMsixDeclaration},
+        };
+
+        let identity = PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0x05, 0x00, 0x00));
+        let register_bar = PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x1000).unwrap();
+        let msix_bar = PciMemoryBar::new(PciBarIndex::new(1).unwrap(), MSIX_BAR_SIZE).unwrap();
+        let plan = [
+            ResolvedBarPlan {
+                index: register_bar.index(),
+                size: register_bar.size(),
+                prefetchable: false,
+                policy: PciBarDecodePolicy::RelocatableWithinHostAperture,
+                address: 0x2000_0000,
+            },
+            ResolvedBarPlan {
+                index: msix_bar.index(),
+                size: msix_bar.size(),
+                prefetchable: false,
+                policy: PciBarDecodePolicy::RelocatableWithinHostAperture,
+                address: 0x2001_0000,
+            },
+        ];
+        let msix = PciMsixDeclaration::new(1).unwrap();
+        let power_on = PowerOnConfig::build(identity, &plan, &[], Some(msix)).unwrap();
+        let mut state =
+            FunctionState::new(PciBdf::bus_zero(1), power_on.clone(), &plan, Some(msix));
+
+        // The capability list is advertised and points at the frozen offset.
+        assert_eq!(state.config[6] & 0x10, 0x10);
+        assert_eq!(state.config[0x34], 0x40);
+        assert_eq!(state.config[0x40], 0x11);
+        assert_eq!(state.config[0x41], 0);
+        // Message Control starts with the read-only table size (1 vector → 0)
+        // and the frozen Table/PBA BIR dwords point at BAR 1.
+        assert_eq!(
+            u16::from_le_bytes([state.config[0x42], state.config[0x43]]),
+            0
+        );
+        assert_eq!(state.config[0x44], 0x01);
+        assert_eq!(
+            u32::from_le_bytes([
+                state.config[0x48],
+                state.config[0x49],
+                state.config[0x4a],
+                state.config[0x4b]
+            ]) & 0x7,
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                state.config[0x48],
+                state.config[0x49],
+                state.config[0x4a],
+                state.config[0x4b]
+            ]) >> 3,
+            0x100
+        );
+
+        // Guest writes flip only the writable Enable/Function Mask bits.
+        state.write_non_bar(0x42, 2, 0x8fff);
+        assert_eq!(state.msix_message_control().unwrap(), 0x8000);
+        state.write_non_bar(0x42, 2, 0x4000);
+        assert_eq!(state.msix_message_control().unwrap(), 0x4000);
+        // A function without MSI-X reports no control value.
+        let plain_power_on = PowerOnConfig::build(identity, &plan, &[], None).unwrap();
+        let plain = FunctionState::new(PciBdf::bus_zero(1), plain_power_on, &plan, None);
+        assert!(plain.msix_message_control().is_none());
     }
 }

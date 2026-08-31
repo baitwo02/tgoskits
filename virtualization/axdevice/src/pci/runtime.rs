@@ -122,6 +122,22 @@ pub trait PciFunction: Device {
         Ok(())
     }
 
+    /// Forwards a Message Control write from the config-space MSI-X
+    /// capability.
+    ///
+    /// `message_control` is the full 16-bit register value after masking
+    /// read-only fields. Endpoints implementing MSI-X delivery must update
+    /// their [`MsixState`](crate::MsixState) here; the root keeps no delivery
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// A failure is logged by the root; the guest write itself stands.
+    fn notify_msix_control(&self, message_control: u16) -> DeviceResult {
+        let _ = message_control;
+        Ok(())
+    }
+
     /// Returns the direct stage-2 mappings this endpoint currently maintains.
     ///
     /// The runtime aggregates these per graph node for the guest
@@ -267,6 +283,7 @@ impl PciRootBinding {
         function: Arc<dyn PciFunction>,
     ) -> DeviceManagerResult<PciBindingLease> {
         self.ensure_relocation_observer();
+        self.ensure_msix_control_observer();
         let token = self.router.activate(device, function.clone())?;
         if let Err(error) = self.root.bind_endpoint(function_id, token) {
             drop(self.router.invalidate(token));
@@ -300,6 +317,34 @@ impl PciRootBinding {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Installs the root's MSI-X Message Control observer once, on the
+    /// first bind.
+    fn ensure_msix_control_observer(self: &Arc<Self>) {
+        if self.root.msix_control_observer_installed() {
+            return;
+        }
+        let binding = Arc::downgrade(self);
+        self.root
+            .set_msix_control_observer(Arc::new(move |bdf: PciBdf, value: u16| {
+                let Some(binding) = binding.upgrade() else {
+                    return;
+                };
+                binding.dispatch_msix_control(bdf, value);
+            }));
+    }
+
+    fn dispatch_msix_control(&self, bdf: PciBdf, value: u16) {
+        let Some(token) = self.root.bound_token(bdf) else {
+            return;
+        };
+        let Ok(endpoint) = self.router.endpoint(token) else {
+            return;
+        };
+        if let Err(error) = endpoint.notify_msix_control(value) {
+            log::error!("PCI endpoint MSI-X control notification failed: {error}");
+        }
     }
 
     /// Installs the root's relocation observer once, on the first bind.

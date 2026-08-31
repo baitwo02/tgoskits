@@ -29,12 +29,10 @@ const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 /// here with a unit-test assertion; re-verify against the pinned QEMU and
 /// Jailhouse revisions before claiming interop with real ivshmem drivers.
 const IVSHMEM_REVISION: u8 = 1;
-/// BAR0 is the ivshmem register page. BAR1 stays an inventory placeholder
-/// until the MSI-X feature (F7) defines its table/PBA semantics, and BAR2 is
-/// the shared memory of one link.
+/// BAR0 is the ivshmem register page. BAR1 carries the MSI-X table/PBA
+/// window (F7 device face), and BAR2 is the shared memory of one link.
 const REGISTER_BAR_INDEX: u8 = 0;
 const MSIX_BAR_INDEX: u8 = 1;
-const MSIX_BAR_SIZE: u64 = 0x100;
 const SHARED_MEMORY_BAR_INDEX: u8 = 2;
 const REGISTER_ACCESS_WIDTH_DETAIL: &str =
     "ivshmem BAR0 registers only accept aligned 32-bit accesses";
@@ -126,7 +124,8 @@ impl DeviceModel for IvshmemPciModel {
         )
         .with_bar(register_bar)?
         .with_bar(msix_bar)?
-        .with_bar(shared_memory_bar)?;
+        .with_bar(shared_memory_bar)?
+        .with_msix(PciMsixDeclaration::new(1)?)?;
         DeviceRequirements::new().with_pci_function(function)
     }
 
@@ -157,6 +156,7 @@ impl DeviceModel for IvshmemPciModel {
         let function = IvshmemPciFunction {
             attachment,
             registers: Arc::clone(&registers),
+            msix: Mutex::new(MsixState::new()),
             stage2_remap,
             owner: context.node_id(),
             direct_plan: IrqSafeMutex::new(None),
@@ -180,6 +180,8 @@ impl DeviceModel for IvshmemPciModel {
 struct IvshmemPciFunction {
     attachment: PeerAttachment,
     registers: Arc<Mutex<IvshmemRegisters>>,
+    /// MSI-X capability/table state (F7 device face).
+    msix: Mutex<MsixState>,
     /// Stage-2 update port; BAR2 maps directly into the guest.
     stage2_remap: Arc<dyn Stage2Remap>,
     /// Graph node identity of this endpoint; direct mappings register per
@@ -411,10 +413,13 @@ impl PciFunction for IvshmemPciFunction {
                     .map(u64::from)
                     .map_err(bar_access_error)
             }
-            // BAR1 is an inventory placeholder until MSI-X (F7) defines its
-            // semantics; reads stay zero so guest probes observe a defined
-            // value instead of a routing error.
-            MSIX_BAR_INDEX => Ok(0),
+            // BAR1 carries the MSI-X table/PBA window (F7 device face).
+            MSIX_BAR_INDEX => self
+                .msix
+                .lock()
+                .unwrap()
+                .read_bar(access.offset())
+                .map(u64::from),
             SHARED_MEMORY_BAR_INDEX => self
                 .attachment
                 .link()
@@ -474,7 +479,19 @@ impl PciFunction for IvshmemPciFunction {
                 }
                 Ok(())
             }
-            MSIX_BAR_INDEX => Ok(()),
+            MSIX_BAR_INDEX => {
+                let cleared_pending = self
+                    .msix
+                    .lock()
+                    .unwrap()
+                    .write_bar(access.offset(), value as u32)?;
+                if cleared_pending {
+                    // A cleared PBA bit means a blocked doorbell is waiting;
+                    // the injection sink joins with the MSI planner feature.
+                    // The Event Status merge semantics keep the state true.
+                }
+                Ok(())
+            }
             SHARED_MEMORY_BAR_INDEX => {
                 // One unified permission decision for every BAR2 write: the
                 // state table denies, other peers' outputs deny, the own
@@ -504,10 +521,11 @@ impl PciFunction for IvshmemPciFunction {
     }
 
     fn reset(&self) -> DeviceResult {
-        // Endpoint reset clears the local registers and zeroes this peer's
-        // state-table entry; the rest of the shared backing stays intact for
-        // the other peer.
+        // Endpoint reset clears the local registers, the MSI-X capability
+        // state, and zeroes this peer's state-table entry; the rest of the
+        // shared backing stays intact for the other peer.
         self.lock_registers("reset ivshmem endpoint")?.reset();
+        self.msix.lock().unwrap().reset();
         self.attachment
             .link()
             .clear_state(self.attachment.peer_id())
@@ -678,6 +696,8 @@ mod tests {
             )
             .unwrap(),
         )
+        .unwrap()
+        .with_msix(PciMsixDeclaration::new(1).unwrap())
         .unwrap();
         assert_eq!(function, &expected);
     }
@@ -1234,6 +1254,113 @@ mod tests {
                 .unwrap(),
             TEST_VALUE
         );
+    }
+
+    #[test]
+    fn config_space_exposes_the_msix_capability() {
+        let registry = test_registry();
+        let stage2_peer0 = Arc::new(TestStage2Remap::default());
+        let peer0 = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::clone(&stage2_peer0),
+        );
+        peer0.enable_memory();
+
+        // Status register bit 4 advertises the capability list.
+        let status = peer0
+            .root
+            .read_config(peer0.bdf, ConfigOffset::new(6).unwrap(), AccessWidth::Word)
+            .unwrap();
+        assert_eq!(status & 0x10, 0x10);
+        // The list starts at the frozen offset with the MSI-X capability ID.
+        let pointer = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x34).unwrap(),
+                AccessWidth::Byte,
+            )
+            .unwrap();
+        assert_eq!(pointer, 0x40);
+        let cap_id = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x40).unwrap(),
+                AccessWidth::Byte,
+            )
+            .unwrap();
+        assert_eq!(cap_id, 0x11);
+        // Message Control: table size 0 (one vector), disabled by default.
+        let control = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+            )
+            .unwrap();
+        assert_eq!(control, 0);
+        // Table BIR/offset and PBA BIR/offset are frozen to BAR 1.
+        let table_bir = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x44).unwrap(),
+                AccessWidth::Dword,
+            )
+            .unwrap();
+        assert_eq!(table_bir & 0x7, 1);
+        let pba_bir = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x48).unwrap(),
+                AccessWidth::Dword,
+            )
+            .unwrap();
+        assert_eq!(pba_bir & 0x7, 1);
+        assert_eq!((pba_bir >> 3) * 8, 0x800);
+
+        // The Message Control Enable bit is guest-writable; the read-only
+        // table-size bits ignore writes (the shadow keeps the frozen size 0).
+        peer0
+            .root
+            .write_config(
+                peer0.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+                0x8fff,
+            )
+            .unwrap();
+        let control = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+            )
+            .unwrap();
+        assert_eq!(control, 0x8000);
+        peer0
+            .root
+            .write_config(
+                peer0.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+                0,
+            )
+            .unwrap();
+        let control = peer0
+            .root
+            .read_config(
+                peer0.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+            )
+            .unwrap();
+        assert_eq!(control, 0);
     }
 
     #[test]
