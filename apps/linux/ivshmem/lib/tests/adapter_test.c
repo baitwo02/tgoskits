@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,7 +348,7 @@ static void test_backends_are_explicit(char *root)
     event_status =
         (volatile uint32_t *)((char *)registers + IVSHMEM_REG_EVENT_STATUS);
 
-    /* The interrupt backend exists only from F7 and must refuse explicitly;
+    /* Without a matching UIO binding, interrupt mode refuses explicitly;
      * there is no silent polling fallback. */
     CHECK_EQ(ivshmem_backend_open(dev, IVSHMEM_BACKEND_INTERRUPT, &backend),
              IVSHMEM_ERR_BACKEND);
@@ -372,6 +373,67 @@ static void test_backends_are_explicit(char *root)
     CHECK_EQ(*event_status, 1);
 
     CHECK_EQ(ivshmem_backend_wait_event(NULL, 100), IVSHMEM_ERR_ARGS);
+    ivshmem_backend_close(backend);
+    ivshmem_device_close(dev);
+}
+
+static void test_interrupt_backend_discovers_uio_and_rearms(char *root)
+{
+    struct ivshmem_device *dev = NULL;
+    struct ivshmem_backend *backend = NULL;
+    void *registers = NULL;
+    size_t register_size = 0;
+    char device_dir[512];
+    char class_root[512];
+    char class_uio[512];
+    char class_device[512];
+    char device_root[512];
+    char uio_node[512];
+    uint32_t event_count = 7;
+    uint32_t rearm = 0;
+    int writer;
+    int observer;
+
+    make_full_ivshmem(root, "0000:00:01.0");
+    snprintf(device_dir, sizeof(device_dir), "%s/0000:00:01.0", root);
+    snprintf(class_root, sizeof(class_root), "%s/uio-class", root);
+    snprintf(class_uio, sizeof(class_uio), "%s/uio0", class_root);
+    snprintf(class_device, sizeof(class_device), "%s/device", class_uio);
+    snprintf(device_root, sizeof(device_root), "%s/dev", root);
+    snprintf(uio_node, sizeof(uio_node), "%s/uio0", device_root);
+    CHECK_EQ(mkdir(class_root, 0755), 0);
+    CHECK_EQ(mkdir(class_uio, 0755), 0);
+    CHECK_EQ(mkdir(device_root, 0755), 0);
+    CHECK_EQ(symlink(device_dir, class_device), 0);
+    CHECK_EQ(mkfifo(uio_node, 0600), 0);
+
+    CHECK_EQ(ivshmem_find_at(root, "0000:00:01.0", &dev), IVSHMEM_OK);
+    CHECK_EQ(ivshmem_map_bar(dev, IVSHMEM_BAR_REGISTERS, &registers,
+                             &register_size),
+             IVSHMEM_OK);
+    CHECK_EQ(ivshmem_backend_open_at(dev, IVSHMEM_BACKEND_INTERRUPT,
+                                     class_root, device_root, &backend),
+             IVSHMEM_OK);
+    CHECK(backend != NULL);
+
+    writer = open(uio_node, O_WRONLY | O_NONBLOCK);
+    CHECK(writer >= 0);
+    if (writer >= 0) {
+        CHECK_EQ(write(writer, &event_count, sizeof(event_count)),
+                 (ssize_t)sizeof(event_count));
+        CHECK_EQ(ivshmem_backend_wait_event(backend, 100), 1);
+        close(writer);
+    }
+    observer = open(uio_node, O_RDONLY | O_NONBLOCK);
+    CHECK(observer >= 0);
+    if (observer >= 0) {
+        CHECK_EQ(read(observer, &rearm, sizeof(rearm)),
+                 (ssize_t)sizeof(rearm));
+        CHECK_EQ(rearm, 1);
+        close(observer);
+    }
+    CHECK_EQ(ivshmem_backend_wait_event(backend, 10), 0);
+
     ivshmem_backend_close(backend);
     ivshmem_device_close(dev);
 }
@@ -421,6 +483,9 @@ int main(void)
 
     make_root("backend", root, sizeof(root));
     test_backends_are_explicit(root);
+
+    make_root("interrupt", root, sizeof(root));
+    test_interrupt_backend_discovers_uio_and_rearms(root);
 
     test_strerror_covers_every_code();
 

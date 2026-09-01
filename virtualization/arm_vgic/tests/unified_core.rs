@@ -304,7 +304,10 @@ fn message_sink_signal_table_validates_the_guest_encoding() {
     .unwrap()
     .with_its(vec![ItsConfig::new(
         ItsId::new(0),
-        region(0x0808_0000, 0x1_0000),
+        // QEMU virt and the guest DTB expose the ITS as two 64 KiB pages:
+        // a control page plus the translation page that holds
+        // GITS_TRANSLATER.
+        region(0x0808_0000, 0x2_0000),
     )])
     .unwrap();
     let core = Arc::new(
@@ -326,20 +329,25 @@ fn message_sink_signal_table_validates_the_guest_encoding() {
         .unwrap();
 
     // The planned encoding for a GICv3 ITS MSI: the address is the ITS
-    // instance's GITS_TRANSLATER (frame base + 0x0040) and the data is the
-    // planned EventID. A matching encoding passes the boundary validation
-    // and reaches the injection path; this minimal fixture has no
-    // initialized LPI tables, so the backend rejects the delivery with a
-    // non-encoding error.
-    let delivered = endpoint.signal_table(0x0808_0040, 5);
+    // instance's GITS_TRANSLATER (frame base + 0x10040; the register sits at
+    // offset 0x40 of the second 64 KiB page per the Arm GICv3 ITS register
+    // map, and Linux programs the same address) and the data is the planned
+    // EventID. A matching encoding passes the boundary validation and
+    // reaches the injection path; this minimal fixture has no initialized
+    // LPI tables, so the backend rejects the delivery with a non-encoding
+    // error.
+    let delivered = endpoint.signal_table(0x0809_0040, 5);
     assert!(!matches!(
         delivered,
         Err(IrqError::MessageEncodingMismatch { .. })
     ));
 
-    // A wrong EventID or a wrong address is refused as an encoding mismatch
+    // A wrong EventID or a wrong address — including the first 64 KiB page
+    // that holds only control registers — is refused as an encoding mismatch
     // without injecting.
-    let error = endpoint.signal_table(0x0808_0040, 6).unwrap_err();
+    let error = endpoint.signal_table(0x0809_0040, 6).unwrap_err();
+    assert!(matches!(error, IrqError::MessageEncodingMismatch { .. }));
+    let error = endpoint.signal_table(0x0808_0040, 5).unwrap_err();
     assert!(matches!(error, IrqError::MessageEncodingMismatch { .. }));
     let error = endpoint.signal_table(0x0908_0040, 5).unwrap_err();
     assert!(matches!(error, IrqError::MessageEncodingMismatch { .. }));

@@ -57,6 +57,11 @@ impl IvshmemRegisters {
         *self = Self::new();
     }
 
+    /// Returns whether interrupt notification is enabled for this endpoint.
+    pub const fn notifications_enabled(&self) -> bool {
+        self.interrupt_control & INTERRUPT_CONTROL_ENABLE != 0
+    }
+
     /// Sets the pending bit (bit 0) of the event status register.
     ///
     /// Multiple pending doorbells merge into this single bit by design;

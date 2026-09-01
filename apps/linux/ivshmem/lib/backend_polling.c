@@ -7,12 +7,14 @@
  * backend owns the W1C handshake on Event Status so callers cannot get the
  * clear-then-recheck order wrong.
  */
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include "ivshmem_internal.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +26,13 @@
  * slow enough not to saturate a single guest CPU. */
 #define IVSHMEM_POLL_INTERVAL_MS 1
 
+#define IVSHMEM_UIO_CLASS "/sys/class/uio"
+#define IVSHMEM_DEVICE_ROOT "/dev"
+
 struct ivshmem_backend {
     struct ivshmem_device *dev;
+    enum ivshmem_backend_kind kind;
+    int interrupt_fd;
 };
 
 int ivshmem_enable_device(struct ivshmem_device *dev)
@@ -142,7 +149,8 @@ int ivshmem_map_bar(struct ivshmem_device *dev, uint8_t bar, void **map,
         return IVSHMEM_ERR_ARGS;
     }
     if (bar == IVSHMEM_BAR_MSIX) {
-        /* The MSI-X BAR has no guest-visible semantics before F7. */
+        /* Linux PCI/MSI-X owns the table and PBA; userspace must not map or
+         * modify them behind the kernel's vector state. */
         return IVSHMEM_ERR_BACKEND;
     }
     if (!is_mappable_bar(bar)) {
@@ -244,26 +252,128 @@ void *ivshmem_shared_memory(const struct ivshmem_device *dev, size_t *size)
     return dev->bars[IVSHMEM_BAR_SHARED].map;
 }
 
-int ivshmem_backend_open(struct ivshmem_device *dev,
-                         enum ivshmem_backend_kind kind,
-                         struct ivshmem_backend **out)
+static int is_uio_name(const char *name)
+{
+    const char *digit;
+
+    if (strncmp(name, "uio", 3) != 0 || name[3] == '\0') {
+        return 0;
+    }
+    for (digit = name + 3; *digit != '\0'; digit++) {
+        if (*digit < '0' || *digit > '9') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int open_matching_uio(const struct ivshmem_device *dev,
+                             const char *uio_class_root,
+                             const char *device_root)
+{
+    char expected_device[IVSHMEM_PATH_MAX];
+    char class_path[IVSHMEM_PATH_MAX];
+    char resolved_device[IVSHMEM_PATH_MAX];
+    char device_path[IVSHMEM_PATH_MAX];
+    char match[256] = { 0 };
+    struct dirent *entry;
+    DIR *directory;
+
+    if (realpath(dev->sysfs_dir, expected_device) == NULL) {
+        return -1;
+    }
+    directory = opendir(uio_class_root);
+    if (directory == NULL) {
+        return -1;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        if (!is_uio_name(entry->d_name)) {
+            continue;
+        }
+        int written = snprintf(class_path, sizeof(class_path), "%s/%s/device",
+                               uio_class_root, entry->d_name);
+
+        if (written < 0 || (size_t)written >= sizeof(class_path) ||
+            realpath(class_path, resolved_device) == NULL ||
+            strcmp(resolved_device, expected_device) != 0) {
+            continue;
+        }
+        if (match[0] != '\0') {
+            closedir(directory);
+            return -1;
+        }
+        if (strlen(entry->d_name) >= sizeof(match)) {
+            closedir(directory);
+            return -1;
+        }
+        memcpy(match, entry->d_name, strlen(entry->d_name) + 1);
+    }
+    closedir(directory);
+    if (match[0] == '\0') {
+        return -1;
+    }
+    {
+        int written = snprintf(device_path, sizeof(device_path), "%s/%s",
+                               device_root, match);
+
+        if (written < 0 || (size_t)written >= sizeof(device_path)) {
+            return -1;
+        }
+    }
+    return open(device_path, O_RDWR | O_CLOEXEC);
+}
+
+int ivshmem_backend_open_at(struct ivshmem_device *dev,
+                            enum ivshmem_backend_kind kind,
+                            const char *uio_class_root,
+                            const char *device_root,
+                            struct ivshmem_backend **out)
 {
     struct ivshmem_backend *backend;
 
-    if (dev == NULL || out == NULL) {
+    if (dev == NULL || out == NULL || uio_class_root == NULL ||
+        device_root == NULL) {
         return IVSHMEM_ERR_ARGS;
     }
-    if (kind != IVSHMEM_BACKEND_POLLING) {
-        /* Explicit refusal, never a silent polling fallback. */
-        return IVSHMEM_ERR_BACKEND;
+    *out = NULL;
+    if (kind != IVSHMEM_BACKEND_POLLING &&
+        kind != IVSHMEM_BACKEND_INTERRUPT) {
+        return IVSHMEM_ERR_ARGS;
     }
     backend = calloc(1, sizeof(*backend));
     if (backend == NULL) {
         return IVSHMEM_ERR_NOMEM;
     }
     backend->dev = dev;
+    backend->kind = kind;
+    backend->interrupt_fd = -1;
+    if (kind == IVSHMEM_BACKEND_INTERRUPT) {
+        void *registers = NULL;
+        size_t register_size = 0;
+
+        if (ivshmem_map_bar(dev, IVSHMEM_BAR_REGISTERS, &registers,
+                            &register_size) != IVSHMEM_OK ||
+            register_size < IVSHMEM_REG_PAGE_SIZE) {
+            free(backend);
+            return IVSHMEM_ERR_BACKEND;
+        }
+        backend->interrupt_fd =
+            open_matching_uio(dev, uio_class_root, device_root);
+        if (backend->interrupt_fd < 0) {
+            free(backend);
+            return IVSHMEM_ERR_BACKEND;
+        }
+    }
     *out = backend;
     return IVSHMEM_OK;
+}
+
+int ivshmem_backend_open(struct ivshmem_device *dev,
+                         enum ivshmem_backend_kind kind,
+                         struct ivshmem_backend **out)
+{
+    return ivshmem_backend_open_at(dev, kind, IVSHMEM_UIO_CLASS,
+                                   IVSHMEM_DEVICE_ROOT, out);
 }
 
 static long monotonic_ms(void)
@@ -282,22 +392,16 @@ static void sleep_poll_interval(void)
     nanosleep(&pause, NULL);
 }
 
-int ivshmem_backend_wait_event(struct ivshmem_backend *be, int timeout_ms)
+static int wait_polling(struct ivshmem_backend *backend, int timeout_ms)
 {
     long deadline = timeout_ms < 0 ? 0 : monotonic_ms() + timeout_ms;
 
-    if (be == NULL || be->dev == NULL) {
-        return IVSHMEM_ERR_ARGS;
-    }
     for (;;) {
-        uint32_t status = ivshmem_read_reg32(be->dev,
+        uint32_t status = ivshmem_read_reg32(backend->dev,
                                              IVSHMEM_REG_EVENT_STATUS);
 
         if (status & 1) {
-            /* The backend owns the W1C clear so callers cannot forget it;
-             * the next call re-reads Event Status and protocol state, per
-             * the release-order contract frozen with the doorbell feature. */
-            ivshmem_write_reg32(be->dev, IVSHMEM_REG_EVENT_STATUS, 1);
+            ivshmem_write_reg32(backend->dev, IVSHMEM_REG_EVENT_STATUS, 1);
             return 1;
         }
         if (timeout_ms >= 0 && monotonic_ms() >= deadline) {
@@ -307,7 +411,53 @@ int ivshmem_backend_wait_event(struct ivshmem_backend *be, int timeout_ms)
     }
 }
 
+static int wait_interrupt(struct ivshmem_backend *backend, int timeout_ms)
+{
+    struct pollfd ready = {
+        .fd = backend->interrupt_fd,
+        .events = POLLIN,
+    };
+    uint32_t event_count;
+    uint32_t rearm = 1;
+    int result;
+
+    result = poll(&ready, 1, timeout_ms);
+    if (result == 0) {
+        return 0;
+    }
+    if (result < 0 || (ready.revents & POLLIN) == 0 ||
+        read(backend->interrupt_fd, &event_count, sizeof(event_count)) !=
+            (ssize_t)sizeof(event_count)) {
+        return IVSHMEM_ERR_IO;
+    }
+    /* UIO masks the vector in its handler. Clear protocol state before
+     * rearming so a new interrupt cannot race with stale Event Status. */
+    ivshmem_write_reg32(backend->dev, IVSHMEM_REG_EVENT_STATUS, 1);
+    if (write(backend->interrupt_fd, &rearm, sizeof(rearm)) !=
+        (ssize_t)sizeof(rearm)) {
+        return IVSHMEM_ERR_IO;
+    }
+    return 1;
+}
+
+int ivshmem_backend_wait_event(struct ivshmem_backend *be, int timeout_ms)
+{
+    if (be == NULL || be->dev == NULL) {
+        return IVSHMEM_ERR_ARGS;
+    }
+    if (be->kind == IVSHMEM_BACKEND_INTERRUPT) {
+        return wait_interrupt(be, timeout_ms);
+    }
+    return wait_polling(be, timeout_ms);
+}
+
 void ivshmem_backend_close(struct ivshmem_backend *be)
 {
+    if (be == NULL) {
+        return;
+    }
+    if (be->interrupt_fd >= 0) {
+        close(be->interrupt_fd);
+    }
     free(be);
 }

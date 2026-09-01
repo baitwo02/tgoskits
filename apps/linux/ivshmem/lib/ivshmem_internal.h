@@ -71,4 +71,17 @@ int ivshmem_find_at(const char *devices_root, const char *bdf,
 int ivshmem_bar_size(const struct ivshmem_device *dev, uint8_t bar,
                      size_t *size);
 
+/**
+ * Opens an event backend through injectable UIO roots.
+ *
+ * Production callers use `/sys/class/uio` and `/dev`; host tests supply a
+ * fixture class and an fd-backed device node while exercising the same
+ * discovery and wait implementation.
+ */
+int ivshmem_backend_open_at(struct ivshmem_device *dev,
+                            enum ivshmem_backend_kind kind,
+                            const char *uio_class_root,
+                            const char *device_root,
+                            struct ivshmem_backend **out);
+
 #endif /* IVSHMEM_INTERNAL_H */

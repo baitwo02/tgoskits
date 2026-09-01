@@ -31,7 +31,11 @@ pub use ecam::{
 pub use error::{PciError, PciResult};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
 pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};
-pub use msix::{MSIX_BAR_SIZE, MsixState, MsixTableEntry, PciMsixDeclaration};
+pub use msix::{
+    MSIX_BAR_SIZE, MSIX_MESSAGE_CONTROL_ENABLE, MSIX_MESSAGE_CONTROL_FUNCTION_MASK,
+    MSIX_PBA_OFFSET, MSIX_TABLE_ENTRY_SIZE, MSIX_TABLE_OFFSET, MsixState, MsixTableEntry,
+    PciMsixDeclaration,
+};
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{

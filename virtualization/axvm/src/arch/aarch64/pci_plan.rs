@@ -1,10 +1,15 @@
 //! AArch64 generic-ECAM host construction and resolved firmware view.
 
-use std::sync::Arc;
+use std::{sync::Arc, vec::Vec};
 
 use axdevice::*;
 
-use crate::{AxVmError, AxVmResult, boot::fdt::core::pci::GuestPciHost, config::AxVMConfig};
+use crate::{
+    AxVmError, AxVmResult,
+    boot::fdt::core::pci::{GuestPciHost, PciMsiMapEntry},
+    config::AxVMConfig,
+    machine::GuestGicProfile,
+};
 
 const PCI_HOST_ID: &str = "pci-host";
 const PCI_HOST_KEY: &str = "aarch64-ecam";
@@ -134,13 +139,82 @@ impl Aarch64PciPlan {
         let resources = graph.resources_for(&host_id)?;
         let ecam = resources.mmio(&ResourceSlot::new(ECAM_SLOT)?)?;
         let memory = resources.mmio(&ResourceSlot::new(MEMORY_SLOT)?)?;
-        let firmware = GuestPciHost::new(ecam, memory)?;
+        let msi_map = resolved_msi_map(graph, topology, config.gic_profile())?;
+        let firmware = GuestPciHost::new(ecam, memory)?.with_msi_map(msi_map)?;
         Ok(Some(Self { firmware }))
     }
 
-    pub(super) const fn firmware(&self) -> GuestPciHost {
-        self.firmware
+    pub(super) fn firmware(&self) -> GuestPciHost {
+        self.firmware.clone()
     }
+}
+
+fn resolved_msi_map(
+    graph: &ResolvedDeviceGraph,
+    topology: &ResolvedPciTopology,
+    gic_profile: Option<&GuestGicProfile>,
+) -> AxVmResult<Vec<PciMsiMapEntry>> {
+    let mut entries = Vec::new();
+    for function in topology.functions() {
+        let resources = graph.resources_for(function.owner())?;
+        let msi_ranges = resources
+            .msi_ranges()
+            .map(|(_, msi)| msi)
+            .collect::<Vec<_>>();
+        if msi_ranges.is_empty() {
+            if function.msix().is_some() {
+                return Err(AxVmError::invalid_config(std::format!(
+                    "PCI function {} declares MSI-X without a planned MSI endpoint",
+                    function.id()
+                )));
+            }
+            continue;
+        }
+        let [msi] = msi_ranges.as_slice() else {
+            return Err(AxVmError::unsupported(
+                "create AArch64 PCI MSI map",
+                std::format!(
+                    "PCI function {} has {} MSI resource slots; one is supported",
+                    function.id(),
+                    msi_ranges.len()
+                ),
+            ));
+        };
+        if function
+            .msix()
+            .is_some_and(|msix| u32::from(msix.vectors()) > msi.count())
+        {
+            return Err(AxVmError::invalid_config(std::format!(
+                "PCI function {} exposes more MSI-X vectors than planned MSI messages",
+                function.id()
+            )));
+        }
+        let profile = gic_profile
+            .and_then(|gic| gic.its.iter().find(|its| its.id == msi.its()))
+            .ok_or_else(|| {
+                AxVmError::invalid_config(std::format!(
+                    "PCI function {} targets ITS {:?}, which is absent from guest firmware",
+                    function.id(),
+                    msi.its()
+                ))
+            })?;
+        let phandle = profile.node_phandle.ok_or_else(|| {
+            AxVmError::invalid_config(std::format!(
+                "guest ITS {:?} needs a phandle for the PCI msi-map",
+                msi.its()
+            ))
+        })?;
+        let bdf = function.bdf();
+        let requester_id = (u32::from(bdf.bus()) << 8)
+            | (u32::from(bdf.device()) << 3)
+            | u32::from(bdf.function());
+        entries.push(PciMsiMapEntry::new(
+            requester_id,
+            phandle,
+            msi.device().value(),
+        ));
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]

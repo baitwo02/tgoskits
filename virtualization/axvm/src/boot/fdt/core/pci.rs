@@ -16,11 +16,30 @@ const MEMORY32_SPACE: u32 = 0x0200_0000;
 /// The view is constructed from the two graph-resolved host resources and
 /// validates the generic ECAM firmware contract before serialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PciMsiMapEntry {
+    requester_id: u32,
+    its_phandle: u32,
+    device_id: u32,
+}
+
+impl PciMsiMapEntry {
+    /// Maps one PCI requester ID to one planner-resolved ITS DeviceID.
+    pub(crate) const fn new(requester_id: u32, its_phandle: u32, device_id: u32) -> Self {
+        Self {
+            requester_id,
+            its_phandle,
+            device_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuestPciHost {
     ecam_base: u64,
     ecam_size: u64,
     memory_base: u64,
     memory_size: u64,
+    msi_map: Vec<PciMsiMapEntry>,
 }
 
 impl GuestPciHost {
@@ -53,30 +72,58 @@ impl GuestPciHost {
             ecam_size: ecam.1,
             memory_base: memory.0,
             memory_size: memory.1,
+            msi_map: Vec::new(),
         })
     }
 
-    pub(crate) const fn ecam_base(self) -> u64 {
+    /// Attaches requester-ID mappings derived from the resolved PCI and MSI
+    /// resources. Each requester owns one DeviceID, so every entry has span 1.
+    pub(crate) fn with_msi_map(mut self, mut entries: Vec<PciMsiMapEntry>) -> AxVmResult<Self> {
+        entries.sort_by_key(|entry| entry.requester_id);
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.requester_id > u16::MAX.into() {
+                return Err(AxVmError::invalid_config(format!(
+                    "PCI requester ID {:#x} does not fit the 16-bit msi-map namespace",
+                    entry.requester_id
+                )));
+            }
+            if entry.its_phandle == 0 {
+                return Err(AxVmError::invalid_config(
+                    "PCI msi-map cannot reference phandle zero",
+                ));
+            }
+            if index != 0 && entries[index - 1].requester_id == entry.requester_id {
+                return Err(AxVmError::invalid_config(format!(
+                    "PCI requester ID {:#x} has more than one MSI mapping",
+                    entry.requester_id
+                )));
+            }
+        }
+        self.msi_map = entries;
+        Ok(self)
+    }
+
+    pub(crate) const fn ecam_base(&self) -> u64 {
         self.ecam_base
     }
 
-    pub(crate) const fn ecam_size(self) -> u64 {
+    pub(crate) const fn ecam_size(&self) -> u64 {
         self.ecam_size
     }
 
-    pub(crate) const fn memory_base(self) -> u64 {
+    pub(crate) const fn memory_base(&self) -> u64 {
         self.memory_base
     }
 
-    pub(crate) const fn memory_size(self) -> u64 {
+    pub(crate) const fn memory_size(&self) -> u64 {
         self.memory_size
     }
 
-    fn ecam_range(self) -> Range<u64> {
+    fn ecam_range(&self) -> Range<u64> {
         self.ecam_base..self.ecam_base + self.ecam_size
     }
 
-    fn memory_range(self) -> Range<u64> {
+    fn memory_range(&self) -> Range<u64> {
         self.memory_base..self.memory_base + self.memory_size
     }
 }
@@ -85,7 +132,7 @@ pub(crate) fn install_pci_host(
     fdt_bytes: &[u8],
     host: Option<&GuestPciHost>,
 ) -> AxVmResult<Vec<u8>> {
-    let Some(host) = host.copied() else {
+    let Some(host) = host else {
         return Ok(fdt_bytes.to_vec());
     };
     let mut tree = FdtTree::from_bytes(fdt_bytes)?;
@@ -98,7 +145,7 @@ pub(crate) fn install_pci_host(
     Ok(bytes)
 }
 
-fn validate_tree(tree: &FdtTree, host: GuestPciHost) -> AxVmResult {
+fn validate_tree(tree: &FdtTree, host: &GuestPciHost) -> AxVmResult {
     for node_id in tree.inner().iter_node_ids() {
         let node = tree.inner().node(node_id).ok_or_else(|| {
             AxVmError::invalid_config("FDT node disappeared during PCI validation")
@@ -147,10 +194,27 @@ fn validate_tree(tree: &FdtTree, host: GuestPciHost) -> AxVmResult {
             }
         }
     }
+    for entry in &host.msi_map {
+        let target = tree
+            .inner()
+            .get_by_phandle(entry.its_phandle.into())
+            .ok_or_else(|| {
+                AxVmError::invalid_config(format!(
+                    "PCI msi-map references missing ITS phandle {:#x}",
+                    entry.its_phandle
+                ))
+            })?;
+        if target.as_node().get_property("msi-controller").is_none() {
+            return Err(AxVmError::invalid_config(format!(
+                "PCI msi-map phandle {:#x} is not an MSI controller",
+                entry.its_phandle
+            )));
+        }
+    }
     Ok(())
 }
 
-fn add_host_node(tree: &mut FdtTree, host: GuestPciHost) -> AxVmResult {
+fn add_host_node(tree: &mut FdtTree, host: &GuestPciHost) -> AxVmResult {
     let root = tree.inner().root_id();
     let root_node = tree
         .inner()
@@ -182,6 +246,14 @@ fn add_host_node(tree: &mut FdtTree, host: GuestPciHost) -> AxVmResult {
     ranges.extend(encode_cells(host.memory_base(), parent_address_cells)?);
     ranges.extend(encode_cells(host.memory_size(), 2)?);
     tree.set_property(node_id, cell_property("ranges", &ranges))?;
+    if !host.msi_map.is_empty() {
+        let cells = host
+            .msi_map
+            .iter()
+            .flat_map(|entry| [entry.requester_id, entry.its_phandle, entry.device_id, 1])
+            .collect::<Vec<_>>();
+        tree.set_property(node_id, cell_property("msi-map", &cells))?;
+    }
     tree.set_property(node_id, Property::new("dma-coherent", Vec::new()))?;
     Ok(())
 }
@@ -223,7 +295,7 @@ mod tests {
     use fdt_edit::{Fdt, Node, NodeType, PciRange, PciSpace, Property};
     use fdt_raw::RegInfo;
 
-    use super::{GuestPciHost, install_pci_host};
+    use super::{GuestPciHost, PciMsiMapEntry, install_pci_host};
 
     fn base_fdt() -> Vec<u8> {
         fdt_with_root_cells(2, 2)
@@ -243,6 +315,24 @@ mod tests {
 
     fn host() -> GuestPciHost {
         GuestPciHost::new((0x0b00_0000, 0x10_0000), (0x0c00_0000, 0x0400_0000)).unwrap()
+    }
+
+    fn fdt_with_its(phandle: u32) -> Vec<u8> {
+        let mut fdt = Fdt::from_bytes(&base_fdt()).unwrap();
+        let its = fdt.add_node(fdt.root_id(), Node::new("its@8080000"));
+        let mut compatible = Property::new("compatible", Vec::new());
+        compatible.set_string("arm,gic-v3-its");
+        fdt.node_mut(its).unwrap().set_property(compatible);
+        fdt.node_mut(its)
+            .unwrap()
+            .set_property(Property::new("msi-controller", Vec::new()));
+        let mut msi_cells = Property::new("#msi-cells", Vec::new());
+        msi_cells.set_u32_ls(&[1]);
+        fdt.node_mut(its).unwrap().set_property(msi_cells);
+        let mut phandle_property = Property::new("phandle", Vec::new());
+        phandle_property.set_u32_ls(&[phandle]);
+        fdt.node_mut(its).unwrap().set_property(phandle_property);
+        fdt.encode().as_ref().to_vec()
     }
 
     #[test]
@@ -303,6 +393,41 @@ mod tests {
         ] {
             assert!(node.get_property(absent).is_none(), "unexpected {absent}");
         }
+    }
+
+    #[test]
+    fn resolved_msi_resources_encode_requester_to_device_map() {
+        let host = host()
+            .with_msi_map(vec![
+                PciMsiMapEntry::new(0x08, 7, 0),
+                PciMsiMapEntry::new(0x10, 7, 1),
+            ])
+            .unwrap();
+        let bytes = install_pci_host(&fdt_with_its(7), Some(&host)).unwrap();
+        let fdt = Fdt::from_bytes(&bytes).unwrap();
+        let node = fdt
+            .find_compatible(&["pci-host-ecam-generic"])
+            .into_iter()
+            .next()
+            .unwrap()
+            .as_node();
+        assert_eq!(
+            node.get_property("msi-map")
+                .unwrap()
+                .get_u32_iter()
+                .collect::<Vec<_>>(),
+            [0x08, 7, 0, 1, 0x10, 7, 1, 1]
+        );
+        assert!(node.get_property("interrupt-map").is_none());
+    }
+
+    #[test]
+    fn missing_msi_controller_target_is_rejected() {
+        let host = host()
+            .with_msi_map(vec![PciMsiMapEntry::new(0x08, 7, 0)])
+            .unwrap();
+        let error = install_pci_host(&base_fdt(), Some(&host)).unwrap_err();
+        assert!(error.to_string().contains("missing ITS phandle 0x7"));
     }
 
     #[test]

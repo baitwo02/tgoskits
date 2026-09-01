@@ -1,0 +1,27 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?m)^AXVISOR_AARCH64_VPCI_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^IVSHMEM_INTERRUPT_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^ivshmem interrupt failed(?:\\s|$)",
+]
+# The polling marker is printed by the ivshmem adapter smoke program after
+# discovery, mapping, profile registers, the BAR2 payload round-trip, and
+# two doorbell/Event Status cycles all passed (04-linux-uio-driver-path.md
+# marker contract).
+success_regex = [
+  "(?m)^ivshmem interrupt pass\\s*$",
+]
+timeout = 240
+to_bin = true
+uefi = false

@@ -15,11 +15,19 @@ pub(crate) fn append_configured_devices(
     nodes: &mut Vec<DeviceNodeSpec>,
     default_controller_node: &DeviceNodeId,
     default_controller: InterruptControllerId,
+    default_message_controller: Option<(InterruptControllerId, ItsId)>,
 ) -> AxVmResult {
-    let base_context = DeviceInstantiationContext::new()
+    let mut base_context = DeviceInstantiationContext::new()
         .with_vm_id(config.id())
         .with_default_wired_controller(default_controller_node.clone(), default_controller)
         .with_ivshmem_registry(config.ivshmem_link_registry());
+    if let Some((controller, its)) = default_message_controller {
+        base_context = base_context.with_default_message_controller(
+            default_controller_node.clone(),
+            controller,
+            its,
+        );
+    }
     let default = default_serial_intent(config, default_controller)?;
     let request = config
         .virtual_device_requests()
@@ -257,6 +265,7 @@ mod tests {
             &mut nodes,
             &controller,
             InterruptControllerId::new(0),
+            None,
         )
         .unwrap();
 
@@ -308,6 +317,7 @@ mod tests {
             &mut nodes,
             &controller,
             InterruptControllerId::new(0),
+            None,
         )
         .unwrap();
 

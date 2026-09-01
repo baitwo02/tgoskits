@@ -21,12 +21,24 @@ use crate::{arceos::cbuild::cc_for_arch, support::process::ProcessExt};
 /// the generated initramfs.
 pub(super) const IVSHMEM_SMOKE_ENV: &str = "AXVISOR_TEST_IVSHMEM_SMOKE";
 
+/// Build-group environment variable pointing at kernel-matched UIO modules.
+pub(super) const IVSHMEM_UIO_MODULE_DIR_ENV: &str = "AXVISOR_TEST_IVSHMEM_UIO_MODULE_DIR";
+
+/// Guest paths of the UIO core and ivshmem PCI modules.
+pub(super) const UIO_CORE_ARCHIVE_PATH: &str = "lib/modules/uio.ko";
+pub(super) const UIO_IVSHMEM_ARCHIVE_PATH: &str = "lib/modules/uio_ivshmem.ko";
+
 /// Guest path of the smoke binary inside the generated initramfs.
 pub(super) const SMOKE_ARCHIVE_PATH: &str = "bin/ivshmem-bar2-smoke";
 
 const ADAPTER_SOURCES: &[&str] = &["discovery.c", "backend_polling.c", "errors.c"];
 const SMOKE_SOURCE: &str = "bar2_smoke/main.c";
 const SMOKE_BINARY_NAME: &str = "ivshmem-bar2-smoke";
+
+pub(super) struct UioModules {
+    pub(super) core: Vec<u8>,
+    pub(super) ivshmem: Vec<u8>,
+}
 
 /// Adapter compile flags: C11, size-optimized, warnings fatal. The adapter
 /// must stay warning-clean so a profile regression cannot hide behind noise.
@@ -44,6 +56,38 @@ const ADAPTER_CFLAGS: &[&str] = &[
 /// Production guest binaries are statically linked: the musl toolchain
 /// always ships a static libc, so the initramfs needs no loader for it.
 const SMOKE_STATIC_LINK_FLAGS: &[&str] = &["-static", "-Wl,--gc-sections"];
+
+/// Reads UIO modules produced by the same build as the configured guest
+/// kernel. The directory is workspace-relative so test configurations cannot
+/// silently consume host-global modules with an unrelated vermagic.
+pub(super) fn read_uio_modules(
+    workspace_root: &Path,
+    configured_dir: &str,
+) -> anyhow::Result<UioModules> {
+    let configured_dir = Path::new(configured_dir);
+    if configured_dir.is_absolute()
+        || !configured_dir.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        bail!(
+            "{IVSHMEM_UIO_MODULE_DIR_ENV} must be a workspace-relative path without parent \
+             traversal"
+        );
+    }
+    let module_dir = workspace_root.join(configured_dir);
+    let read_module = |name: &str| {
+        let path = module_dir.join(name);
+        fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
+    };
+    Ok(UioModules {
+        core: read_module("uio.ko")?,
+        ivshmem: read_module("uio_ivshmem.ko")?,
+    })
+}
 
 /// Builds the statically linked smoke binary for `arch` and returns its
 /// bytes, recompiling from the current sources on every call.
@@ -173,6 +217,46 @@ mod tests {
         let binary =
             build_smoke_binary_with(&workspace_root, "aarch64", "cc", &[]).expect("smoke binary");
         assert!(binary.len() > 1024);
+    }
+
+    #[test]
+    fn adapter_behavior_tests_run_against_fixture_sysfs_and_uio() {
+        if !has_host_cc() {
+            panic!("a host C compiler is required for the adapter behavior test");
+        }
+        let workspace_root = crate::context::workspace_root_path().unwrap();
+        let adapter_dir = workspace_root.join("apps/linux/ivshmem");
+        let lib_dir = adapter_dir.join("lib");
+        let out_dir = workspace_root.join("target/axbuild/ivshmem-smoke/host-tests");
+        fs::create_dir_all(&out_dir).unwrap();
+        let binary = out_dir.join("adapter-test");
+        let mut command = Command::new("cc");
+        command.args(ADAPTER_CFLAGS);
+        command.arg(format!("-I{}", lib_dir.display()));
+        for source in ADAPTER_SOURCES {
+            command.arg(lib_dir.join(source));
+        }
+        command.arg(lib_dir.join("tests/adapter_test.c"));
+        command.arg("-o").arg(&binary);
+        command.exec().expect("compile adapter behavior test");
+        Command::new(&binary)
+            .exec()
+            .expect("run adapter behavior test");
+    }
+
+    #[test]
+    fn uio_modules_must_come_from_a_workspace_relative_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let module_dir = workspace.path().join("kernel-modules");
+        fs::create_dir(&module_dir).unwrap();
+        fs::write(module_dir.join("uio.ko"), b"uio").unwrap();
+        fs::write(module_dir.join("uio_ivshmem.ko"), b"ivshmem").unwrap();
+
+        let modules = read_uio_modules(workspace.path(), "kernel-modules").unwrap();
+        assert_eq!(modules.core, b"uio");
+        assert_eq!(modules.ivshmem, b"ivshmem");
+        assert!(read_uio_modules(workspace.path(), "../outside").is_err());
+        assert!(read_uio_modules(workspace.path(), "/outside").is_err());
     }
 
     #[test]

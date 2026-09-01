@@ -92,7 +92,8 @@ int ivshmem_enable_device(struct ivshmem_device *dev);
  * Maps one memory BAR of the device.
  *
  * @param bar   One of IVSHMEM_BAR_REGISTERS / IVSHMEM_BAR_SHARED.
- *              IVSHMEM_BAR_MSIX returns IVSHMEM_ERR_BACKEND before F7.
+ *              IVSHMEM_BAR_MSIX remains kernel-owned and returns
+ *              IVSHMEM_ERR_BACKEND.
  * @param map   Receives the mapping base pointer.
  * @param size  Receives the mapping size in bytes.
  * @return IVSHMEM_OK or a negative error; the mapping stays valid until
@@ -114,7 +115,7 @@ void *ivshmem_shared_memory(const struct ivshmem_device *dev, size_t *size);
 
 enum ivshmem_backend_kind {
     IVSHMEM_BACKEND_POLLING = 0,
-    IVSHMEM_BACKEND_INTERRUPT = 1, /* implemented with F7 only */
+    IVSHMEM_BACKEND_INTERRUPT = 1,
 };
 
 /**
@@ -134,9 +135,9 @@ int ivshmem_backend_open(struct ivshmem_device *dev,
  *
  * POLLING: polls Event Status bit 0; on return 1 the bit has been cleared
  * (write-1-to-clear) so the next call can observe the following event.
- * INTERRUPT (F7): reads the 4-byte event count from /dev/uioN, the caller
- * clears Event Status, then the backend re-enables the vector by writing 1
- * to the UIO fd (irqcontrol).
+ * INTERRUPT: reads the 4-byte event count from /dev/uioN, clears Event
+ * Status, then re-enables the vector by writing 1 to the UIO fd
+ * (`irqcontrol`).
  *
  * @param timeout_ms  Milliseconds; a negative value waits indefinitely.
  * @return 1 when an event was observed, 0 on timeout, negative ivshmem_err

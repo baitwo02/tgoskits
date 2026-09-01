@@ -4,7 +4,9 @@ use core::fmt;
 use std::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use axdevice::*;
-use axdevice_base::{ControllerInputId, InterruptControllerId, InterruptSharing, InterruptTrigger};
+use axdevice_base::{
+    ControllerInputId, InterruptControllerId, InterruptSharing, InterruptTrigger, ItsId,
+};
 use axvmconfig::VirtualDeviceRequest;
 
 use crate::{machine::GuestSerialFirmwareIdentity, *};
@@ -92,6 +94,7 @@ impl FixedDeviceBindings {
 pub struct DeviceInstantiationContext {
     vm_id: Option<usize>,
     default_wired_controller: Option<(DeviceNodeId, InterruptControllerId)>,
+    default_message_controller: Option<(DeviceNodeId, InterruptControllerId, ItsId)>,
     fixed: FixedDeviceBindings,
     firmware_binding: DeviceFirmwareBinding,
     serial_profile: Option<crate::machine::GuestSerialProfile>,
@@ -105,6 +108,7 @@ impl DeviceInstantiationContext {
         Self {
             vm_id: None,
             default_wired_controller: None,
+            default_message_controller: None,
             fixed: FixedDeviceBindings::default(),
             firmware_binding: DeviceFirmwareBinding::None,
             serial_profile: None,
@@ -141,6 +145,31 @@ impl DeviceInstantiationContext {
     /// Returns the graph node that must precede users of the default wired domain.
     pub fn default_wired_controller_node(&self) -> Option<&DeviceNodeId> {
         self.default_wired_controller.as_ref().map(|(node, _)| node)
+    }
+
+    /// Injects the VM's default message-signaled interrupt domain.
+    pub fn with_default_message_controller(
+        mut self,
+        node: DeviceNodeId,
+        controller: InterruptControllerId,
+        its: ItsId,
+    ) -> Self {
+        self.default_message_controller = Some((node, controller, its));
+        self
+    }
+
+    /// Returns the controller and ITS identities of the default MSI domain.
+    pub fn default_message_controller(&self) -> Option<(InterruptControllerId, ItsId)> {
+        self.default_message_controller
+            .as_ref()
+            .map(|(_, controller, its)| (*controller, *its))
+    }
+
+    /// Returns the graph node that must precede users of the default MSI domain.
+    pub fn default_message_controller_node(&self) -> Option<&DeviceNodeId> {
+        self.default_message_controller
+            .as_ref()
+            .map(|(node, ..)| node)
     }
 
     pub fn fixed_bindings(&self) -> &FixedDeviceBindings {

@@ -220,6 +220,13 @@ impl ResolvedDeviceResources {
             .ok_or_else(|| resource_kind_error(slot, "MSI"))
     }
 
+    /// Iterates all resolved MSI slots in stable slot order.
+    pub fn msi_ranges(&self) -> impl Iterator<Item = (&ResourceSlot, ResolvedMsi)> {
+        self.entries
+            .iter()
+            .filter_map(|(slot, resource)| resource.msi().map(|msi| (slot, msi)))
+    }
+
     /// Returns a deterministic fingerprint of all resolved slot values.
     pub fn fingerprint(&self) -> u64 {
         let mut value = FNV_OFFSET_BASIS;

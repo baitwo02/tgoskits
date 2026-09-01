@@ -151,9 +151,13 @@ impl MsixState {
 
     /// Writes the Message Control register; only Enable and Function Mask
     /// are writable, Table Size and BIR fields are read-only.
-    pub fn write_message_control(&mut self, value: u16) {
+    ///
+    /// Returns `true` when this write makes a pending vector deliverable.
+    pub fn write_message_control(&mut self, value: u16) -> bool {
+        let was_blocked = self.vector_blocked(0);
         let writable = MSIX_MESSAGE_CONTROL_ENABLE | MSIX_MESSAGE_CONTROL_FUNCTION_MASK;
         self.message_control = (self.message_control & !writable) | (value & writable);
+        was_blocked && !self.vector_blocked(0) && self.pending(0)
     }
 
     /// Returns whether MSI-X is enabled.
@@ -205,9 +209,9 @@ impl MsixState {
 
     /// Writes one aligned Dword of the MSI-X BAR.
     ///
-    /// Table writes update the entry; PBA writes are write-1-to-clear and
-    /// report via the return value whether a pending bit was cleared, which
-    /// is the caller's trigger to attempt a delivery.
+    /// Table writes update the entry; PBA writes are ignored because pending
+    /// bits are device-owned. The return value reports whether removing the
+    /// vector mask made a pending vector deliverable.
     ///
     /// # Errors
     ///
@@ -224,10 +228,11 @@ impl MsixState {
         }
         if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + MSIX_TABLE_ENTRY_SIZE).contains(&offset) {
             let word = (offset - MSIX_TABLE_OFFSET) / 4;
+            let was_blocked = self.vector_blocked(0);
             match self.table.word_mut(word * 4) {
                 Some(field) => {
                     *field = value;
-                    return Ok(false);
+                    return Ok(was_blocked && !self.vector_blocked(0) && self.pending(0));
                 }
                 None => {
                     return Err(DeviceError::OutOfRange { addr: offset });
@@ -235,9 +240,7 @@ impl MsixState {
             }
         }
         if offset == MSIX_PBA_OFFSET {
-            let cleared = self.pba & value != 0;
-            self.pba &= !value;
-            return Ok(cleared);
+            return Ok(false);
         }
         if offset >= MSIX_BAR_SIZE {
             return Err(DeviceError::OutOfRange { addr: offset });
@@ -286,6 +289,23 @@ impl MsixState {
             0 => self.pba & 1 != 0,
             _ => false,
         }
+    }
+
+    /// Takes one pending table entry when every MSI-X gate permits delivery.
+    ///
+    /// The PBA bit is cleared before the caller injects outside the state
+    /// lock. A failed injection must call [`restore_pending`](Self::restore_pending).
+    pub fn take_pending_entry(&mut self, vector: u16) -> Option<MsixTableEntry> {
+        if !self.pending(vector) || self.vector_blocked(vector) {
+            return None;
+        }
+        self.pba &= !1;
+        self.table_entry(vector)
+    }
+
+    /// Restores a vector's PBA bit after an attempted injection failed.
+    pub fn restore_pending(&mut self, vector: u16) {
+        self.set_pending(vector);
     }
 
     /// Clears Enable, function mask, table runtime state and PBA.
@@ -347,20 +367,50 @@ mod tests {
     }
 
     #[test]
-    fn pba_is_write_one_to_clear() {
+    fn pba_is_device_owned_and_guest_writes_are_ignored() {
         let mut state = MsixState::new();
         assert!(state.set_pending(0));
         assert!(state.pending(0));
-        // Writing one clears and reports the pending bit.
-        assert!(state.write_bar(MSIX_PBA_OFFSET, 1).unwrap());
-        assert!(!state.pending(0));
-        // Writing zero changes nothing.
-        state.set_pending(0);
-        assert!(!state.write_bar(MSIX_PBA_OFFSET, 0).unwrap());
-        assert!(state.pending(0));
-        // Writing one when clear reports nothing to re-deliver.
-        state.write_bar(MSIX_PBA_OFFSET, 1).unwrap();
         assert!(!state.write_bar(MSIX_PBA_OFFSET, 1).unwrap());
+        assert!(state.pending(0));
+        assert_eq!(state.read_bar(MSIX_PBA_OFFSET).unwrap(), 1);
+    }
+
+    #[test]
+    fn unblocking_transitions_report_pending_delivery() {
+        let mut state = MsixState::new();
+        state.write_bar(0xc, 1).unwrap();
+        state.set_pending(0);
+
+        // Enabling while the vector remains masked cannot deliver yet.
+        assert!(!state.write_message_control(MSIX_MESSAGE_CONTROL_ENABLE));
+        // Removing the vector mask makes the pending vector deliverable.
+        assert!(state.write_bar(0xc, 0).unwrap());
+
+        state.write_bar(0xc, 1).unwrap();
+        state.set_pending(0);
+        state.write_message_control(
+            MSIX_MESSAGE_CONTROL_ENABLE | MSIX_MESSAGE_CONTROL_FUNCTION_MASK,
+        );
+        state.write_bar(0xc, 0).unwrap();
+        // Removing Function Mask is the final gate transition.
+        assert!(state.write_message_control(MSIX_MESSAGE_CONTROL_ENABLE));
+    }
+
+    #[test]
+    fn pending_entry_is_taken_only_when_deliverable() {
+        let mut state = MsixState::new();
+        state.write_bar(0x0, 0x0808_0040).unwrap();
+        state.write_bar(0x8, 5).unwrap();
+        state.set_pending(0);
+        assert!(state.take_pending_entry(0).is_none());
+        state.write_message_control(MSIX_MESSAGE_CONTROL_ENABLE);
+        let entry = state.take_pending_entry(0).unwrap();
+        assert_eq!(entry.message_address(), 0x0808_0040);
+        assert_eq!(entry.message_data(), 5);
+        assert!(!state.pending(0));
+        state.restore_pending(0);
+        assert!(state.pending(0));
     }
 
     #[test]

@@ -284,6 +284,22 @@ case "$cmdline" in
     run_pci_enumeration_check IVSHMEM_POLLING_ENUMERATION_PASSED
     /bin/ivshmem-bar2-smoke --backend polling
     exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-interrupt*)
+    # Enumerate before binding so the shared check can still diagnose an
+    # unexpected pre-existing driver. Both modules must match this kernel;
+    # load or probe failures are interrupt-path failures, never permission to
+    # run the polling backend instead.
+    run_pci_enumeration_check IVSHMEM_INTERRUPT_ENUMERATION_PASSED
+    if ! /bin/busybox insmod /lib/modules/uio.ko; then
+      echo "ivshmem interrupt failed module: cannot load uio.ko"
+    elif ! /bin/busybox insmod /lib/modules/uio_ivshmem.ko; then
+      echo "ivshmem interrupt failed module: cannot load uio_ivshmem.ko"
+    elif [ ! -c /dev/uio0 ]; then
+      echo "ivshmem interrupt failed module: /dev/uio0 was not created"
+    else
+      /bin/ivshmem-bar2-smoke --backend interrupt
+    fi
+    exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=off*)
     if [ -d /sys/firmware/acpi/tables ]; then
       echo AXVISOR_X86_ACPI_FAILED
@@ -533,11 +549,23 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             )?),
             None => None,
         };
+        let uio_modules = cargo
+            .env
+            .get(super::ivshmem_smoke::IVSHMEM_UIO_MODULE_DIR_ENV)
+            .map(|directory| super::ivshmem_smoke::read_uio_modules(workspace_root, directory))
+            .transpose()?;
+        ensure!(
+            uio_modules.is_none() || smoke_binary.is_some(),
+            "{} requires {}",
+            super::ivshmem_smoke::IVSHMEM_UIO_MODULE_DIR_ENV,
+            super::ivshmem_smoke::IVSHMEM_SMOKE_ENV
+        );
         prepare_busybox_initramfs(
             &rootfs_path,
             &output_path,
             &request.arch,
             smoke_binary.as_deref(),
+            uio_modules.as_ref(),
         )?;
         println!(
             "prepared Axvisor QEMU test initramfs: {}",
@@ -577,6 +605,7 @@ fn prepare_busybox_initramfs(
     output_path: &Path,
     arch: &str,
     smoke_binary: Option<&[u8]>,
+    uio_modules: Option<&super::ivshmem_smoke::UioModules>,
 ) -> anyhow::Result<()> {
     let busybox = required_rootfs_file(rootfs_path, BUSYBOX_PATH)?;
     let loader_path = musl_loader_path(arch)?;
@@ -592,6 +621,7 @@ fn prepare_busybox_initramfs(
         &libpci,
         &pci_ids,
         smoke_binary,
+        uio_modules,
     )?;
 
     let output_parent = output_path.parent().with_context(|| {
@@ -651,6 +681,7 @@ fn build_busybox_initramfs(
     libpci: &[u8],
     pci_ids: &[u8],
     smoke_binary: Option<&[u8]>,
+    uio_modules: Option<&super::ivshmem_smoke::UioModules>,
 ) -> anyhow::Result<Vec<u8>> {
     let init_script = init_script();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -672,6 +703,16 @@ fn build_busybox_initramfs(
         add_parent_directories(libpci_archive_path, &mut directories);
         let pci_ids_archive_path = archive_path(PCI_IDS_PATH)?;
         add_parent_directories(pci_ids_archive_path, &mut directories);
+        if uio_modules.is_some() {
+            add_parent_directories(
+                super::ivshmem_smoke::UIO_CORE_ARCHIVE_PATH,
+                &mut directories,
+            );
+            add_parent_directories(
+                super::ivshmem_smoke::UIO_IVSHMEM_ARCHIVE_PATH,
+                &mut directories,
+            );
+        }
         for directory in directories {
             archive.append_directory(&directory)?;
         }
@@ -683,10 +724,17 @@ fn build_busybox_initramfs(
         archive.append_symlink(archive_path(LIBPCI_SONAME_PATH)?, "libpci.so.3.14.0")?;
         archive.append_regular(pci_ids_archive_path, pci_ids)?;
         if let Some(smoke_binary) = smoke_binary {
-            // The ivshmem polling case runs the adapter smoke program from
-            // the guest; it is added only when the case requests it so other
-            // groups keep a toolchain-free initramfs.
+            // The ivshmem cases run the adapter smoke program from the guest;
+            // it is added only when requested so unrelated groups keep a
+            // toolchain-free initramfs.
             archive.append_regular(super::ivshmem_smoke::SMOKE_ARCHIVE_PATH, smoke_binary)?;
+        }
+        if let Some(modules) = uio_modules {
+            archive.append_regular(super::ivshmem_smoke::UIO_CORE_ARCHIVE_PATH, &modules.core)?;
+            archive.append_regular(
+                super::ivshmem_smoke::UIO_IVSHMEM_ARCHIVE_PATH,
+                &modules.ivshmem,
+            )?;
         }
         archive.append_regular("init", &init_script)?;
         for applet in [
@@ -816,6 +864,7 @@ mod tests {
             b"libpci",
             b"pci-ids",
             Some(b"smoke-binary-bytes"),
+            None,
         )
         .unwrap();
         let mut archive = Vec::new();
@@ -827,6 +876,39 @@ mod tests {
         assert_eq!(
             entries.get("bin/ivshmem-bar2-smoke").unwrap(),
             b"smoke-binary-bytes"
+        );
+    }
+
+    #[test]
+    fn generated_archive_carries_kernel_matched_uio_modules() {
+        let modules = super::super::ivshmem_smoke::UioModules {
+            core: b"uio-core-module".to_vec(),
+            ivshmem: b"ivshmem-pci-module".to_vec(),
+        };
+        let compressed = build_busybox_initramfs(
+            b"busybox",
+            "/lib/ld-musl-test.so.1",
+            b"loader",
+            b"lspci",
+            b"libpci",
+            b"pci-ids",
+            Some(b"smoke"),
+            Some(&modules),
+        )
+        .unwrap();
+        let mut archive = Vec::new();
+        GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut archive)
+            .unwrap();
+        let entries = parse_newc_entries(&archive);
+
+        assert_eq!(
+            entries.get("lib/modules/uio.ko").unwrap(),
+            b"uio-core-module"
+        );
+        assert_eq!(
+            entries.get("lib/modules/uio_ivshmem.ko").unwrap(),
+            b"ivshmem-pci-module"
         );
     }
 
@@ -851,6 +933,7 @@ mod tests {
             b"lspci",
             b"libpci",
             b"pci-ids",
+            None,
             None,
         )
         .unwrap();
@@ -920,6 +1003,14 @@ mod tests {
         assert!(
             init.windows(b"axvisor.pci_case=ivshmem-polling".len())
                 .any(|window| window == b"axvisor.pci_case=ivshmem-polling")
+        );
+        assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-interrupt".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-interrupt")
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-bar2-smoke --backend interrupt".len())
+                .any(|window| window == b"/bin/ivshmem-bar2-smoke --backend interrupt")
         );
         assert!(
             init.windows(b"/bin/ivshmem-bar2-smoke --backend polling".len())

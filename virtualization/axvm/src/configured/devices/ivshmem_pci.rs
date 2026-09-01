@@ -14,7 +14,8 @@ use std::{
 use ax_std::os::arceos::sync::IrqSafeMutex;
 use axdevice::*;
 use axdevice_base::{
-    AccessWidth, Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource,
+    AccessWidth, Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult,
+    InterruptControllerId, ItsId, MsiEndpoint, Resource,
 };
 use axvmconfig::VirtualDeviceRequest;
 
@@ -34,6 +35,7 @@ const IVSHMEM_REVISION: u8 = 1;
 const REGISTER_BAR_INDEX: u8 = 0;
 const MSIX_BAR_INDEX: u8 = 1;
 const SHARED_MEMORY_BAR_INDEX: u8 = 2;
+const MSI_RESOURCE_SLOT: &str = "ivshmem-msix";
 const REGISTER_ACCESS_WIDTH_DETAIL: &str =
     "ivshmem BAR0 registers only accept aligned 32-bit accesses";
 
@@ -91,6 +93,21 @@ fn create_device_node(
                 model: request.model.clone(),
                 detail: "no ivshmem link registry was injected into this VM".into(),
             })?;
+    let (message_controller, its) = context.default_message_controller().ok_or_else(|| {
+        ConfiguredDeviceError::Instantiation {
+            device: request.id.clone(),
+            model: request.model.clone(),
+            detail: "no message-signaled interrupt domain was injected into this VM".into(),
+        }
+    })?;
+    let message_controller_node = context
+        .default_message_controller_node()
+        .cloned()
+        .ok_or_else(|| ConfiguredDeviceError::Instantiation {
+            device: request.id.clone(),
+            model: request.model.clone(),
+            detail: "the message-signaled interrupt domain has no graph owner".into(),
+        })?;
     let profile = LinkProfile::new(options.max_peers, options.common_size, options.output_size)
         .map_err(|error| ConfiguredDeviceError::Instantiation {
             device: request.id.clone(),
@@ -109,12 +126,19 @@ fn create_device_node(
         })?;
     Ok(DeviceNodeSpec::virtual_device(
         id,
-        Arc::new(IvshmemPciModel { reservation }),
-    ))
+        Arc::new(IvshmemPciModel {
+            reservation,
+            message_controller,
+            its,
+        }),
+    )
+    .with_dependency(message_controller_node))
 }
 
 struct IvshmemPciModel {
     reservation: PeerReservation,
+    message_controller: InterruptControllerId,
+    its: ItsId,
 }
 
 impl DeviceModel for IvshmemPciModel {
@@ -139,7 +163,19 @@ impl DeviceModel for IvshmemPciModel {
         .with_bar(msix_bar)?
         .with_bar(shared_memory_bar)?
         .with_msix(PciMsixDeclaration::new(1)?)?;
-        DeviceRequirements::new().with_pci_function(function)
+        DeviceRequirements::new()
+            .with_msi(
+                ResourceSlot::new(MSI_RESOURCE_SLOT)?,
+                MsiResourceRequest::new(
+                    self.message_controller,
+                    self.its,
+                    1,
+                    ResourceRequest::Auto,
+                    ResourceRequest::Auto,
+                    ResourceRequest::Auto,
+                )?,
+            )?
+            .with_pci_function(function)
     }
 
     fn firmware(&self) -> DeviceFirmwareSpec {
@@ -165,20 +201,26 @@ impl DeviceModel for IvshmemPciModel {
                     operation: "build ivshmem PCI endpoint",
                     detail: "no stage-2 update port was injected into this VM".into(),
                 })?;
+        let msi = context.msi(MSI_RESOURCE_SLOT)?;
         let registers = Arc::new(Mutex::new(IvshmemRegisters::new()));
+        let msix = Arc::new(Mutex::new(MsixState::new()));
+        let event_sink = Arc::new(MsixDoorbellSink::new(
+            Arc::clone(&registers),
+            Arc::clone(&msix),
+            msi,
+        ));
         let function = IvshmemPciFunction {
             attachment,
-            registers: Arc::clone(&registers),
-            msix: Mutex::new(MsixState::new()),
+            registers,
+            msix,
+            event_sink: Arc::clone(&event_sink),
             stage2_remap,
             owner: context.node_id(),
             direct_plan: IrqSafeMutex::new(None),
         };
-        // The sink shares the endpoint's register lock, so events routed by
-        // the link land in exactly the registers BAR0 exposes.
         function
             .attachment
-            .set_event_sink(Arc::new(RegisterEventSink::new(registers)))
+            .set_event_sink(event_sink)
             .map_err(|error| DeviceManagerError::InvalidState {
                 operation: "build ivshmem PCI endpoint",
                 detail: error.to_string(),
@@ -193,8 +235,11 @@ impl DeviceModel for IvshmemPciModel {
 struct IvshmemPciFunction {
     attachment: PeerAttachment,
     registers: Arc<Mutex<IvshmemRegisters>>,
-    /// MSI-X capability/table state (F7 device face).
-    msix: Mutex<MsixState>,
+    /// MSI-X capability/table state shared with the doorbell sink.
+    msix: Arc<Mutex<MsixState>>,
+    /// Doorbell-to-MSI-X adapter used by unmask transitions for pending
+    /// redelivery.
+    event_sink: Arc<MsixDoorbellSink>,
     /// Stage-2 update port; BAR2 maps directly into the guest.
     stage2_remap: Arc<dyn Stage2Remap>,
     /// Graph node identity of this endpoint; direct mappings register per
@@ -205,36 +250,87 @@ struct IvshmemPciFunction {
     direct_plan: IrqSafeMutex<Option<IvshmemDirectPlan>>,
 }
 
-/// The endpoint's event sink: doorbells routed by the link record the event
-/// in this endpoint's register page.
+/// Records doorbell state and injects the endpoint's planned MSI-X message.
 ///
-/// The sink shares the endpoint's register `Mutex` instead of owning state,
-/// so the Event Status observed through BAR0 and the events recorded by the
-/// link cannot diverge.
-struct RegisterEventSink {
+/// Lock order is `registers -> msix`; message injection always runs after
+/// both locks are released. BAR and config writes release their state lock
+/// before requesting pending redelivery, so the order has no reverse edge.
+struct MsixDoorbellSink {
     registers: Arc<Mutex<IvshmemRegisters>>,
+    msix: Arc<Mutex<MsixState>>,
+    msi: MsiEndpoint,
 }
 
-impl RegisterEventSink {
-    fn new(registers: Arc<Mutex<IvshmemRegisters>>) -> Self {
-        Self { registers }
+impl MsixDoorbellSink {
+    fn new(
+        registers: Arc<Mutex<IvshmemRegisters>>,
+        msix: Arc<Mutex<MsixState>>,
+        msi: MsiEndpoint,
+    ) -> Self {
+        Self {
+            registers,
+            msix,
+            msi,
+        }
+    }
+
+    /// Delivers one coalesced pending message when every device gate allows
+    /// it. A failed controller injection restores the PBA bit for retry.
+    fn redeliver_pending(&self) -> Result<(), IvshmemError> {
+        let entry = {
+            let registers = self.lock_registers("redeliver pending MSI-X event")?;
+            if !registers.notifications_enabled() {
+                return Ok(());
+            }
+            self.lock_msix("redeliver pending MSI-X event")?
+                .take_pending_entry(0)
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let address =
+            (u64::from(entry.message_upper_address()) << 32) | u64::from(entry.message_address());
+        if let Err(error) = self.msi.signal_table(address, entry.message_data()) {
+            self.lock_msix("restore failed MSI-X delivery")?
+                .restore_pending(0);
+            return Err(IvshmemError::EventDeliveryFailed {
+                operation: "inject MSI-X doorbell",
+                detail: error.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn lock_registers(
+        &self,
+        operation: &'static str,
+    ) -> Result<MutexGuard<'_, IvshmemRegisters>, IvshmemError> {
+        self.registers
+            .lock()
+            .map_err(|_| IvshmemError::EventDeliveryFailed {
+                operation,
+                detail: "ivshmem register lock is poisoned".into(),
+            })
+    }
+
+    fn lock_msix(
+        &self,
+        operation: &'static str,
+    ) -> Result<MutexGuard<'_, MsixState>, IvshmemError> {
+        self.msix
+            .lock()
+            .map_err(|_| IvshmemError::EventDeliveryFailed {
+                operation,
+                detail: "ivshmem MSI-X state lock is poisoned".into(),
+            })
     }
 }
 
-impl IvshmemEventSink for RegisterEventSink {
-    fn deliver(&self, event: DoorbellEvent) -> Result<(), IvshmemError> {
-        let Ok(mut registers) = self.registers.lock() else {
-            return Err(IvshmemError::EventDeliveryFailed {
-                operation: "record doorbell event",
-                detail: format!(
-                    "peer {} register lock is poisoned while recording a doorbell from peer {}",
-                    event.target().value(),
-                    event.source().value()
-                ),
-            });
-        };
-        registers.record_event();
-        Ok(())
+impl IvshmemEventSink for MsixDoorbellSink {
+    fn deliver(&self, _event: DoorbellEvent) -> Result<(), IvshmemError> {
+        self.lock_registers("record doorbell event")?.record_event();
+        self.lock_msix("queue MSI-X doorbell")?.set_pending(0);
+        self.redeliver_pending()
     }
 }
 
@@ -248,6 +344,22 @@ impl IvshmemPciFunction {
             .map_err(|_| DeviceError::InvalidState {
                 operation,
                 detail: "ivshmem register lock is poisoned".into(),
+            })
+    }
+
+    fn lock_msix(&self, operation: &'static str) -> DeviceResult<MutexGuard<'_, MsixState>> {
+        self.msix.lock().map_err(|_| DeviceError::InvalidState {
+            operation,
+            detail: "ivshmem MSI-X state lock is poisoned".into(),
+        })
+    }
+
+    fn redeliver_pending(&self, operation: &'static str) -> DeviceResult {
+        self.event_sink
+            .redeliver_pending()
+            .map_err(|error| DeviceError::Backend {
+                operation,
+                detail: error.to_string(),
             })
     }
 
@@ -413,6 +525,16 @@ impl PciFunction for IvshmemPciFunction {
             .unwrap_or_default()
     }
 
+    fn notify_msix_control(&self, message_control: u16) -> DeviceResult {
+        let should_redeliver = self
+            .lock_msix("update ivshmem MSI-X Message Control")?
+            .write_message_control(message_control);
+        if should_redeliver {
+            self.redeliver_pending("redeliver ivshmem MSI-X after Message Control write")?;
+        }
+        Ok(())
+    }
+
     fn read_bar(
         &self,
         access: PciBarAccess,
@@ -433,13 +555,17 @@ impl PciFunction for IvshmemPciFunction {
                     .map(u64::from)
                     .map_err(bar_access_error)
             }
-            // BAR1 carries the MSI-X table/PBA window (F7 device face).
-            MSIX_BAR_INDEX => self
-                .msix
-                .lock()
-                .unwrap()
-                .read_bar(access.offset())
-                .map(u64::from),
+            MSIX_BAR_INDEX => {
+                if access.width() != AccessWidth::Dword {
+                    return Err(DeviceError::InvalidInput {
+                        operation: "read ivshmem MSI-X BAR",
+                        detail: "MSI-X table and PBA only accept aligned 32-bit accesses".into(),
+                    });
+                }
+                self.lock_msix("read ivshmem MSI-X BAR")?
+                    .read_bar(access.offset())
+                    .map(u64::from)
+            }
             SHARED_MEMORY_BAR_INDEX => {
                 let backing = self.attachment.link().backing().map_err(bar_access_error)?;
                 backing
@@ -483,6 +609,11 @@ impl PciFunction for IvshmemPciFunction {
                         .write(access.offset(), value)
                         .map_err(bar_access_error)?;
                 }
+                if access.offset() == INTERRUPT_CONTROL_OFFSET {
+                    self.redeliver_pending(
+                        "redeliver ivshmem MSI-X after Interrupt Control write",
+                    )?;
+                }
                 // The local register is the first state transition; the
                 // state-table publish follows outside the register lock, so
                 // the register and backing locks never nest. Between the two
@@ -500,15 +631,21 @@ impl PciFunction for IvshmemPciFunction {
                 Ok(())
             }
             MSIX_BAR_INDEX => {
-                let cleared_pending = self
-                    .msix
-                    .lock()
-                    .unwrap()
-                    .write_bar(access.offset(), value as u32)?;
-                if cleared_pending {
-                    // A cleared PBA bit means a blocked doorbell is waiting;
-                    // the injection sink joins with the MSI planner feature.
-                    // The Event Status merge semantics keep the state true.
+                if access.width() != AccessWidth::Dword {
+                    return Err(DeviceError::InvalidInput {
+                        operation: "write ivshmem MSI-X BAR",
+                        detail: "MSI-X table and PBA only accept aligned 32-bit accesses".into(),
+                    });
+                }
+                let value = u32::try_from(value).map_err(|_| DeviceError::InvalidInput {
+                    operation: "write ivshmem MSI-X BAR",
+                    detail: "MSI-X table and PBA only accept 32-bit values".into(),
+                })?;
+                let should_redeliver = self
+                    .lock_msix("write ivshmem MSI-X BAR")?
+                    .write_bar(access.offset(), value)?;
+                if should_redeliver {
+                    self.redeliver_pending("redeliver ivshmem MSI-X after vector control write")?;
                 }
                 Ok(())
             }
@@ -544,7 +681,7 @@ impl PciFunction for IvshmemPciFunction {
         // state, and zeroes this peer's state-table entry; the rest of the
         // shared backing stays intact for the other peer.
         self.lock_registers("reset ivshmem endpoint")?.reset();
-        self.msix.lock().unwrap().reset();
+        self.lock_msix("reset ivshmem endpoint")?.reset();
         self.attachment
             .link()
             .clear_state(self.attachment.peer_id())
@@ -561,6 +698,11 @@ mod tests {
     use std::{alloc::Layout, collections::BTreeMap};
 
     use axdevice::{BackingAllocation, SharedBackingAllocator};
+    use axdevice_base::{
+        ControllerInputId, InterruptTrigger, IrqResult, LpiId, MessageInterruptController,
+        MessageInterruptSink, MsiDeviceId, MsiEventId, MsiMessage, VirtualInterruptController,
+        WiredIrqInput, WiredIrqSink,
+    };
     use axvmconfig::VirtualDeviceRequest;
 
     use super::*;
@@ -693,7 +835,11 @@ mod tests {
         peer_id: u16,
     ) -> IvshmemPciModel {
         let reservation = registry.reserve(link_id, peer_id).unwrap();
-        IvshmemPciModel { reservation }
+        IvshmemPciModel {
+            reservation,
+            message_controller: InterruptControllerId::new(0),
+            its: ItsId::new(0),
+        }
     }
 
     #[test]
@@ -733,14 +879,30 @@ mod tests {
         .with_msix(PciMsixDeclaration::new(1).unwrap())
         .unwrap();
         assert_eq!(function, &expected);
+        let msi = requirements
+            .entries()
+            .iter()
+            .find_map(|requirement| match requirement {
+                DeviceRequirement::Msi { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(msi.controller(), InterruptControllerId::new(0));
+        assert_eq!(msi.its(), ItsId::new(0));
+        assert_eq!(msi.count(), 1);
     }
 
     #[test]
     fn options_require_link_and_peer_identity() {
         let registry = test_registry();
         let catalog = registered_catalog();
-        let context =
-            DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
+        let context = DeviceInstantiationContext::new()
+            .with_ivshmem_registry(Some(registry.clone()))
+            .with_default_message_controller(
+                id("vgic"),
+                InterruptControllerId::new(0),
+                ItsId::new(0),
+            );
 
         let Err(missing) = catalog.instantiate_node(
             &VirtualDeviceRequest {
@@ -788,8 +950,13 @@ mod tests {
     fn duplicate_peer_reservations_fail_the_second_vm() {
         let registry = test_registry();
         let catalog = registered_catalog();
-        let context =
-            DeviceInstantiationContext::new().with_ivshmem_registry(Some(registry.clone()));
+        let context = DeviceInstantiationContext::new()
+            .with_ivshmem_registry(Some(registry.clone()))
+            .with_default_message_controller(
+                id("vgic"),
+                InterruptControllerId::new(0),
+                ItsId::new(0),
+            );
         // The first node spec keeps its reservation alive; dropping it would
         // retire the peer and change the second VM's error.
         let _first = catalog
@@ -815,6 +982,124 @@ mod tests {
             panic!("expected an instantiation error");
         };
         assert!(detail.contains("ivshmem link registry"));
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestMsiDelivery {
+        message: MsiMessage,
+        address: u64,
+        data: u32,
+    }
+
+    #[derive(Default)]
+    struct TestMessageSink {
+        deliveries: Mutex<Vec<TestMsiDelivery>>,
+    }
+
+    impl MessageInterruptSink for TestMessageSink {
+        fn signal(&self, message: MsiMessage) -> IrqResult {
+            self.deliveries.lock().unwrap().push(TestMsiDelivery {
+                message,
+                address: 0,
+                data: 0,
+            });
+            Ok(())
+        }
+
+        fn signal_table(&self, message: MsiMessage, address: u64, data: u32) -> IrqResult {
+            self.deliveries.lock().unwrap().push(TestMsiDelivery {
+                message,
+                address,
+                data,
+            });
+            Ok(())
+        }
+    }
+
+    struct TestMessageController {
+        sink: Arc<TestMessageSink>,
+    }
+
+    impl MessageInterruptController for TestMessageController {
+        fn id(&self) -> InterruptControllerId {
+            InterruptControllerId::new(0)
+        }
+
+        fn msi_endpoint(
+            &self,
+            its: ItsId,
+            device: MsiDeviceId,
+            event: MsiEventId,
+            lpi: LpiId,
+        ) -> IrqResult<MsiEndpoint> {
+            Ok(MsiEndpoint::new(
+                self.id(),
+                MsiMessage::new(its, device, event, lpi),
+                self.sink.clone(),
+            ))
+        }
+    }
+
+    struct TestWiredController;
+    struct TestWiredSink;
+
+    impl WiredIrqSink for TestWiredSink {
+        fn set_level(&self, _input: ControllerInputId, _asserted: bool) -> IrqResult {
+            Ok(())
+        }
+
+        fn pulse(&self, _input: ControllerInputId) -> IrqResult {
+            Ok(())
+        }
+    }
+
+    impl VirtualInterruptController for TestWiredController {
+        fn id(&self) -> InterruptControllerId {
+            InterruptControllerId::new(0)
+        }
+
+        fn wired_input(
+            &self,
+            input: ControllerInputId,
+            trigger: InterruptTrigger,
+        ) -> IrqResult<WiredIrqInput> {
+            Ok(WiredIrqInput::new(
+                self.id(),
+                input,
+                trigger,
+                Arc::new(TestWiredSink),
+            ))
+        }
+    }
+
+    struct TestInterruptControllerModel {
+        sink: Arc<TestMessageSink>,
+    }
+
+    impl DeviceModel for TestInterruptControllerModel {
+        fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
+            Ok(DeviceRequirements::new())
+        }
+
+        fn firmware(&self) -> DeviceFirmwareSpec {
+            DeviceFirmwareSpec::None
+        }
+
+        fn build(
+            &self,
+            _context: &mut DeviceBuildContext<'_>,
+        ) -> DeviceManagerResult<DeviceBundle> {
+            let wired: Arc<dyn VirtualInterruptController> = Arc::new(TestWiredController);
+            let message: Arc<dyn MessageInterruptController> = Arc::new(TestMessageController {
+                sink: self.sink.clone(),
+            });
+            Ok(DeviceBundle::from_registration(
+                DeviceRegistration::InterruptController(
+                    ControllerRegistration::new(InterruptControllerId::new(0), wired)
+                        .with_message(message),
+                ),
+            ))
+        }
     }
 
     struct HostModel {
@@ -859,6 +1144,7 @@ mod tests {
         _graph: ResolvedDeviceGraph,
         _runtime: DeviceRuntime,
         stage2: Arc<TestStage2Remap>,
+        msi_sink: Arc<TestMessageSink>,
         binding: Arc<PciRootBinding>,
         root: Arc<PciRootState>,
         bdf: PciBdf,
@@ -891,6 +1177,36 @@ mod tests {
                 u64::from(value),
             )
         }
+
+        fn write_msix(&self, offset: u64, value: u32) -> DeviceResult {
+            self.binding
+                .write_bar(self.msix_bar + offset, AccessWidth::Dword, u64::from(value))
+        }
+
+        fn read_msix(&self, offset: u64) -> DeviceResult<u64> {
+            self.binding
+                .read_bar(self.msix_bar + offset, AccessWidth::Dword)
+        }
+
+        fn write_msix_control(&self, value: u16) -> PciResult {
+            self.root.write_config(
+                self.bdf,
+                ConfigOffset::new(0x42).unwrap(),
+                AccessWidth::Word,
+                u64::from(value),
+            )
+        }
+
+        fn program_msix_table(&self, address: u64, data: u32, masked: bool) {
+            self.write_msix(0, address as u32).unwrap();
+            self.write_msix(4, (address >> 32) as u32).unwrap();
+            self.write_msix(8, data).unwrap();
+            self.write_msix(0xc, u32::from(masked)).unwrap();
+        }
+
+        fn msi_deliveries(&self) -> Vec<TestMsiDelivery> {
+            self.msi_sink.deliveries.lock().unwrap().clone()
+        }
     }
 
     fn build_endpoint(
@@ -909,14 +1225,36 @@ mod tests {
             ),
             slot("pci-memory"),
         );
+        let msi_sink = Arc::new(TestMessageSink::default());
+        let controller_node = id("vgic");
         let mut builder = DeviceGraphBuilder::new();
         builder.register_pci_host(provider).unwrap();
         builder
-            .add(DeviceNodeSpec::virtual_device(id(node_id), Arc::new(model)))
+            .add(DeviceNodeSpec::virtual_device(
+                controller_node.clone(),
+                Arc::new(TestInterruptControllerModel {
+                    sink: msi_sink.clone(),
+                }),
+            ))
+            .unwrap();
+        builder
+            .add(
+                DeviceNodeSpec::virtual_device(id(node_id), Arc::new(model))
+                    .with_dependency(controller_node),
+            )
             .unwrap();
         let mut pools = ResourcePools::new();
         pools
             .add_auto_mmio(APERTURE_BASE..APERTURE_BASE + APERTURE_SIZE)
+            .unwrap();
+        pools
+            .add_auto_msi_domain(
+                InterruptControllerId::new(0),
+                ItsId::new(0),
+                MsiDeviceId::new(0)..MsiDeviceId::new(16),
+                MsiEventId::new(0)..MsiEventId::new(16),
+                LpiId::new(8192)..LpiId::new(8208),
+            )
             .unwrap();
         let graph = builder.declare().unwrap().resolve(pools).unwrap();
         let stage2_trait: Arc<dyn Stage2Remap> = Arc::clone(&stage2) as _;
@@ -955,6 +1293,7 @@ mod tests {
             binding,
             root,
             bdf,
+            msi_sink,
             register_bar,
             msix_bar,
             shared_bar,
@@ -1399,6 +1738,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(control, 0);
+    }
+
+    #[test]
+    fn enabled_doorbell_uses_the_guest_programmed_msix_table() {
+        let registry = test_registry();
+        let peer = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::new(TestStage2Remap::default()),
+        );
+        peer.enable_memory();
+        peer.program_msix_table(0x0808_0040, 0, false);
+        peer.write_register(INTERRUPT_CONTROL_OFFSET, 1).unwrap();
+        peer.write_msix_control(MSIX_MESSAGE_CONTROL_ENABLE)
+            .unwrap();
+
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+
+        assert_eq!(
+            peer.msi_deliveries(),
+            [TestMsiDelivery {
+                message: MsiMessage::new(
+                    ItsId::new(0),
+                    MsiDeviceId::new(0),
+                    MsiEventId::new(0),
+                    LpiId::new(8192),
+                ),
+                address: 0x0808_0040,
+                data: 0,
+            }]
+        );
+        assert_eq!(peer.read_msix(MSIX_PBA_OFFSET).unwrap(), 0);
+        assert_eq!(event_status(&peer), 1);
+    }
+
+    #[test]
+    fn blocked_doorbells_coalesce_and_redeliver_on_each_gate_transition() {
+        let registry = test_registry();
+        let peer = build_endpoint(
+            "ivshmem0",
+            model_for(&registry, 1, 0),
+            Arc::new(TestStage2Remap::default()),
+        );
+        peer.enable_memory();
+        peer.program_msix_table(0x0808_0040, 0, true);
+        peer.write_register(INTERRUPT_CONTROL_OFFSET, 1).unwrap();
+        peer.write_msix_control(MSIX_MESSAGE_CONTROL_ENABLE)
+            .unwrap();
+
+        // Repeated events under vector mask coalesce into one PBA bit.
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        assert!(peer.msi_deliveries().is_empty());
+        assert_eq!(peer.read_msix(MSIX_PBA_OFFSET).unwrap(), 1);
+        // PBA is device-owned; guest writes cannot discard pending state.
+        peer.write_msix(MSIX_PBA_OFFSET, 1).unwrap();
+        assert_eq!(peer.read_msix(MSIX_PBA_OFFSET).unwrap(), 1);
+        peer.write_msix(0xc, 0).unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 1);
+        assert_eq!(peer.read_msix(MSIX_PBA_OFFSET).unwrap(), 0);
+
+        // Function Mask preserves pending until it is removed.
+        peer.write_msix_control(MSIX_MESSAGE_CONTROL_ENABLE | MSIX_MESSAGE_CONTROL_FUNCTION_MASK)
+            .unwrap();
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 1);
+        peer.write_msix_control(MSIX_MESSAGE_CONTROL_ENABLE)
+            .unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 2);
+
+        // Device interrupt control is the outer gate.
+        peer.write_register(INTERRUPT_CONTROL_OFFSET, 0).unwrap();
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 2);
+        peer.write_register(INTERRUPT_CONTROL_OFFSET, 1).unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 3);
+
+        // Enabling MSI-X is also a deliverable transition.
+        peer.write_msix_control(0).unwrap();
+        peer.write_register(DOORBELL_OFFSET, doorbell(0, 0))
+            .unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 3);
+        peer.write_msix_control(MSIX_MESSAGE_CONTROL_ENABLE)
+            .unwrap();
+        assert_eq!(peer.msi_deliveries().len(), 4);
     }
 
     #[test]

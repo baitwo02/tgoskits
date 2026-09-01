@@ -6,8 +6,8 @@
  * test never hard-codes a BDF, a BAR address, or a sysfs path.
  *
  * Output contract (frozen with the shared QEMU case):
- *   success: "ivshmem polling pass"
- *   failure: "ivshmem polling failed <step>: <detail>"
+ *   success: "ivshmem <backend> pass"
+ *   failure: "ivshmem <backend> failed <step>: <detail>"
  *   progress: "ivshmem checkpoint <name>"
  *
  * The polling handshake exercises discovery without a fixed BDF, mapping
@@ -32,6 +32,7 @@
 #define SMOKE_PAYLOAD_SIZE 0x100
 
 static const uint32_t EXPECTED_MAX_PEERS = 2;
+static const char *selected_backend = "unknown";
 
 static void checkpoint(const char *name)
 {
@@ -41,7 +42,7 @@ static void checkpoint(const char *name)
 
 static void fail(const char *step, const char *detail)
 {
-    printf("ivshmem polling failed %s: %s\n", step, detail);
+    printf("ivshmem %s failed %s: %s\n", selected_backend, step, detail);
     fflush(stdout);
     exit(1);
 }
@@ -53,11 +54,14 @@ static void fail_err(const char *step, int err)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --backend polling [--bdf <BDF>]\n", program);
+    fprintf(stderr,
+            "usage: %s --backend polling|interrupt [--bdf <BDF>]\n",
+            program);
 }
 
 struct options {
     const char *bdf;
+    enum ivshmem_backend_kind backend;
 };
 
 static void parse_options(int argc, char **argv, struct options *options)
@@ -65,14 +69,19 @@ static void parse_options(int argc, char **argv, struct options *options)
     int index;
 
     memset(options, 0, sizeof(*options));
+    options->backend = IVSHMEM_BACKEND_POLLING;
+    selected_backend = "polling";
     for (index = 1; index < argc; index++) {
         if (strcmp(argv[index], "--backend") == 0 && index + 1 < argc) {
             index++;
-            if (strcmp(argv[index], "polling") != 0) {
-                /* The interrupt backend exists only with F7; there is no
-                 * silent fallback to polling. */
-                fail("backend", "only the polling backend exists in this "
-                                "adapter revision");
+            if (strcmp(argv[index], "polling") == 0) {
+                options->backend = IVSHMEM_BACKEND_POLLING;
+                selected_backend = "polling";
+            } else if (strcmp(argv[index], "interrupt") == 0) {
+                options->backend = IVSHMEM_BACKEND_INTERRUPT;
+                selected_backend = "interrupt";
+            } else {
+                fail("backend", "backend must be polling or interrupt");
             }
         } else if (strcmp(argv[index], "--bdf") == 0 && index + 1 < argc) {
             index++;
@@ -196,7 +205,7 @@ int main(int argc, char **argv)
     }
     checkpoint("state");
 
-    result = ivshmem_backend_open(dev, IVSHMEM_BACKEND_POLLING, &backend);
+    result = ivshmem_backend_open(dev, options.backend, &backend);
     if (result != IVSHMEM_OK) {
         fail_err("backend", result);
     }
@@ -236,7 +245,7 @@ int main(int argc, char **argv)
     ivshmem_backend_close(backend);
     ivshmem_device_close(dev);
 
-    printf("ivshmem polling pass\n");
+    printf("ivshmem %s pass\n", selected_backend);
     fflush(stdout);
     return 0;
 }

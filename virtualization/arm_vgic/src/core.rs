@@ -417,11 +417,14 @@ impl MessageInterruptSink for VgicMessageSink {
 
     fn signal_table(&self, message: MsiMessage, address: u64, data: u32) -> IrqResult {
         // Guest encoding for a GICv3 ITS MSI (DT `msi-map` path): the write
-        // address is the ITS instance's GITS_TRANSLATER register (offset
-        // 0x0040 of the ITS frame) and the write data is the EventID. The
-        // device layer only forwards what the guest wrote into the MSI-X
-        // table; anything else is refused without injecting.
-        const GITS_TRANSLATER_OFFSET: u64 = 0x0040;
+        // address is the ITS instance's GITS_TRANSLATER register and the
+        // write data is the EventID. GITS_TRANSLATER sits at offset 0x40 of
+        // the ITS frame's second 64 KiB page, i.e. frame base + 0x10040
+        // (Arm GICv3 IHI 0069, ITS register map; Linux programs the same
+        // address via GITS_TRANSLATER in drivers/irqchip/irq-gic-v3-its.c).
+        // The device layer only forwards what the guest wrote into the
+        // MSI-X table; anything else is refused without injecting.
+        const GITS_TRANSLATER_OFFSET: u64 = 0x1_0040;
         let endpoint = InterruptEndpoint::Message {
             controller: self.id,
             its: message.its(),
