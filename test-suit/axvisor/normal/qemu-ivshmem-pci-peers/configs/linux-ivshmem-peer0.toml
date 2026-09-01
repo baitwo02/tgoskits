@@ -5,7 +5,7 @@
 # Guest VM ids must stay unique across all guest configs of a build: the
 # embedded static image table and the VM registry are keyed by this id, and
 # the ArceOS peer guest keeps id 1.
-id = 2
+id = 1
 name = "linux-ivshmem-pci"
 guest_type = "virtualized"
 cpu_num = 1
@@ -17,12 +17,12 @@ image_location = "memory"
 kernel_path = "${workspace}/tmp/axbuild/images/qemu-aarch64/linux/linux-qemu"
 kernel_load_addr = 0x8020_0000
 dtb_load_addr = 0x8000_0000
-ramdisk_path = "${workspace}/tmp/axbuild/axvisor/qemu-ivshmem-pci-interrupt/initramfs-aarch64.cpio.gz"
+ramdisk_path = "${workspace}/tmp/axbuild/axvisor/qemu-ivshmem-pci-peers/initramfs-aarch64.cpio.gz"
 ramdisk_load_addr = 0x8400_0000
 # axvisor.pci_aperture must match the AArch64 auto-placed PCI memory aperture
 # (the auto MMIO pool starts after the 1 MiB ECAM at 0x0b00_0000) and feeds
 # the sysfs BAR2 containment check in the initramfs /init.
-cmdline = "console=ttyAMA0 rdinit=/init devtmpfs.mount=1 loglevel=7 initcall_blacklist=ahci_pci_driver_init,virtio_pci_driver_init axvisor.pci_case=ivshmem-interrupt axvisor.pci_aperture=0x0c000000-0x10000000"
+cmdline = "console=ttyAMA0 rdinit=/init devtmpfs.mount=1 loglevel=7 initcall_blacklist=ahci_pci_driver_init,virtio_pci_driver_init axvisor.pci_case=ivshmem-polling-peers axvisor.pci_aperture=0x0c000000-0x10000000"
 memory_regions = [
   [0x8000_0000, 0x2000_0000, 0x7, 0],
 ]

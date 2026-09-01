@@ -1,0 +1,28 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?m)^IVSHMEM_PEERS_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^ivshmem polling failed(?:\\s|$)",
+]
+# Success requires the initiator (peer 0, VM[1]) to observe the completed
+# cross-peer round trip: request doorbell -> responder state/payload
+# validation -> reply doorbell -> reply validation. The responder prints the
+# distinct "ivshmem polling relay pass" so its earlier success cannot mask a
+# broken initiator side. The optional prefix matches the dual-guest console
+# multiplexer (same convention as the IVC case).
+success_regex = [
+  "(?m)^(?:\\x1b\\[[0-9;]*m)*(?:\\[VM 1\\] )?ivshmem polling pass\\s*$",
+]
+timeout = 240
+to_bin = true
+uefi = false

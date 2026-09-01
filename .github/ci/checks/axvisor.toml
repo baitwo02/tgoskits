@@ -55,6 +55,27 @@ arch = "aarch64"
 cases = ["ivshmem-pci"]
 
 [[check]]
+id = "test-axvisor-aarch64-qemu-ivshmem-pci-peers"
+impact_targets = ["axvisor:aarch64"]
+name = "QEMU aarch64 · ivshmem-pci dual-peer cross-VM handshake (pciutils image)"
+timeout_minutes = 30
+command = '''
+echo "==> pull pciutils-enabled aarch64 rootfs for ivshmem-pci-peers"
+export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivshmem-pci-images"
+export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild/rootfs"
+cargo xtask image pull \
+  --registry "https://raw.githubusercontent.com/baitwo02/tgosimages/b78c7f255c3fae3737e6c4909d4749358635b438/registry/ivc-message-v1-3ce6ae8a-lspci.toml" \
+  "rootfs-aarch64-alpine-ivc-message-v1.img:0.0.12-ivc-message-v1-3ce6ae8a-lspci"
+echo "==> axvisor aarch64 ivshmem-pci dual-peer Linux guests"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-pci-peers
+'''
+
+[[check.suite]]
+kind = "axvisor-qemu"
+arch = "aarch64"
+cases = ["ivshmem-pci-peers"]
+
+[[check]]
 id = "test-axvisor-aarch64-qemu-panic-modes"
 impact_targets = ["axvisor:aarch64"]
 name = "QEMU aarch64 · Panic modes"

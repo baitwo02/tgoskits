@@ -277,6 +277,14 @@ case "$cmdline" in
       *) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED ;;
     esac
     exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-polling-peers*)
+    # Dual-peer polling case: both guests run the same smoke with
+    # --cross-peer; the initiator's final marker is the case success. The
+    # enumeration check runs before binding so an unexpected pre-existing
+    # driver is still diagnosed.
+    run_pci_enumeration_check IVSHMEM_PEERS_ENUMERATION_PASSED
+    /bin/ivshmem-bar2-smoke --backend polling --cross-peer
+    exec /bin/busybox sh -i ;;
   *axvisor.pci_case=ivshmem-polling*)
     # The full enumeration evidence must still hold; its failure marker is a
     # case-level fail_regex entry, and the smoke program carries the success
@@ -607,22 +615,22 @@ fn prepare_busybox_initramfs(
     smoke_binary: Option<&[u8]>,
     uio_modules: Option<&super::ivshmem_smoke::UioModules>,
 ) -> anyhow::Result<()> {
-    let busybox = required_rootfs_file(rootfs_path, BUSYBOX_PATH)?;
     let loader_path = musl_loader_path(arch)?;
+    let busybox = required_rootfs_file(rootfs_path, BUSYBOX_PATH)?;
     let loader = required_rootfs_file(rootfs_path, loader_path)?;
     let lspci = required_rootfs_file(rootfs_path, LSPCI_PATH)?;
     let libpci = required_rootfs_file(rootfs_path, LIBPCI_PATH)?;
     let pci_ids = required_rootfs_file(rootfs_path, PCI_IDS_PATH)?;
-    let archive = build_busybox_initramfs(
-        &busybox,
+    let archive = build_busybox_initramfs(BusyboxInitramfsPayload {
+        busybox: &busybox,
         loader_path,
-        &loader,
-        &lspci,
-        &libpci,
-        &pci_ids,
+        loader: &loader,
+        lspci: &lspci,
+        libpci: &libpci,
+        pci_ids: &pci_ids,
         smoke_binary,
         uio_modules,
-    )?;
+    })?;
 
     let output_parent = output_path.parent().with_context(|| {
         format!(
@@ -673,16 +681,21 @@ fn musl_loader_path(arch: &str) -> anyhow::Result<&'static str> {
     }
 }
 
-fn build_busybox_initramfs(
-    busybox: &[u8],
-    loader_path: &str,
-    loader: &[u8],
-    lspci: &[u8],
-    libpci: &[u8],
-    pci_ids: &[u8],
-    smoke_binary: Option<&[u8]>,
-    uio_modules: Option<&super::ivshmem_smoke::UioModules>,
-) -> anyhow::Result<Vec<u8>> {
+/// Guest-visible payload of the generated BusyBox initramfs. The optional
+/// smoke binary and UIO modules are added only by the ivshmem cases so
+/// unrelated groups keep a toolchain-free initramfs.
+struct BusyboxInitramfsPayload<'a> {
+    busybox: &'a [u8],
+    loader_path: &'a str,
+    loader: &'a [u8],
+    lspci: &'a [u8],
+    libpci: &'a [u8],
+    pci_ids: &'a [u8],
+    smoke_binary: Option<&'a [u8]>,
+    uio_modules: Option<&'a super::ivshmem_smoke::UioModules>,
+}
+
+fn build_busybox_initramfs(payload: BusyboxInitramfsPayload<'_>) -> anyhow::Result<Vec<u8>> {
     let init_script = init_script();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     {
@@ -695,7 +708,7 @@ fn build_busybox_initramfs(
             "sys".to_string(),
             "tmp".to_string(),
         ]);
-        let loader_archive_path = archive_path(loader_path)?;
+        let loader_archive_path = archive_path(payload.loader_path)?;
         add_parent_directories(loader_archive_path, &mut directories);
         let lspci_archive_path = archive_path(LSPCI_PATH)?;
         add_parent_directories(lspci_archive_path, &mut directories);
@@ -703,7 +716,7 @@ fn build_busybox_initramfs(
         add_parent_directories(libpci_archive_path, &mut directories);
         let pci_ids_archive_path = archive_path(PCI_IDS_PATH)?;
         add_parent_directories(pci_ids_archive_path, &mut directories);
-        if uio_modules.is_some() {
+        if payload.uio_modules.is_some() {
             add_parent_directories(
                 super::ivshmem_smoke::UIO_CORE_ARCHIVE_PATH,
                 &mut directories,
@@ -717,19 +730,19 @@ fn build_busybox_initramfs(
             archive.append_directory(&directory)?;
         }
 
-        archive.append_regular("bin/busybox", busybox)?;
-        archive.append_regular(loader_archive_path, loader)?;
-        archive.append_regular(lspci_archive_path, lspci)?;
-        archive.append_regular(libpci_archive_path, libpci)?;
+        archive.append_regular("bin/busybox", payload.busybox)?;
+        archive.append_regular(loader_archive_path, payload.loader)?;
+        archive.append_regular(lspci_archive_path, payload.lspci)?;
+        archive.append_regular(libpci_archive_path, payload.libpci)?;
         archive.append_symlink(archive_path(LIBPCI_SONAME_PATH)?, "libpci.so.3.14.0")?;
-        archive.append_regular(pci_ids_archive_path, pci_ids)?;
-        if let Some(smoke_binary) = smoke_binary {
+        archive.append_regular(pci_ids_archive_path, payload.pci_ids)?;
+        if let Some(smoke_binary) = payload.smoke_binary {
             // The ivshmem cases run the adapter smoke program from the guest;
             // it is added only when requested so unrelated groups keep a
             // toolchain-free initramfs.
             archive.append_regular(super::ivshmem_smoke::SMOKE_ARCHIVE_PATH, smoke_binary)?;
         }
-        if let Some(modules) = uio_modules {
+        if let Some(modules) = payload.uio_modules {
             archive.append_regular(super::ivshmem_smoke::UIO_CORE_ARCHIVE_PATH, &modules.core)?;
             archive.append_regular(
                 super::ivshmem_smoke::UIO_IVSHMEM_ARCHIVE_PATH,
@@ -854,19 +867,27 @@ mod tests {
 
     use super::*;
 
+    /// Fixed payload fixture shared by the archive-content tests.
+    fn test_payload<'a>(
+        smoke_binary: Option<&'a [u8]>,
+        uio_modules: Option<&'a super::super::ivshmem_smoke::UioModules>,
+    ) -> BusyboxInitramfsPayload<'a> {
+        BusyboxInitramfsPayload {
+            busybox: b"busybox",
+            loader_path: "/lib/ld-musl-test.so.1",
+            loader: b"loader",
+            lspci: b"lspci",
+            libpci: b"libpci",
+            pci_ids: b"pci-ids",
+            smoke_binary,
+            uio_modules,
+        }
+    }
+
     #[test]
     fn generated_archive_carries_the_smoke_binary_when_requested() {
-        let compressed = build_busybox_initramfs(
-            b"busybox",
-            "/lib/ld-musl-test.so.1",
-            b"loader",
-            b"lspci",
-            b"libpci",
-            b"pci-ids",
-            Some(b"smoke-binary-bytes"),
-            None,
-        )
-        .unwrap();
+        let compressed =
+            build_busybox_initramfs(test_payload(Some(b"smoke-binary-bytes"), None)).unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
@@ -885,17 +906,8 @@ mod tests {
             core: b"uio-core-module".to_vec(),
             ivshmem: b"ivshmem-pci-module".to_vec(),
         };
-        let compressed = build_busybox_initramfs(
-            b"busybox",
-            "/lib/ld-musl-test.so.1",
-            b"loader",
-            b"lspci",
-            b"libpci",
-            b"pci-ids",
-            Some(b"smoke"),
-            Some(&modules),
-        )
-        .unwrap();
+        let compressed =
+            build_busybox_initramfs(test_payload(Some(b"smoke"), Some(&modules))).unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
@@ -926,17 +938,7 @@ mod tests {
 
     #[test]
     fn generated_archive_contains_busybox_loader_and_shell_applets() {
-        let compressed = build_busybox_initramfs(
-            b"busybox",
-            "/lib/ld-musl-test.so.1",
-            b"loader",
-            b"lspci",
-            b"libpci",
-            b"pci-ids",
-            None,
-            None,
-        )
-        .unwrap();
+        let compressed = build_busybox_initramfs(test_payload(None, None)).unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
