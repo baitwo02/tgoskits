@@ -17,13 +17,20 @@ const ECAM_SIZE: usize = 0x10_0000;
 const IVSHMEM_ECAM_OFFSET: usize = 0x8000;
 const PCI_ID_OFFSET: usize = 0x00;
 const PCI_COMMAND_OFFSET: usize = 0x04;
+const PCI_BAR0_OFFSET: usize = 0x10;
 const PCI_BAR2_OFFSET: usize = 0x18;
 const PCI_COMMAND_MEMORY_ENABLE: u16 = 1 << 1;
 const IVSHMEM_PCI_ID: u32 = 0x1110_1af4;
 const IVSHMEM_BAR_SIZE: usize = 0x1_0000;
-// F4 reserves the first BAR2 page for the state table; test payloads live in
-// the shared region past 0x1000.
-const TEST_OFFSET: usize = 0x1100;
+// F4 reserves the first BAR2 page for the state table; F5/F6 give every peer
+// one 28 KiB output section starting at 0x1000 (peer N: 0x1000 +
+// N * 0x7000), writable only by its owner. The test payload must stay
+// inside this peer's own section.
+const SMOKE_OUTPUT_SECTION_BASE: usize = 0x1000;
+const SMOKE_OUTPUT_SECTION_STRIDE: usize = 0x7000;
+const IVSHMEM_REG_ID: usize = 0x00;
+const IVSHMEM_BAR0_SIZE: usize = 0x1000;
+const TEST_OFFSET_IN_SECTION: usize = 0x100;
 const TEST_VALUE: u64 = 0x4956_5348_4d45_4d31;
 
 #[cfg(feature = "arceos")]
@@ -60,16 +67,33 @@ fn run() -> Result<(), String> {
         command | PCI_COMMAND_MEMORY_ENABLE,
     );
 
+    // The test payload offset depends on this endpoint's peer ID (F5
+    // ownership: each peer may write only its own output section), so map
+    // BAR0 and read the identity register first.
+    let bar0 = usize::try_from(read_u32(ecam, IVSHMEM_ECAM_OFFSET + PCI_BAR0_OFFSET) & 0xffff_fff0)
+        .map_err(|_| "BAR0 address does not fit usize".to_string())?;
+    if bar0 == 0 {
+        return Err("BAR0 was not assigned".into());
+    }
+    let registers = map_device_range(bar0, IVSHMEM_BAR0_SIZE, "ivshmem BAR0")?;
+    let peer_id = read_u32(registers, IVSHMEM_REG_ID);
+    let test_offset = SMOKE_OUTPUT_SECTION_BASE
+        + peer_id as usize * SMOKE_OUTPUT_SECTION_STRIDE
+        + TEST_OFFSET_IN_SECTION;
+
     let shared_memory = map_device_range(bar2, IVSHMEM_BAR_SIZE, "ivshmem BAR2")?;
-    write_u64(shared_memory, TEST_OFFSET, TEST_VALUE);
-    let actual = read_u64(shared_memory, TEST_OFFSET);
+    write_u64(shared_memory, test_offset, TEST_VALUE);
+    let actual = read_u64(shared_memory, test_offset);
     if actual != TEST_VALUE {
         return Err(format!(
             "BAR2 readback mismatch: expected {TEST_VALUE:#018x}, got {actual:#018x}"
         ));
     }
 
-    println!("ivshmem-pci identity={identity:#010x} bar2={bar2:#x}");
+    println!(
+        "ivshmem-pci identity={identity:#010x} bar2={bar2:#x} peer_id={peer_id} \
+         test_offset={test_offset:#x}"
+    );
     Ok(())
 }
 
