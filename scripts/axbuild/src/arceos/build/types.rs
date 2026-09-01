@@ -11,6 +11,11 @@ pub type ArceosBuildInfo = BuildInfo;
 pub(crate) struct ArceosBuildConfig {
     #[serde(flatten, default)]
     pub(crate) build_info: ArceosBuildInfo,
+    /// Converts the built kernel ELF into the raw image that AxVisor VM
+    /// configs embed. Mirrors the qemu/uboot conversion entry so a build-only
+    /// invocation produces the same guest kernel image.
+    #[serde(rename = "to_bin", skip_serializing_if = "Option::is_none")]
+    pub(crate) to_bin: Option<bool>,
     #[serde(rename = "app-c", skip_serializing_if = "Option::is_none")]
     pub(crate) app_c: Option<PathBuf>,
 }
@@ -19,6 +24,7 @@ impl ArceosBuildConfig {
     pub(super) fn default_config() -> Self {
         Self {
             build_info: ArceosBuildInfo::default(),
+            to_bin: None,
             app_c: None,
         }
     }

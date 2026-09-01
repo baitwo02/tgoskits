@@ -6,7 +6,7 @@ use std::{
 use tempfile::tempdir;
 
 use super::{
-    ArceosBuildInfo, ArceosBuildMode, default_build_info_path,
+    ArceosBuildConfig, ArceosBuildInfo, ArceosBuildMode, default_build_info_path,
     info::{load_build_info, resolve_build_info_path_in_dir},
     load_arceos_build_mode, load_c_app_cargo_config, resolve_app_c_dir, resolve_app_c_mode,
     resolve_build_info_path,
@@ -468,4 +468,15 @@ fn prepared_cargo_config_defaults_x86_64_to_dynamic_platform() {
     );
     assert!(!cargo.features.contains(&"ax-std/plat-dyn".to_string()));
     assert!(!cargo.features.contains(&"ax-hal/x86-pc".to_string()));
+}
+
+#[test]
+fn declared_to_bin_flows_into_the_build_cargo_config() {
+    let config: ArceosBuildConfig = toml::from_str("features = []\nlog = \"Info\"\nto_bin = true")
+        .expect("parse build config with to_bin");
+    assert_eq!(config.to_bin, Some(true));
+
+    let default: ArceosBuildConfig =
+        toml::from_str("features = []\nlog = \"Info\"").expect("parse default build config");
+    assert_eq!(default.to_bin, None);
 }

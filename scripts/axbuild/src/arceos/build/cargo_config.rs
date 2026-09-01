@@ -16,12 +16,15 @@ pub(crate) fn load_cargo_config(request: &ResolvedBuildRequest) -> anyhow::Resul
         );
     }
     let build_info = config.build_info;
-
-    build_info.into_prepared_std_cargo_config_with_metadata(
+    // The declared `to_bin` flag converts the built kernel ELF into the raw
+    // image AxVisor VM configs embed; the base std config keeps ELF-only.
+    let mut cargo = build_info.into_prepared_std_cargo_config_with_metadata(
         &request.package,
         &request.target,
         metadata,
-    )
+    )?;
+    cargo.to_bin = config.to_bin.unwrap_or(false);
+    Ok(cargo)
 }
 
 pub(crate) fn load_c_app_cargo_config(request: &ResolvedBuildRequest) -> anyhow::Result<Cargo> {

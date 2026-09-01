@@ -466,10 +466,17 @@ impl ArceOS {
         match build::load_arceos_build_mode(&request.build_info_path)? {
             build::ArceosBuildMode::RustStd => {
                 let cargo = build::load_cargo_config(&request)?;
-                self.app
-                    .build(cargo, request.build_info_path)
-                    .await
-                    .map(|_| ())
+                let to_bin = cargo.to_bin;
+                let output = self.app.build(cargo, request.build_info_path).await?;
+                // The declared `to_bin` flag converts the kernel ELF into the
+                // raw image that AxVisor VM configs embed, exactly like the
+                // qemu/uboot paths; plain library builds leave it false.
+                if to_bin {
+                    self.app
+                        .prepare_elf_artifact(output.elf_path().to_path_buf(), true)
+                        .await?;
+                }
+                Ok(())
             }
             build::ArceosBuildMode::AppC { app_dir, app_name } => {
                 let output = self.build_c_app_request(&request, app_dir, app_name)?;
