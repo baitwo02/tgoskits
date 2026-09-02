@@ -1,0 +1,26 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "run VCpu\\[\\d+\\] get error",
+  "IVSHMEM_THREE_PEERS_ENUMERATION_FAILED",
+  "ivshmem polling failed",
+]
+# Only peer 0 emits this marker, after peer 1 handled its directed doorbell,
+# peer 2 proved no event crosstalk, and peer 0 validated all three state and
+# output sections.
+success_regex = [
+  "(?m)^(?:\\x1b\\[[0-9;]*m)*(?:\\[VM 1\\] )?ivshmem polling three-peer pass\\s*$",
+]
+timeout = 240
+to_bin = true
+uefi = false

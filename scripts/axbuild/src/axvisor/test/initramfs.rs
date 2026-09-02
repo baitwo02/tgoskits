@@ -285,6 +285,12 @@ case "$cmdline" in
     run_pci_enumeration_check IVSHMEM_PEERS_ENUMERATION_PASSED
     /bin/ivshmem-bar2-smoke --backend polling --cross-peer
     exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-three-peers*)
+    # Peer 0 emits the only case success marker after peer 1 receives the
+    # directed event without waking peer 2 and all three payloads are visible.
+    run_pci_enumeration_check IVSHMEM_THREE_PEERS_ENUMERATION_PASSED
+    /bin/ivshmem-bar2-smoke --backend polling --three-peer
+    exec /bin/busybox sh -i ;;
   *axvisor.pci_case=ivshmem-polling*)
     # The full enumeration evidence must still hold; its failure marker is a
     # case-level fail_regex entry, and the smoke program carries the success
@@ -1009,6 +1015,16 @@ mod tests {
         assert!(
             init.windows(b"axvisor.pci_case=ivshmem-interrupt".len())
                 .any(|window| window == b"axvisor.pci_case=ivshmem-interrupt")
+        );
+        assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-three-peers".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-three-peers")
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-bar2-smoke --backend polling --three-peer".len())
+                .any(|window| {
+                    window == b"/bin/ivshmem-bar2-smoke --backend polling --three-peer"
+                })
         );
         assert!(
             init.windows(b"/bin/ivshmem-bar2-smoke --backend interrupt".len())

@@ -1,3 +1,6 @@
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * ivshmem shared-memory smoke scenario.
  *
@@ -24,10 +27,16 @@
  * rings back. The initiator's final "ivshmem polling pass" therefore
  * implies a completed cross-peer round trip; the responder prints the
  * distinct "ivshmem polling relay pass" instead.
+ *
+ * With --three-peer, peer 0 directs one request to peer 1 while peer 2
+ * observes its Event Status and fails on any crosstalk. Peer 0 emits the
+ * unique "ivshmem polling three-peer pass" marker only after validating all
+ * three state-table entries and output-section mailboxes.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ivshmem.h"
 
@@ -47,12 +56,20 @@
 #define SMOKE_HANDSHAKE_STATE_INITIATOR 0x00010003u
 #define SMOKE_HANDSHAKE_STATE_RESPONDER 0x00010004u
 
+/* Three-peer protocol state. */
+#define SMOKE_THREE_OUTPUT_SECTION_STRIDE 0x5000
+#define SMOKE_THREE_STATE_COORDINATOR 0x00020000u
+#define SMOKE_THREE_STATE_TARGET_READY 0x00020001u
+#define SMOKE_THREE_STATE_TARGET_RECEIVED 0x00020011u
+#define SMOKE_THREE_STATE_TARGET_REPLIED 0x00020012u
+#define SMOKE_THREE_STATE_OBSERVER_ARMED 0x00020020u
+#define SMOKE_THREE_STATE_OBSERVER_CLEAN 0x00020021u
+
 /* Guest scheduling is not part of the device contract: the handshake waits
  * long enough for the other guest to reach the smoke, and every wait
  * failure carries a distinct step name. */
 #define SMOKE_HANDSHAKE_TIMEOUT_MS 30000
 
-static const uint32_t EXPECTED_MAX_PEERS = 2;
 static const char *selected_backend = "unknown";
 
 static void checkpoint(const char *name)
@@ -76,7 +93,8 @@ static void fail_err(const char *step, int err)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --backend polling|interrupt [--cross-peer] [--bdf <BDF>]\n",
+            "usage: %s --backend polling|interrupt [--cross-peer|--three-peer] "
+            "[--bdf <BDF>]\n",
             program);
 }
 
@@ -84,6 +102,7 @@ struct options {
     const char *bdf;
     enum ivshmem_backend_kind backend;
     int cross_peer;
+    int three_peer;
 };
 
 static void parse_options(int argc, char **argv, struct options *options)
@@ -110,10 +129,19 @@ static void parse_options(int argc, char **argv, struct options *options)
             options->bdf = argv[index];
         } else if (strcmp(argv[index], "--cross-peer") == 0) {
             options->cross_peer = 1;
+        } else if (strcmp(argv[index], "--three-peer") == 0) {
+            options->three_peer = 1;
         } else {
             usage(argv[0]);
             fail("args", "unrecognized command line");
         }
+    }
+    if (options->cross_peer && options->three_peer) {
+        fail("args", "cross-peer and three-peer modes are mutually exclusive");
+    }
+    if (options->three_peer &&
+        options->backend != IVSHMEM_BACKEND_POLLING) {
+        fail("backend", "three-peer routing evidence requires polling mode");
     }
 }
 
@@ -128,10 +156,11 @@ static uint32_t payload_checksum(const uint8_t *payload, size_t size)
     return checksum;
 }
 
-static void exchange_payload(void *shared, uint32_t peer_id)
+static void exchange_payload(void *shared, uint32_t peer_id,
+                             size_t output_stride)
 {
     size_t payload_offset =
-        SMOKE_OUTPUT_SECTION_BASE + (size_t)peer_id * SMOKE_OUTPUT_SECTION_STRIDE;
+        SMOKE_OUTPUT_SECTION_BASE + (size_t)peer_id * output_stride;
     uint8_t payload[SMOKE_PAYLOAD_SIZE];
     volatile uint8_t *remote = (volatile uint8_t *)shared + payload_offset;
     uint32_t written_checksum;
@@ -168,10 +197,11 @@ struct smoke_mailbox {
 };
 
 static volatile struct smoke_mailbox *section_mailbox(void *shared,
-                                                      uint32_t peer_id)
+                                                      uint32_t peer_id,
+                                                      size_t output_stride)
 {
     size_t offset =
-        SMOKE_OUTPUT_SECTION_BASE + (size_t)peer_id * SMOKE_OUTPUT_SECTION_STRIDE;
+        SMOKE_OUTPUT_SECTION_BASE + (size_t)peer_id * output_stride;
 
     return (volatile struct smoke_mailbox *)((volatile uint8_t *)shared + offset);
 }
@@ -240,9 +270,11 @@ static void cross_peer_exchange(void *shared, uint32_t peer_id,
                                 struct ivshmem_backend *backend)
 {
     const volatile uint32_t *state_table = (const volatile uint32_t *)shared;
-    volatile struct smoke_mailbox *own = section_mailbox(shared, peer_id);
+    volatile struct smoke_mailbox *own =
+        section_mailbox(shared, peer_id, SMOKE_OUTPUT_SECTION_STRIDE);
     uint32_t target = peer_id ^ 1u;
-    volatile struct smoke_mailbox *remote = section_mailbox(shared, target);
+    volatile struct smoke_mailbox *remote =
+        section_mailbox(shared, target, SMOKE_OUTPUT_SECTION_STRIDE);
     int wait_result;
 
     if (peer_id == 0) {
@@ -321,6 +353,151 @@ static void self_doorbell_tests(struct ivshmem_device *dev,
     checkpoint("doorbell-second");
 }
 
+static long monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        fail("clock", "clock_gettime failed");
+    }
+    return now.tv_sec * 1000L + now.tv_nsec / 1000000L;
+}
+
+static void sleep_one_millisecond(void)
+{
+    const struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000L,
+    };
+
+    nanosleep(&delay, NULL);
+}
+
+static void wait_remote_state_long(const volatile uint32_t *state_table,
+                                   uint32_t peer_id, uint32_t expected,
+                                   const char *step)
+{
+    long deadline = monotonic_ms() + SMOKE_HANDSHAKE_TIMEOUT_MS;
+
+    while (state_table[peer_id] != expected) {
+        if (monotonic_ms() >= deadline) {
+            fail(step, "remote peer state timed out");
+        }
+        sleep_one_millisecond();
+    }
+}
+
+static void three_peer_exchange(void *shared, uint32_t peer_id,
+                                struct ivshmem_device *dev,
+                                struct ivshmem_backend *backend)
+{
+    const volatile uint32_t *state_table = (const volatile uint32_t *)shared;
+    volatile struct smoke_mailbox *own =
+        section_mailbox(shared, peer_id,
+                        SMOKE_THREE_OUTPUT_SECTION_STRIDE);
+    volatile struct smoke_mailbox *coordinator =
+        section_mailbox(shared, 0, SMOKE_THREE_OUTPUT_SECTION_STRIDE);
+    volatile struct smoke_mailbox *target =
+        section_mailbox(shared, 1, SMOKE_THREE_OUTPUT_SECTION_STRIDE);
+    volatile struct smoke_mailbox *observer =
+        section_mailbox(shared, 2, SMOKE_THREE_OUTPUT_SECTION_STRIDE);
+    int wait_result;
+
+    if (peer_id == 0) {
+        fill_mailbox(own, 0x31);
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_COORDINATOR);
+        wait_remote_state_long(state_table, 1,
+                               SMOKE_THREE_STATE_TARGET_READY,
+                               "three-peer-target-ready");
+        wait_remote_state_long(state_table, 2,
+                               SMOKE_THREE_STATE_OBSERVER_ARMED,
+                               "three-peer-observer-ready");
+        __sync_synchronize();
+        ivshmem_write_reg32(dev, IVSHMEM_REG_DOORBELL, 1u << 16);
+        checkpoint("three-peer-target-doorbell");
+
+        wait_result =
+            ivshmem_backend_wait_event(backend, SMOKE_HANDSHAKE_TIMEOUT_MS);
+        if (wait_result != 1) {
+            fail("three-peer-reply",
+                 wait_result == 0 ? "target reply timed out"
+                                  : "target reply wait failed");
+        }
+        wait_remote_state_long(state_table, 1,
+                               SMOKE_THREE_STATE_TARGET_REPLIED,
+                               "three-peer-target-reply");
+        wait_remote_state_long(state_table, 2,
+                               SMOKE_THREE_STATE_OBSERVER_CLEAN,
+                               "three-peer-observer-clean");
+        validate_mailbox(coordinator, "three-peer-coordinator-payload");
+        validate_mailbox(target, "three-peer-target-reply");
+        validate_mailbox(observer, "three-peer-observer-payload");
+        checkpoint("three-peer-visible-state-and-payload");
+        return;
+    }
+
+    if (peer_id == 1) {
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_TARGET_READY);
+        wait_result =
+            ivshmem_backend_wait_event(backend, SMOKE_HANDSHAKE_TIMEOUT_MS);
+        if (wait_result != 1) {
+            fail("three-peer-request",
+                 wait_result == 0 ? "coordinator request timed out"
+                                  : "coordinator request wait failed");
+        }
+        wait_remote_state_long(state_table, 0,
+                               SMOKE_THREE_STATE_COORDINATOR,
+                               "three-peer-coordinator-state");
+        validate_mailbox(coordinator, "three-peer-coordinator-request");
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_TARGET_RECEIVED);
+        wait_remote_state_long(state_table, 2,
+                               SMOKE_THREE_STATE_OBSERVER_CLEAN,
+                               "three-peer-observer-clean");
+
+        fill_mailbox(own, 0x52);
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_TARGET_REPLIED);
+        __sync_synchronize();
+        ivshmem_write_reg32(dev, IVSHMEM_REG_DOORBELL, 0);
+        checkpoint("three-peer-target-reply");
+        return;
+    }
+
+    if (peer_id == 2) {
+        long deadline;
+
+        fill_mailbox(own, 0x73);
+        __sync_synchronize();
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_OBSERVER_ARMED);
+        deadline = monotonic_ms() + SMOKE_HANDSHAKE_TIMEOUT_MS;
+        while (state_table[1] != SMOKE_THREE_STATE_TARGET_RECEIVED) {
+            if ((ivshmem_read_reg32(dev, IVSHMEM_REG_EVENT_STATUS) & 1) != 0) {
+                fail("three-peer-isolation",
+                     "peer 1 doorbell also reached peer 2");
+            }
+            if (monotonic_ms() >= deadline) {
+                fail("three-peer-isolation",
+                     "target did not receive the directed doorbell");
+            }
+            sleep_one_millisecond();
+        }
+        if ((ivshmem_read_reg32(dev, IVSHMEM_REG_EVENT_STATUS) & 1) != 0) {
+            fail("three-peer-isolation", "peer 2 has a pending event");
+        }
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_THREE_STATE_OBSERVER_CLEAN);
+        validate_mailbox(own, "three-peer-observer-payload");
+        checkpoint("three-peer-observer-clean");
+        return;
+    }
+
+    fail("three-peer-profile", "peer ID is outside the three-peer profile");
+}
+
 int main(int argc, char **argv)
 {
     struct options options;
@@ -332,6 +509,7 @@ int main(int argc, char **argv)
     size_t shared_size = 0;
     uint32_t peer_id;
     uint32_t max_peers;
+    uint32_t expected_max_peers;
 
     parse_options(argc, argv, &options);
 
@@ -363,14 +541,25 @@ int main(int argc, char **argv)
 
     peer_id = ivshmem_read_reg32(dev, IVSHMEM_REG_ID);
     max_peers = ivshmem_read_reg32(dev, IVSHMEM_REG_MAX_PEERS);
-    if (max_peers != EXPECTED_MAX_PEERS) {
+    expected_max_peers = options.three_peer ? 3u : 2u;
+    if (max_peers != expected_max_peers) {
         char detail[128];
 
         snprintf(detail, sizeof(detail),
                  "max_peers reads %u (peer_id reads %u), expected %u",
                  (unsigned)max_peers, (unsigned)peer_id,
-                 (unsigned)EXPECTED_MAX_PEERS);
+                 (unsigned)expected_max_peers);
         fail("profile", detail);
+    }
+    if (peer_id >= max_peers) {
+        fail("profile", "peer ID is outside the advertised peer range");
+    }
+    if (shared_size <
+        SMOKE_OUTPUT_SECTION_BASE +
+            (size_t)max_peers *
+                (options.three_peer ? SMOKE_THREE_OUTPUT_SECTION_STRIDE
+                                    : SMOKE_OUTPUT_SECTION_STRIDE)) {
+        fail("profile", "shared BAR is too small for the selected layout");
     }
     printf("ivshmem checkpoint profile peer_id=%u max_peers=%u "
            "shared_bytes=%zu\n",
@@ -379,25 +568,33 @@ int main(int argc, char **argv)
     if (ivshmem_shared_memory(dev, &shared_size) != shared) {
         fail("map-shared", "shared-memory mapping is not cached");
     }
-    exchange_payload(shared, peer_id);
+    exchange_payload(shared, peer_id,
+                     options.three_peer ? SMOKE_THREE_OUTPUT_SECTION_STRIDE
+                                        : SMOKE_OUTPUT_SECTION_STRIDE);
 
     /* The BAR0 State write must surface in the shared state table: this
      * peer's entry sits at BAR2 offset `peer_id * 4` inside the first page
-     * (F4 layout). The remote-peer observation is part of the cross-peer
-     * exchange below. */
+     * (F4 layout). The three-peer protocol publishes role-specific state
+     * after all peers have opened their event backend. */
     const volatile uint32_t *state_table = (const volatile uint32_t *)shared;
-    ivshmem_write_reg32(dev, IVSHMEM_REG_STATE, SMOKE_HANDSHAKE_STATE_SELF);
-    if (state_table[peer_id] != SMOKE_HANDSHAKE_STATE_SELF) {
-        fail("state", "BAR0 state write did not surface in the state table");
+    if (!options.three_peer) {
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_HANDSHAKE_STATE_SELF);
+        if (state_table[peer_id] != SMOKE_HANDSHAKE_STATE_SELF) {
+            fail("state",
+                 "BAR0 state write did not surface in the state table");
+        }
+        checkpoint("state");
     }
-    checkpoint("state");
 
     result = ivshmem_backend_open(dev, options.backend, &backend);
     if (result != IVSHMEM_OK) {
         fail_err("backend", result);
     }
 
-    if (options.cross_peer) {
+    if (options.three_peer) {
+        three_peer_exchange(shared, peer_id, dev, backend);
+    } else if (options.cross_peer) {
         if (peer_id == 0) {
             /* Initiator: self-doorbell coverage first, then the exchange.
              * Its own events are consumed by the self tests, so the reply
@@ -426,6 +623,15 @@ int main(int argc, char **argv)
     ivshmem_backend_close(backend);
     ivshmem_device_close(dev);
 
+    if (options.three_peer) {
+        if (peer_id == 0) {
+            printf("ivshmem %s three-peer pass\n", selected_backend);
+        } else {
+            printf("ivshmem %s three-peer relay pass\n", selected_backend);
+        }
+        fflush(stdout);
+        return 0;
+    }
     if (options.cross_peer && peer_id != 0) {
         /* The responder's marker is distinct: the case succeeds only when
          * the initiator observes the completed round trip. */

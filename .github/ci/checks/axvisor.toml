@@ -70,12 +70,14 @@ echo "==> axvisor aarch64 ivshmem-pci dual-peer Linux guests"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-pci-peers
 echo "==> axvisor aarch64 ivshmem-pci Linux and ArceOS peers"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-arceos-peer
+echo "==> axvisor aarch64 ivshmem-pci three-peer routing and isolation"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-pci-three-peers
 '''
 
 [[check.suite]]
 kind = "axvisor-qemu"
 arch = "aarch64"
-cases = ["ivshmem-pci-peers", "ivshmem-arceos-peer"]
+cases = ["ivshmem-pci-peers", "ivshmem-arceos-peer", "ivshmem-pci-three-peers"]
 
 [[check]]
 id = "test-axvisor-aarch64-qemu-panic-modes"
