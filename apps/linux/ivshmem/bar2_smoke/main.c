@@ -63,6 +63,7 @@
 #define SMOKE_HANDSHAKE_STATE_SELF 0x00010002u
 #define SMOKE_HANDSHAKE_STATE_INITIATOR 0x00010003u
 #define SMOKE_HANDSHAKE_STATE_RESPONDER 0x00010004u
+#define SMOKE_HANDSHAKE_STATE_READY 0x00010005u
 
 /* Three-peer protocol state. */
 #define SMOKE_THREE_OUTPUT_SECTION_STRIDE 0x5000
@@ -273,6 +274,10 @@ static void wait_remote_state(const volatile uint32_t *state_table,
     fail(step, "remote peer state did not reach the handshake value");
 }
 
+static void wait_remote_state_long(const volatile uint32_t *state_table,
+                                   uint32_t peer_id, uint32_t expected,
+                                   const char *step);
+
 static void cross_peer_exchange(void *shared, uint32_t peer_id,
                                 struct ivshmem_device *dev,
                                 struct ivshmem_backend *backend)
@@ -286,6 +291,13 @@ static void cross_peer_exchange(void *shared, uint32_t peer_id,
     int wait_result;
 
     if (peer_id == 0) {
+        /* Interrupt delivery is not valid until the responder has opened its
+         * event backend and completed MSI-X/UIO setup. Polling peers use the
+         * same readiness state so the protocol has one deterministic start. */
+        wait_remote_state_long(state_table, target,
+                               SMOKE_HANDSHAKE_STATE_READY,
+                               "cross-peer-ready");
+
         /* Initiator: publish the request, ring the responder, then validate
          * the responder's published state and reply. */
         fill_mailbox(own, 0x5a);
@@ -308,10 +320,15 @@ static void cross_peer_exchange(void *shared, uint32_t peer_id,
         validate_mailbox(remote, "cross-peer");
         checkpoint("cross-peer-reply");
     } else {
-        /* Responder: the first event must be the initiator's request. The
-         * self-doorbell tests run only after the exchange, because a
-         * pending self event would merge with the request event (Event
-         * Status is one merged bit). */
+        /* Responder: publish readiness only after the selected event backend
+         * is open. The first event can therefore only be the initiator's
+         * request. Self-doorbell tests run after the exchange because a
+         * pending self event would merge with the request event. */
+        ivshmem_write_reg32(dev, IVSHMEM_REG_STATE,
+                            SMOKE_HANDSHAKE_STATE_READY);
+        __sync_synchronize();
+        checkpoint("cross-peer-ready");
+
         wait_result =
             ivshmem_backend_wait_event(backend, SMOKE_HANDSHAKE_TIMEOUT_MS);
         if (wait_result != 1) {

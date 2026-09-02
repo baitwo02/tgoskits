@@ -1,0 +1,27 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?m)^IVSHMEM_PEERS_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^IVSHMEM_INTERRUPT_PEERS_ENUMERATION_FAILED(?:\\s|$)",
+  "(?m)^ivshmem polling failed(?:\\s|$)",
+  "(?m)^ivshmem interrupt failed(?:\\s|$)",
+]
+# Peer 0 prints this marker only after peer 1 has received the request through
+# /dev/uio0, validated the shared state and payload, and sent a reply. The
+# optional prefix matches the dual-guest console multiplexer.
+success_regex = [
+  "(?m)^(?:\\x1b\\[[0-9;]*m)*(?:\\[VM 1\\] )?ivshmem polling pass\\s*$",
+]
+timeout = 240
+to_bin = true
+uefi = false

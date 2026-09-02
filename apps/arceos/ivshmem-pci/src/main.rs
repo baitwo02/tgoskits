@@ -52,6 +52,7 @@ const MAILBOX_MAGIC: u32 = 0x4956_4350;
 const HANDSHAKE_STATE_SELF: u32 = 0x0001_0002;
 const HANDSHAKE_STATE_INITIATOR: u32 = 0x0001_0003;
 const HANDSHAKE_STATE_RESPONDER: u32 = 0x0001_0004;
+const HANDSHAKE_STATE_READY: u32 = 0x0001_0005;
 const MAILBOX_PAYLOAD_SIZE: usize = 0x100;
 
 // Guest scheduling is not part of the device contract: the handshake waits
@@ -245,6 +246,12 @@ fn cross_peer_exchange(
         validate_mailbox(remote_mailbox)?;
         println!("ivshmem-pci checkpoint cross-peer-reply");
     } else {
+        // Publish readiness only after the event path and shared mappings are
+        // usable, matching the Linux responder protocol.
+        write_u32(registers, IVSHMEM_REG_STATE, HANDSHAKE_STATE_READY);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        println!("ivshmem-pci checkpoint cross-peer-ready");
+
         if !wait_event(registers, HANDSHAKE_TIMEOUT_NANOS) {
             return Err("cross-peer request event timed out".into());
         }

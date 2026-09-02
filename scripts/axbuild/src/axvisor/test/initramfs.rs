@@ -266,6 +266,22 @@ run_pci_enumeration_check() {
   fi
 }
 
+load_ivshmem_uio_modules() {
+  if ! /bin/busybox insmod /lib/modules/uio.ko; then
+    echo "ivshmem interrupt failed module: cannot load uio.ko"
+    return 1
+  fi
+  if ! /bin/busybox insmod /lib/modules/uio_ivshmem.ko; then
+    echo "ivshmem interrupt failed module: cannot load uio_ivshmem.ko"
+    return 1
+  fi
+  if [ ! -c /dev/uio0 ]; then
+    echo "ivshmem interrupt failed module: /dev/uio0 was not created"
+    return 1
+  fi
+  return 0
+}
+
 cmdline=$(/bin/busybox cat /proc/cmdline)
 guest_arch=$(/bin/busybox uname -m)
 case "$cmdline" in
@@ -298,19 +314,22 @@ case "$cmdline" in
     run_pci_enumeration_check IVSHMEM_POLLING_ENUMERATION_PASSED
     /bin/ivshmem-bar2-smoke --backend polling
     exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-interrupt-peers*)
+    # Peer 1 receives peer 0's doorbells through uio_ivshmem MSI-X events.
+    # The peer 0 polling marker is the case success, so it cannot pass until
+    # this guest has handled the request and sent its reply.
+    run_pci_enumeration_check IVSHMEM_INTERRUPT_PEERS_ENUMERATION_PASSED
+    if load_ivshmem_uio_modules; then
+      /bin/ivshmem-bar2-smoke --backend interrupt --cross-peer
+    fi
+    exec /bin/busybox sh -i ;;
   *axvisor.pci_case=ivshmem-interrupt*)
     # Enumerate before binding so the shared check can still diagnose an
     # unexpected pre-existing driver. Both modules must match this kernel;
     # load or probe failures are interrupt-path failures, never permission to
     # run the polling backend instead.
     run_pci_enumeration_check IVSHMEM_INTERRUPT_ENUMERATION_PASSED
-    if ! /bin/busybox insmod /lib/modules/uio.ko; then
-      echo "ivshmem interrupt failed module: cannot load uio.ko"
-    elif ! /bin/busybox insmod /lib/modules/uio_ivshmem.ko; then
-      echo "ivshmem interrupt failed module: cannot load uio_ivshmem.ko"
-    elif [ ! -c /dev/uio0 ]; then
-      echo "ivshmem interrupt failed module: /dev/uio0 was not created"
-    else
+    if load_ivshmem_uio_modules; then
       /bin/ivshmem-bar2-smoke --backend interrupt
     fi
     exec /bin/busybox sh -i ;;
@@ -1017,6 +1036,10 @@ mod tests {
                 .any(|window| window == b"axvisor.pci_case=ivshmem-interrupt")
         );
         assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-interrupt-peers".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-interrupt-peers")
+        );
+        assert!(
             init.windows(b"axvisor.pci_case=ivshmem-three-peers".len())
                 .any(|window| window == b"axvisor.pci_case=ivshmem-three-peers")
         );
@@ -1029,6 +1052,12 @@ mod tests {
         assert!(
             init.windows(b"/bin/ivshmem-bar2-smoke --backend interrupt".len())
                 .any(|window| window == b"/bin/ivshmem-bar2-smoke --backend interrupt")
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-bar2-smoke --backend interrupt --cross-peer".len())
+                .any(|window| {
+                    window == b"/bin/ivshmem-bar2-smoke --backend interrupt --cross-peer"
+                })
         );
         assert!(
             init.windows(b"/bin/ivshmem-bar2-smoke --backend polling".len())
