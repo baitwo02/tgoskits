@@ -1,0 +1,28 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "run VCpu\\[\\d+\\] get error",
+  "IVSHMEM_PEERS_ENUMERATION_FAILED",
+  "ivshmem polling failed",
+  "ARCEOS_IVSHMEM_PCI_FAIL",
+]
+# The Linux initiator prints this only after the ArceOS responder has
+# consumed and validated the request, completed its local doorbell checks,
+# and returned a validated reply. Ostool success patterns are alternatives,
+# so the responder's earlier PASS is intentionally not a success pattern.
+success_regex = [
+  "ivshmem polling pass",
+]
+timeout = 120
+to_bin = true
+uefi = false

@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 
 use crate::{arceos::cbuild::cc_for_arch, support::process::ProcessExt};
 
@@ -23,6 +23,9 @@ pub(super) const IVSHMEM_SMOKE_ENV: &str = "AXVISOR_TEST_IVSHMEM_SMOKE";
 
 /// Build-group environment variable pointing at kernel-matched UIO modules.
 pub(super) const IVSHMEM_UIO_MODULE_DIR_ENV: &str = "AXVISOR_TEST_IVSHMEM_UIO_MODULE_DIR";
+
+/// Build-group environment variable selecting the ArceOS peer build config.
+pub(super) const IVSHMEM_ARCEOS_SMOKE_ENV: &str = "AXVISOR_TEST_IVSHMEM_ARCEOS_SMOKE";
 
 /// Guest paths of the UIO core and ivshmem PCI modules.
 pub(super) const UIO_CORE_ARCHIVE_PATH: &str = "lib/modules/uio.ko";
@@ -38,6 +41,68 @@ const SMOKE_BINARY_NAME: &str = "ivshmem-bar2-smoke";
 pub(super) struct UioModules {
     pub(super) core: Vec<u8>,
     pub(super) ivshmem: Vec<u8>,
+}
+
+/// Builds the ArceOS peer image from current sources before Axvisor embeds
+/// VM images. Calling the current xtask executable preserves the project's
+/// supported build entry and avoids a stale target artifact.
+pub(super) fn build_arceos_smoke(
+    workspace_root: &Path,
+    arch: &str,
+    configured_build: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        arch == "aarch64",
+        "the ArceOS ivshmem peer is currently built for aarch64 only"
+    );
+    let configured_build =
+        workspace_relative_path(workspace_root, configured_build, IVSHMEM_ARCEOS_SMOKE_ENV)?;
+    ensure!(
+        configured_build.is_file(),
+        "{} does not exist",
+        configured_build.display()
+    );
+    let xtask = std::env::current_exe().context("failed to locate the running xtask")?;
+    let mut command = Command::new(xtask);
+    command
+        .current_dir(workspace_root)
+        .arg("arceos")
+        .arg("build")
+        .arg("--package")
+        .arg("arceos-ivshmem-pci")
+        .arg("--config")
+        .arg(&configured_build);
+    command
+        .exec()
+        .context("failed to build the ArceOS ivshmem peer")?;
+
+    let image =
+        workspace_root.join("target/aarch64-unknown-linux-musl/release/arceos-ivshmem-pci.bin");
+    ensure!(
+        image.is_file(),
+        "ArceOS ivshmem build did not produce {}",
+        image.display()
+    );
+    Ok(())
+}
+
+fn workspace_relative_path(
+    workspace_root: &Path,
+    configured: &str,
+    variable: &str,
+) -> anyhow::Result<PathBuf> {
+    let configured = Path::new(configured);
+    if configured.is_absolute()
+        || !configured.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        bail!("{variable} must be a workspace-relative path without parent traversal");
+    }
+    Ok(workspace_root.join(configured))
 }
 
 /// Adapter compile flags: C11, size-optimized, warnings fatal. The adapter
@@ -64,21 +129,8 @@ pub(super) fn read_uio_modules(
     workspace_root: &Path,
     configured_dir: &str,
 ) -> anyhow::Result<UioModules> {
-    let configured_dir = Path::new(configured_dir);
-    if configured_dir.is_absolute()
-        || !configured_dir.components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::Normal(_)
-            )
-        })
-    {
-        bail!(
-            "{IVSHMEM_UIO_MODULE_DIR_ENV} must be a workspace-relative path without parent \
-             traversal"
-        );
-    }
-    let module_dir = workspace_root.join(configured_dir);
+    let module_dir =
+        workspace_relative_path(workspace_root, configured_dir, IVSHMEM_UIO_MODULE_DIR_ENV)?;
     let read_module = |name: &str| {
         let path = module_dir.join(name);
         fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
@@ -260,9 +312,31 @@ mod tests {
     }
 
     #[test]
+    fn arceos_smoke_build_config_must_stay_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert_eq!(
+            workspace_relative_path(
+                workspace.path(),
+                "apps/arceos/build.toml",
+                IVSHMEM_ARCEOS_SMOKE_ENV,
+            )
+            .unwrap(),
+            workspace.path().join("apps/arceos/build.toml")
+        );
+        assert!(
+            workspace_relative_path(workspace.path(), "../outside", IVSHMEM_ARCEOS_SMOKE_ENV)
+                .is_err()
+        );
+        assert!(
+            workspace_relative_path(workspace.path(), "/outside", IVSHMEM_ARCEOS_SMOKE_ENV)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn unsupported_architectures_are_rejected() {
         let workspace_root = crate::context::workspace_root_path().unwrap();
-        let result = build_smoke_binary(&workspace_root, "riscv64");
-        assert!(result.is_err());
+        assert!(build_smoke_binary(&workspace_root, "riscv64").is_err());
+        assert!(build_arceos_smoke(&workspace_root, "riscv64", "unused.toml").is_err());
     }
 }

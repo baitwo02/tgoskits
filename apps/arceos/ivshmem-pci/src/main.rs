@@ -1,4 +1,13 @@
 //! ArceOS guest smoke test for AxVisor's initial ivshmem PCI endpoint.
+//!
+//! With the bootargs marker `axvisor.pci_case=ivshmem-cross-peer` the smoke
+//! additionally runs the dual-peer handshake shared with the Linux smoke
+//! (`apps/linux/ivshmem/bar2_smoke/main.c`): the initiator (peer 0)
+//! publishes a request mailbox in its own output section and rings the
+//! responder, the responder validates the request, publishes its reply and
+//! rings back. Both sides observe the remote peer's state through the BAR2
+//! state table. Event waiting polls the BAR0 Event Status register with
+//! write-1-to-clear, matching the Linux polling backend's semantics.
 
 #[cfg(feature = "arceos")]
 use core::ptr::NonNull;
@@ -29,9 +38,31 @@ const IVSHMEM_BAR_SIZE: usize = 0x1_0000;
 const SMOKE_OUTPUT_SECTION_BASE: usize = 0x1000;
 const SMOKE_OUTPUT_SECTION_STRIDE: usize = 0x7000;
 const IVSHMEM_REG_ID: usize = 0x00;
+const IVSHMEM_REG_MAX_PEERS: usize = 0x04;
+const IVSHMEM_REG_DOORBELL: usize = 0x0c;
+const IVSHMEM_REG_STATE: usize = 0x10;
+const IVSHMEM_REG_EVENT_STATUS: usize = 0x14;
 const IVSHMEM_BAR0_SIZE: usize = 0x1000;
 const TEST_OFFSET_IN_SECTION: usize = 0x100;
 const TEST_VALUE: u64 = 0x4956_5348_4d45_4d31;
+
+// Cross-peer mailbox magic ("IVCP") and the BAR0 state values each side
+// publishes for the handshake; identical to the Linux smoke's contract.
+const MAILBOX_MAGIC: u32 = 0x4956_4350;
+const HANDSHAKE_STATE_SELF: u32 = 0x0001_0002;
+const HANDSHAKE_STATE_INITIATOR: u32 = 0x0001_0003;
+const HANDSHAKE_STATE_RESPONDER: u32 = 0x0001_0004;
+const MAILBOX_PAYLOAD_SIZE: usize = 0x100;
+
+// Guest scheduling is not part of the device contract: the handshake waits
+// long enough for the other guest to reach its smoke.
+const HANDSHAKE_TIMEOUT_NANOS: u64 = 30_000_000_000;
+const SELF_DOORBELL_TIMEOUT_NANOS: u64 = 5_000_000_000;
+const SELF_DOORBELL_UNAVAILABLE_WAIT_NANOS: u64 = 200_000_000;
+
+// The bootargs marker that switches the smoke into the dual-peer handshake;
+// the guest FDT carries it from the VM config's [kernel] cmdline.
+const CROSS_PEER_BOOTARGS_MARKER: &str = "axvisor.pci_case=ivshmem-cross-peer";
 
 #[cfg(feature = "arceos")]
 fn main() {
@@ -69,7 +100,7 @@ fn run() -> Result<(), String> {
 
     // The test payload offset depends on this endpoint's peer ID (F5
     // ownership: each peer may write only its own output section), so map
-    // BAR0 and read the identity register first.
+    // BAR0 and read the identity registers first.
     let bar0 = usize::try_from(read_u32(ecam, IVSHMEM_ECAM_OFFSET + PCI_BAR0_OFFSET) & 0xffff_fff0)
         .map_err(|_| "BAR0 address does not fit usize".to_string())?;
     if bar0 == 0 {
@@ -77,9 +108,16 @@ fn run() -> Result<(), String> {
     }
     let registers = map_device_range(bar0, IVSHMEM_BAR0_SIZE, "ivshmem BAR0")?;
     let peer_id = read_u32(registers, IVSHMEM_REG_ID);
-    let test_offset = SMOKE_OUTPUT_SECTION_BASE
-        + peer_id as usize * SMOKE_OUTPUT_SECTION_STRIDE
-        + TEST_OFFSET_IN_SECTION;
+    let max_peers = read_u32(registers, IVSHMEM_REG_MAX_PEERS);
+    if max_peers != 2 {
+        return Err(format!(
+            "max_peers reads {max_peers} (peer_id reads {peer_id}), expected 2"
+        ));
+    }
+
+    let cross_peer = ax_hal_bootargs_contains(CROSS_PEER_BOOTARGS_MARKER);
+    let own_section = SMOKE_OUTPUT_SECTION_BASE + peer_id as usize * SMOKE_OUTPUT_SECTION_STRIDE;
+    let test_offset = own_section + TEST_OFFSET_IN_SECTION;
 
     let shared_memory = map_device_range(bar2, IVSHMEM_BAR_SIZE, "ivshmem BAR2")?;
     write_u64(shared_memory, test_offset, TEST_VALUE);
@@ -90,11 +128,231 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    // The BAR0 State write must surface in the shared state table (F4);
+    // this peer's entry sits at BAR2 offset `peer_id * 4` in the first page.
+    let state_table = shared_memory.as_ptr() as *const u32;
+    write_u32(registers, IVSHMEM_REG_STATE, HANDSHAKE_STATE_SELF);
+    // SAFETY: the BAR2 mapping covers the whole state table page and the
+    // peer entry offset is inside it.
+    let own_state = unsafe { core::ptr::read_volatile(state_table.add(peer_id as usize)) };
+    if own_state != HANDSHAKE_STATE_SELF {
+        return Err(format!(
+            "BAR0 state write did not surface in the state table: {own_state:#010x}"
+        ));
+    }
     println!(
         "ivshmem-pci identity={identity:#010x} bar2={bar2:#x} peer_id={peer_id} \
-         test_offset={test_offset:#x}"
+         test_offset={test_offset:#x} cross_peer={cross_peer}"
     );
+
+    if cross_peer {
+        if peer_id == 0 {
+            // Initiator: self-doorbell coverage first, then the exchange.
+            self_doorbell_tests(registers, peer_id)?;
+            cross_peer_exchange(registers, shared_memory, peer_id)?;
+        } else {
+            // The responder exchange consumes the request first and runs the
+            // self-doorbell checks before publishing its reply. Therefore the
+            // initiator's final pass marker proves both ArceOS paths completed.
+            cross_peer_exchange(registers, shared_memory, peer_id)?;
+        }
+    } else {
+        self_doorbell_tests(registers, peer_id)?;
+    }
     Ok(())
+}
+
+/// Waits until Event Status bit 0 pends and clears it with write-1-to-clear.
+///
+/// Returns `true` when an event was observed, `false` on timeout.
+#[cfg(feature = "arceos")]
+fn wait_event(registers: NonNull<u8>, timeout_nanos: u64) -> bool {
+    let deadline = ax_hal_monotonic_time_nanos().saturating_add(timeout_nanos);
+    while ax_hal_monotonic_time_nanos() < deadline {
+        if read_u32(registers, IVSHMEM_REG_EVENT_STATUS) & 1 != 0 {
+            write_u32(registers, IVSHMEM_REG_EVENT_STATUS, 1);
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Rings this endpoint's own doorbell twice and verifies the W1C/re-pend
+/// behavior, then checks that an unsupported vector produces no event.
+#[cfg(feature = "arceos")]
+fn self_doorbell_tests(registers: NonNull<u8>, peer_id: u32) -> Result<(), String> {
+    let doorbell = |target: u32, vector: u32| {
+        write_u32(registers, IVSHMEM_REG_DOORBELL, (target << 16) | vector);
+    };
+
+    doorbell(peer_id, 0);
+    if !wait_event(registers, SELF_DOORBELL_TIMEOUT_NANOS) {
+        return Err("first self doorbell timed out".into());
+    }
+    if read_u32(registers, IVSHMEM_REG_EVENT_STATUS) & 1 != 0 {
+        return Err("event status was not cleared by the wait".into());
+    }
+
+    doorbell(peer_id, 0);
+    if !wait_event(registers, SELF_DOORBELL_TIMEOUT_NANOS) {
+        return Err("second self doorbell timed out".into());
+    }
+
+    // Vector 1 is outside the current profile: the doorbell is a no-op and
+    // no event may arrive.
+    doorbell(peer_id, 1);
+    if wait_event(registers, SELF_DOORBELL_UNAVAILABLE_WAIT_NANOS) {
+        return Err("an unsupported vector produced an event".into());
+    }
+    Ok(())
+}
+
+/// Runs the cross-peer mailbox exchange shared with the Linux smoke.
+///
+/// The initiator (peer 0) publishes the request in its own output section,
+/// publishes its handshake state and rings the responder; the responder
+/// validates the request, publishes its reply and rings back. The
+/// `fill_mailbox` order (payload, then state, then doorbell) and the remote
+/// state poll make the payload visible before the reply is validated.
+#[cfg(feature = "arceos")]
+fn cross_peer_exchange(
+    registers: NonNull<u8>,
+    shared_memory: NonNull<u8>,
+    peer_id: u32,
+) -> Result<(), String> {
+    let target = peer_id ^ 1;
+    let own_mailbox = shared_memory.as_ptr() as usize
+        + SMOKE_OUTPUT_SECTION_BASE
+        + peer_id as usize * SMOKE_OUTPUT_SECTION_STRIDE;
+    let remote_mailbox = shared_memory.as_ptr() as usize
+        + SMOKE_OUTPUT_SECTION_BASE
+        + target as usize * SMOKE_OUTPUT_SECTION_STRIDE;
+
+    if peer_id == 0 {
+        fill_mailbox(own_mailbox, 0x5a)?;
+        write_u32(registers, IVSHMEM_REG_STATE, HANDSHAKE_STATE_INITIATOR);
+        // The doorbell is a Device write and does not order the prior
+        // Normal-memory mailbox and state stores.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        write_u32(registers, IVSHMEM_REG_DOORBELL, target << 16);
+        println!("ivshmem-pci checkpoint cross-peer-request");
+
+        if !wait_event(registers, HANDSHAKE_TIMEOUT_NANOS) {
+            return Err("cross-peer reply event timed out".into());
+        }
+        wait_remote_state(shared_memory, target, HANDSHAKE_STATE_RESPONDER)?;
+        validate_mailbox(remote_mailbox)?;
+        println!("ivshmem-pci checkpoint cross-peer-reply");
+    } else {
+        if !wait_event(registers, HANDSHAKE_TIMEOUT_NANOS) {
+            return Err("cross-peer request event timed out".into());
+        }
+        wait_remote_state(shared_memory, target, HANDSHAKE_STATE_INITIATOR)?;
+        validate_mailbox(remote_mailbox)?;
+
+        // Event Status is clear after consuming the request, so self events
+        // cannot merge with and hide that request. Complete all local event
+        // checks before replying; the Linux initiator only passes after this
+        // peer reaches the reply doorbell below.
+        self_doorbell_tests(registers, peer_id)?;
+        fill_mailbox(own_mailbox, 0xa5)?;
+        write_u32(registers, IVSHMEM_REG_STATE, HANDSHAKE_STATE_RESPONDER);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        write_u32(registers, IVSHMEM_REG_DOORBELL, target << 16);
+        println!("ivshmem-pci checkpoint cross-peer-relay");
+    }
+    Ok(())
+}
+
+/// Polls the remote peer's state-table entry until it reaches `expected`.
+#[cfg(feature = "arceos")]
+fn wait_remote_state(
+    shared_memory: NonNull<u8>,
+    peer_id: u32,
+    expected: u32,
+) -> Result<(), String> {
+    let deadline = ax_hal_monotonic_time_nanos() + 1_000_000_000;
+    let entry = (shared_memory.as_ptr() as usize + peer_id as usize * 4) as *const u32;
+    // SAFETY: the BAR2 mapping covers the state table page and the peer
+    // entry offset is inside it.
+    while unsafe { core::ptr::read_volatile(entry) } != expected {
+        if ax_hal_monotonic_time_nanos() >= deadline {
+            return Err(format!("remote peer state did not reach {expected:#010x}"));
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn payload_checksum(payload: &[u8; MAILBOX_PAYLOAD_SIZE]) -> u32 {
+    let mut checksum: u32 = 0x4956_5348;
+    for &byte in payload {
+        checksum = checksum.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    checksum
+}
+
+/// Writes one mailbox: payload first, then magic and the payload checksum,
+/// so a reader that observes the magic also observes the payload.
+#[cfg(feature = "arceos")]
+fn fill_mailbox(mailbox: usize, seed: u32) -> Result<(), String> {
+    // SAFETY: the mailbox lives inside this peer's own output section, which
+    // the F5/F6 mapping makes writable, and the mailbox layout fits the 28
+    // KiB section.
+    let mailbox = NonNull::new(mailbox as *mut u8).ok_or("mailbox pointer is null")?;
+    let mut payload = [0u8; MAILBOX_PAYLOAD_SIZE];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = (index as u32 * 7 + seed) as u8;
+    }
+    for (index, byte) in payload.iter().enumerate() {
+        // SAFETY: the payload offset is naturally aligned and contained in
+        // the peer-owned output section mapping.
+        unsafe {
+            core::ptr::write_volatile(mailbox.as_ptr().add(0x10 + index), *byte);
+        }
+    }
+    let checksum = payload_checksum(&payload);
+    write_u32(mailbox, 0x00, MAILBOX_MAGIC);
+    write_u32(mailbox, 0x04, checksum);
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn validate_mailbox(mailbox: usize) -> Result<(), String> {
+    // SAFETY: the mailbox lives inside the remote peer's output section,
+    // which the F5/F6 mapping makes readable, and the reads are aligned and
+    // contained in the 28 KiB section.
+    let mailbox = NonNull::new(mailbox as *mut u8).ok_or("mailbox pointer is null")?;
+    let magic = read_u32(mailbox, 0x00);
+    let checksum = read_u32(mailbox, 0x04);
+    if magic != MAILBOX_MAGIC {
+        return Err(format!("cross-peer mailbox magic mismatch: {magic:#010x}"));
+    }
+    let mut payload = [0u8; MAILBOX_PAYLOAD_SIZE];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        // SAFETY: the payload offset is naturally aligned and contained in
+        // the remote peer's output section mapping.
+        unsafe {
+            *byte = core::ptr::read_volatile(mailbox.as_ptr().add(0x10 + index));
+        }
+    }
+    if checksum != payload_checksum(&payload) {
+        return Err("cross-peer payload checksum mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn ax_hal_bootargs_contains(marker: &str) -> bool {
+    ax_std::os::arceos::modules::ax_hal::boot::bootargs()
+        .is_some_and(|bootargs| bootargs.contains(marker))
+}
+
+#[cfg(feature = "arceos")]
+fn ax_hal_monotonic_time_nanos() -> u64 {
+    ax_std::os::arceos::modules::ax_hal::time::monotonic_time_nanos()
 }
 
 #[cfg(feature = "arceos")]
@@ -123,6 +381,13 @@ fn read_u32(base: NonNull<u8>, offset: usize) -> u32 {
     // SAFETY: the caller provides a mapped device aperture and every constant
     // offset used here is naturally aligned and contained in that aperture.
     unsafe { core::ptr::read_volatile(base.as_ptr().add(offset).cast::<u32>()) }
+}
+
+#[cfg(feature = "arceos")]
+fn write_u32(base: NonNull<u8>, offset: usize, value: u32) {
+    // SAFETY: the caller provides a mapped device aperture and every constant
+    // offset used here is naturally aligned and contained in that aperture.
+    unsafe { core::ptr::write_volatile(base.as_ptr().add(offset).cast::<u32>(), value) }
 }
 
 #[cfg(feature = "arceos")]

@@ -162,6 +162,17 @@ impl Axvisor {
                 group_rootfs.as_deref(),
             )
             .await?;
+            if let Some(configured_build) = build_group
+                .cargo
+                .env
+                .get(super::ivshmem_smoke::IVSHMEM_ARCEOS_SMOKE_ENV)
+            {
+                super::ivshmem_smoke::build_arceos_smoke(
+                    self.app.workspace_root(),
+                    &build_group.request.arch,
+                    configured_build,
+                )?;
+            }
             prepare_configured_busybox_initramfs(
                 &build_group.request,
                 &build_group.cargo,
