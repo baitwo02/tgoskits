@@ -16,6 +16,8 @@ use core::{arch::asm, fmt::Formatter};
 
 use aarch64_cpu::registers::*;
 
+use crate::ArmGuestAbortFrame;
+
 /// A struct representing the AArch64 CPU context frame.
 ///
 /// This context frame includes
@@ -204,6 +206,19 @@ pub(crate) const GUEST_TPIDR_EL0_OFFSET: usize =
 const _: () = assert!(GUEST_TPIDR_EL0_OFFSET.is_multiple_of(core::mem::align_of::<u64>()));
 
 impl GuestSystemRegisters {
+    /// Returns the guest vector-table base used for guest exception injection.
+    pub(crate) fn vbar_el1(&self) -> u64 {
+        self.vbar_el1
+    }
+
+    /// Applies the guest-side registers of one abort injection frame.
+    pub(crate) fn apply_abort_frame(&mut self, frame: &ArmGuestAbortFrame) {
+        self.elr_el1 = frame.guest_pc;
+        self.spsr_el1 = frame.guest_spsr as u32;
+        self.esr_el1 = frame.esr_el1;
+        self.far_el1 = frame.far_el1;
+    }
+
     /// Resets the VM context by setting all registers to zero.
     ///
     /// This method allows the `GuestSystemRegisters` instance to be reused by resetting

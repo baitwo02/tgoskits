@@ -32,11 +32,19 @@
  * observes its Event Status and fails on any crosstalk. Peer 0 emits the
  * unique "ivshmem polling three-peer pass" marker only after validating all
  * three state-table entries and output-section mailboxes.
+ *
+ * Every mode additionally proves the F5/F6 write isolation: a write to the
+ * state table and to a non-owner output section must fault into the guest
+ * (SIGBUS or SIGSEGV from the injected data abort), leave the target bytes
+ * unchanged, and let the VM keep running.
  */
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "ivshmem.h"
 
@@ -323,6 +331,71 @@ static void cross_peer_exchange(void *shared, uint32_t peer_id,
     }
 }
 
+static sigjmp_buf deny_jump;
+static volatile sig_atomic_t deny_armed;
+
+static void deny_signal_handler(int signal)
+{
+    if (deny_armed) {
+        deny_armed = 0;
+        siglongjmp(deny_jump, 1);
+    }
+    _exit(128 + signal);
+}
+
+static void install_deny_signal_handlers(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = deny_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_NODEFER;
+    if (sigaction(SIGBUS, &action, NULL) != 0 ||
+        sigaction(SIGSEGV, &action, NULL) != 0) {
+        fail("deny-write", "failed to install signal handlers");
+    }
+}
+
+/* A write to a read-only stage-2 section must fault back into the guest
+ * (SIGBUS or SIGSEGV from the injected synchronous external abort) instead
+ * of reaching the backing: the target bytes stay unchanged and the VM keeps
+ * running. */
+static void expect_denied_write(volatile uint32_t *target, const char *step)
+{
+    uint32_t before = *target;
+
+    if (sigsetjmp(deny_jump, 1) == 0) {
+        deny_armed = 1;
+        __sync_synchronize();
+        *target = 0xdeadbeefu;
+        deny_armed = 0;
+        fail(step, "a read-only stage-2 section accepted a write");
+    }
+    deny_armed = 0;
+    __sync_synchronize();
+    if (*target != before) {
+        fail(step, "a denied write still modified the shared bytes");
+    }
+}
+
+static void deny_write_tests(void *shared, uint32_t peer_id,
+                             uint32_t max_peers, size_t output_stride)
+{
+    volatile uint32_t *state_entry = (volatile uint32_t *)shared + peer_id;
+    uint32_t remote_peer = (peer_id + 1) % max_peers;
+    volatile uint32_t *remote_output =
+        (volatile uint32_t *)((volatile uint8_t *)shared +
+                              SMOKE_OUTPUT_SECTION_BASE +
+                              (size_t)remote_peer * output_stride);
+
+    install_deny_signal_handlers();
+    expect_denied_write(state_entry, "deny-write-state");
+    checkpoint("deny-write-state");
+    expect_denied_write(remote_output, "deny-write-output");
+    checkpoint("deny-write-output");
+}
+
 static void self_doorbell_tests(struct ivshmem_device *dev,
                                 struct ivshmem_backend *backend,
                                 uint32_t peer_id)
@@ -586,6 +659,13 @@ int main(int argc, char **argv)
         }
         checkpoint("state");
     }
+
+    /* F5/F6 evidence: the state table is read-only for every peer and each
+     * peer may write only its own output section. The writes below must
+     * fault into the guest and leave the backing bytes untouched. */
+    deny_write_tests(shared, peer_id, max_peers,
+                     options.three_peer ? SMOKE_THREE_OUTPUT_SECTION_STRIDE
+                                        : SMOKE_OUTPUT_SECTION_STRIDE);
 
     result = ivshmem_backend_open(dev, options.backend, &backend);
     if (result != IVSHMEM_OK) {

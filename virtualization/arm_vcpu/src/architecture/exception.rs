@@ -27,7 +27,7 @@ use super::{
         exception_sysreg_addr, exception_sysreg_direction_write, exception_sysreg_gpr,
     },
 };
-use crate::{ArmAccessWidth, ArmSysRegAddr, ArmVcpuError, ArmVcpuResult, ArmVmExit};
+use crate::{ArmAccessWidth, ArmSysRegAddr, ArmVcpuResult, ArmVmExit};
 
 numeric_enum_macro::numeric_enum! {
 #[repr(u8)]
@@ -110,12 +110,7 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
             ctx.set_exception_pc(next_pc);
             Ok(ArmVmExit::WaitForInterrupt)
         }
-        Some(ESR_EL2::EC::Value::DataAbortLowerEL) => {
-            let elr = ctx.exception_pc();
-            let val = elr + exception_next_instruction_step();
-            ctx.set_exception_pc(val);
-            handle_data_abort(ctx)
-        }
+        Some(ESR_EL2::EC::Value::DataAbortLowerEL) => handle_data_abort(ctx),
         Some(ESR_EL2::EC::Value::HVC64) => {
             // HVC records the preferred return address (the instruction after
             // `hvc`) in ELR_EL2, so the handlers must preserve this PC.
@@ -217,11 +212,19 @@ fn handle_data_abort(context_frame: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> 
 
     if !exception_data_abort_is_translate_fault() {
         if exception_data_abort_is_permission_fault() {
-            return Err(ArmVcpuError::Unsupported);
+            // Stage-2 permission fault on a mapped GPA. Keep ELR_EL2 on the
+            // faulting instruction: the VMM either installs a mapping and
+            // retries, or injects a guest-visible abort for the denied
+            // access.
+            return Ok(ArmVmExit::NestedPageFault { addr, is_write });
         } else {
             panic!("Core data abort is not translate fault {:#x}", addr,);
         }
     }
+
+    // MMIO emulation retires the trapping instruction before returning.
+    let next_pc = context_frame.exception_pc() + exception_next_instruction_step();
+    context_frame.set_exception_pc(next_pc);
 
     if is_write {
         return Ok(ArmVmExit::MmioWrite {

@@ -1940,7 +1940,8 @@ impl AxVM {
             let diagnosis = resources.stage2_remap.diagnose(addr.as_usize() as u64);
             match &diagnosis {
                 Some(fault) => warn!(
-                    "VM[{}] stage2 permission violation: gpa={:#x} section={} owner={}                      mapping_writable={} access={:?}",
+                    "VM[{}] stage2 permission violation: gpa={:#x} section={} owner={} \
+                     mapping_writable={} access={:?}",
                     vm_id,
                     addr.as_usize(),
                     fault.label(),

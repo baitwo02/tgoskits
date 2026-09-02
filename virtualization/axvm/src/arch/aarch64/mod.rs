@@ -107,6 +107,9 @@ impl ArchOps for Aarch64Arch {
                     data,
                 },
             ),
+            ArmVmExit::NestedPageFault { addr, is_write } => {
+                handle_aarch64_nested_page_fault(vm, vcpu, addr, is_write)
+            }
             ArmVmExit::SysRegRead { addr, reg } => sysreg::handle_read(
                 vm,
                 vcpu,
@@ -286,6 +289,32 @@ fn vgic_runtime(vm: &crate::AxVM) -> AxVmResult<Arc<vgic::Aarch64VgicRuntime>> {
         .require::<Aarch64VgicRuntimeKey>()?)
 }
 
+/// Handles a stage-2 permission fault reported by the vCPU core.
+///
+/// A fault the address space cannot repair belongs to an intentionally
+/// denied section (for example a non-owner write to an ivshmem output
+/// section): the store never reached the backing, so the guest receives a
+/// synchronous external abort and keeps running instead of the VM being
+/// destroyed. `handle_nested_page_fault` already logged the owning device
+/// and section for the faulting GPA.
+fn handle_aarch64_nested_page_fault(
+    vm: &crate::AxVMRef,
+    vcpu: &crate::vm::AxVCpuRef<AxvmArmVcpu>,
+    addr: ArmGuestPhysAddr,
+    is_write: bool,
+) -> AxVmResult<BoundVcpuExit<Aarch64DeferredRunWork>> {
+    let access = if is_write {
+        MappingFlags::READ | MappingFlags::WRITE
+    } else {
+        MappingFlags::READ
+    };
+    if vm.handle_nested_page_fault(arm_guest_phys_addr_to_ax(addr), access) {
+        return Ok(BoundVcpuExit::Continue);
+    }
+    vcpu.get_arch_vcpu().inject_data_abort(is_write)?;
+    Ok(BoundVcpuExit::Continue)
+}
+
 struct AxvmArmHostOps;
 
 impl ArmHostOps for AxvmArmHostOps {
@@ -350,6 +379,11 @@ impl AxvmArmVcpu {
         self.vgic_binding
             .as_ref()
             .ok_or_else(|| crate::AxVmError::resource_unavailable("VGIC vCPU binding", "missing"))
+    }
+
+    fn inject_data_abort(&mut self, is_write: bool) -> AxVmResult {
+        arm_result(self.inner.inject_data_abort(is_write))
+            .map_err(|error| crate::vcpu::map_vcpu_backend_error("inject guest data abort", error))
     }
 
     fn write_sgi1r(&self, value: u64) -> AxVmResult {

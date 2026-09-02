@@ -25,8 +25,8 @@ use super::{
     host::{ArmHostIrqConfig, ArmHostIrqGuard, ArmHostOps},
 };
 use crate::{
-    ArmGuestPhysAddr, ArmNestedPagingConfig, ArmSysRegAddr, ArmTimerKind, ArmTimerSnapshot,
-    ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer, ArmVmExit,
+    ArmGuestAbortFrame, ArmGuestPhysAddr, ArmNestedPagingConfig, ArmSysRegAddr, ArmTimerKind,
+    ArmTimerSnapshot, ArmTimerVmConfig, ArmVcpuResult, ArmVcpuTimer, ArmVmExit,
 };
 
 /// (v)CPU register state that must be saved or restored when entering/exiting a VM or switching
@@ -234,6 +234,28 @@ impl<H: ArmHostOps> ArmVcpu<H> {
             config.mode
         };
         self.guest_system_regs.vtcr_el2 = vtcr_for_config(config.levels, config.gpa_bits, pa_bits);
+        Ok(())
+    }
+
+    /// Injects a synchronous external data abort into the guest for a
+    /// stage-2 permission violation the VMM refused to service.
+    ///
+    /// The next guest entry lands on the guest's own synchronous exception
+    /// vector with `ELR_EL1`/`SPSR_EL1` describing the faulting context, so
+    /// the guest handles the access exactly like a hardware-reported abort.
+    /// `ELR_EL2` was left on the faulting instruction by the
+    /// [`ArmVmExit::NestedPageFault`] exit; a guest handler that resumes the
+    /// faulting PC faults again.
+    pub fn inject_data_abort(&mut self, is_write: bool) -> ArmVcpuResult {
+        let frame = ArmGuestAbortFrame::data_abort(
+            self.ctx.elr,
+            self.ctx.spsr,
+            self.guest_system_regs.vbar_el1(),
+            is_write,
+        );
+        self.guest_system_regs.apply_abort_frame(&frame);
+        self.ctx.elr = frame.entry_pc;
+        self.ctx.spsr = frame.entry_spsr;
         Ok(())
     }
 

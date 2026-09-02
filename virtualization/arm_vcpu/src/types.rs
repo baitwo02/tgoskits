@@ -165,6 +165,94 @@ impl From<ArmAccessWidth> for usize {
     }
 }
 
+/// Reconstructed register state for injecting a synchronous data abort into
+/// a guest after the VMM refuses to service a stage-2 permission fault.
+///
+/// The frame redirects the next guest entry to the guest's own synchronous
+/// exception vector with `ELR_EL1`/`SPSR_EL1` describing the faulting
+/// context, so the guest handles the access exactly like a hardware-reported
+/// external abort. `FAR_EL1` is zero because the guest virtual address
+/// cannot be recovered from `HPFAR_EL2`; a zero FAR guarantees the guest
+/// kernel takes its bad-area path and never matches a real VMA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArmGuestAbortFrame {
+    /// `ELR_EL1`: faulting guest PC reported to the guest handler.
+    pub guest_pc: u64,
+    /// `SPSR_EL1`: guest PSTATE reported to the guest handler.
+    pub guest_spsr: u64,
+    /// `ESR_EL1`: reconstructed syndrome (data abort, external-abort FSC).
+    pub esr_el1: u32,
+    /// `FAR_EL1`: always zero; see the type-level documentation.
+    pub far_el1: u64,
+    /// `ELR_EL2`: guest synchronous exception vector for the next entry.
+    pub entry_pc: u64,
+    /// `SPSR_EL2`: EL1h with all exceptions masked for the vector entry.
+    pub entry_spsr: u64,
+}
+
+impl ArmGuestAbortFrame {
+    /// ESR exception class for a data abort from a lower exception level.
+    const ESR_EC_DATA_ABORT_LOWER: u64 = 0x24;
+    /// ESR exception class for a data abort from the current exception level.
+    const ESR_EC_DATA_ABORT_CURRENT: u64 = 0x25;
+    /// ESR instruction-length bit (always set for AArch64).
+    const ESR_IL: u64 = 1 << 25;
+    /// ESR write-not-read bit.
+    const ESR_WNR: u64 = 1 << 6;
+    /// ESR fault status code for a synchronous external abort.
+    const ESR_FSC_EXTERNAL_ABORT: u64 = 0x10;
+
+    /// PSTATE mode field mask (`M[3:0]`).
+    const SPSR_MODE_MASK: u64 = 0xf;
+    /// PSTATE mode value for EL0t.
+    const SPSR_MODE_EL0T: u64 = 0x0;
+    /// PSTATE mode value for EL1t.
+    const SPSR_MODE_EL1T: u64 = 0x4;
+
+    /// Vector offset for exceptions from a lower AArch64 exception level.
+    const VECTOR_OFFSET_LOWER_AARCH64: u64 = 0x400;
+    /// Vector offset for exceptions from the current level using SP_ELx.
+    const VECTOR_OFFSET_CURRENT_SPX: u64 = 0x200;
+    /// Vector offset for exceptions from the current level using SP_EL0.
+    const VECTOR_OFFSET_CURRENT_SP0: u64 = 0x000;
+
+    /// PSTATE for the injected vector entry: EL1h with D/A/I/F masked.
+    const PSTATE_EL1H_MASKED: u64 = 0x3c5;
+
+    /// Builds the injection frame for one denied guest access.
+    ///
+    /// `fault_pc` and `source_spsr` describe the faulting guest context and
+    /// become `ELR_EL1`/`SPSR_EL1`; `vbar_el1` is the guest vector base.
+    pub fn data_abort(fault_pc: u64, source_spsr: u64, vbar_el1: u64, is_write: bool) -> Self {
+        let (exception_class, vector_offset) = match source_spsr & Self::SPSR_MODE_MASK {
+            Self::SPSR_MODE_EL0T => (
+                Self::ESR_EC_DATA_ABORT_LOWER,
+                Self::VECTOR_OFFSET_LOWER_AARCH64,
+            ),
+            Self::SPSR_MODE_EL1T => (
+                Self::ESR_EC_DATA_ABORT_CURRENT,
+                Self::VECTOR_OFFSET_CURRENT_SP0,
+            ),
+            _ => (
+                Self::ESR_EC_DATA_ABORT_CURRENT,
+                Self::VECTOR_OFFSET_CURRENT_SPX,
+            ),
+        };
+        let mut esr = (exception_class << 26) | Self::ESR_IL | Self::ESR_FSC_EXTERNAL_ABORT;
+        if is_write {
+            esr |= Self::ESR_WNR;
+        }
+        Self {
+            guest_pc: fault_pc,
+            guest_spsr: source_spsr,
+            esr_el1: esr as u32,
+            far_el1: 0,
+            entry_pc: vbar_el1 + vector_offset,
+            entry_spsr: Self::PSTATE_EL1H_MASKED,
+        }
+    }
+}
+
 /// Stage-2 page table configuration selected by the embedding VMM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArmNestedPagingConfig {
@@ -265,6 +353,17 @@ pub enum ArmVmExit {
         /// Value written by the guest.
         value: u64,
     },
+    /// The guest faulted on stage-2 permissions for a mapped GPA.
+    ///
+    /// The vCPU leaves `ELR_EL2` on the faulting instruction so the VMM can
+    /// either install a mapping and retry, or inject a guest-visible abort
+    /// for the denied access.
+    NestedPageFault {
+        /// Guest physical address being accessed.
+        addr: ArmGuestPhysAddr,
+        /// Whether the faulting access was a write.
+        is_write: bool,
+    },
     /// A physical host interrupt should be handled by the embedding VMM.
     ExternalInterrupt {
         /// Opaque acknowledgement token, or `None` for a spurious interrupt.
@@ -303,4 +402,41 @@ pub enum ArmVmExit {
     },
     /// The vCPU handled the event internally.
     Nothing,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_abort_frame_for_el0_write_targets_lower_el_vector() {
+        let frame = ArmGuestAbortFrame::data_abort(0x1000, 0x0, 0xffff_0000_0800_0000, true);
+
+        assert_eq!(frame.guest_pc, 0x1000);
+        assert_eq!(frame.guest_spsr, 0x0);
+        assert_eq!(frame.entry_pc, 0xffff_0000_0800_0400);
+        assert_eq!(frame.entry_spsr, 0x3c5);
+        assert_eq!(frame.far_el1, 0);
+        assert_eq!(frame.esr_el1 >> 26, 0x24);
+        assert!(frame.esr_el1 & (1 << 25) != 0);
+        assert!(frame.esr_el1 & (1 << 6) != 0);
+        assert_eq!(frame.esr_el1 & 0x3f, 0x10);
+    }
+
+    #[test]
+    fn data_abort_frame_for_el1h_read_targets_current_el_vector() {
+        let frame = ArmGuestAbortFrame::data_abort(0x2000, 0x5, 0xffff_0000_0800_0000, false);
+
+        assert_eq!(frame.entry_pc, 0xffff_0000_0800_0200);
+        assert_eq!(frame.esr_el1 >> 26, 0x25);
+        assert!(frame.esr_el1 & (1 << 6) == 0);
+    }
+
+    #[test]
+    fn data_abort_frame_for_el1t_uses_sp0_vector() {
+        let frame = ArmGuestAbortFrame::data_abort(0x2000, 0x4, 0xffff_0000_0800_0000, false);
+
+        assert_eq!(frame.entry_pc, 0xffff_0000_0800_0000);
+        assert_eq!(frame.esr_el1 >> 26, 0x25);
+    }
 }
