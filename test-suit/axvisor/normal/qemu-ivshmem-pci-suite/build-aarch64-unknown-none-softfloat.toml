@@ -1,0 +1,18 @@
+features = []
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = [
+  "test-suit/axvisor/normal/qemu-ivshmem-pci-suite/configs/linux-primary.toml",
+  "test-suit/axvisor/normal/qemu-ivshmem-pci-suite/configs/arceos-peer.toml",
+  "test-suit/axvisor/normal/qemu-ivshmem-pci-suite/configs/linux-portable-peer.toml",
+]
+
+[env]
+AXVISOR_TEST_BUSYBOX_INITRAMFS = "tmp/axbuild/axvisor/qemu-ivshmem-pci-suite/initramfs-aarch64.cpio.gz"
+# The standard Alpine image must contain the matching pciutils assets. The
+# UIO modules move into this image when the supply-chain change lands.
+AXVISOR_TEST_ROOTFS_IMAGE = "rootfs-aarch64-alpine.img"
+AXVISOR_TEST_IVSHMEM_SMOKE = "1"
+# The suite never falls back to polling when the MSI-X assets are absent.
+AXVISOR_TEST_IVSHMEM_UIO_MODULE_DIR = "tmp/axbuild/ivshmem-uio-modules"
+AXVISOR_TEST_IVSHMEM_ARCEOS_SMOKE = "apps/arceos/build-aarch64-ivshmem-pci.toml"

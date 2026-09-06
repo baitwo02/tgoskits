@@ -20,9 +20,9 @@ use crate::{axvisor::rootfs, context::ResolvedAxvisorRequest, rootfs::inject::re
 
 const OUTPUT_ENV: &str = "AXVISOR_TEST_BUSYBOX_INITRAMFS";
 const OVMF_OUTPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_OUTPUT";
-/// Names a non-default managed rootfs image for cases whose generated
-/// initramfs needs extra guest tools (for example pciutils for the ivshmem
-/// PCI enumeration case). Other cases keep the architecture default image.
+/// Names the managed rootfs image that supplies assets for a generated
+/// initramfs. Cases may select the architecture default explicitly when its
+/// packaged tools are part of the test contract.
 const ROOTFS_IMAGE_ENV: &str = "AXVISOR_TEST_ROOTFS_IMAGE";
 
 /// Resolves the managed rootfs image a build group selects through
@@ -282,6 +282,27 @@ load_ivshmem_uio_modules() {
   return 0
 }
 
+run_ivshmem_suite_linux() {
+  run_pci_enumeration_check IVSHMEM_SUITE_LINUX_ENUMERATION_PASSED
+  # The primary Linux peer first proves the userspace polling backend. Only
+  # after that process exits successfully do we bind UIO and run the MSI-X
+  # phase, so no polling self-event can leave a stale UIO notification.
+  if /bin/ivshmem-pci-suite --suite-role linux-polling; then
+    if load_ivshmem_uio_modules; then
+      /bin/ivshmem-pci-suite --suite-role linux-interrupt
+    else
+      echo "IVSHMEM_PCI_SUITE_FAILED peer=0 role=linux-interrupt phase=module-load step=load-uio detail=kernel-matched UIO modules are unavailable"
+    fi
+  fi
+}
+
+run_ivshmem_suite_portable_peer() {
+  # This Linux polling process occupies the portable peer slot until the
+  # planned Zephyr demo implements the same mailbox and state protocol.
+  run_pci_enumeration_check IVSHMEM_SUITE_PORTABLE_ENUMERATION_PASSED
+  /bin/ivshmem-pci-suite --suite-role portable-peer
+}
+
 cmdline=$(/bin/busybox cat /proc/cmdline)
 guest_arch=$(/bin/busybox uname -m)
 case "$cmdline" in
@@ -292,6 +313,12 @@ case "$cmdline" in
       aarch64) run_pci_enumeration_check AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED ;;
       *) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED ;;
     esac
+    exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-suite-linux*)
+    run_ivshmem_suite_linux
+    exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=ivshmem-suite-portable*)
+    run_ivshmem_suite_portable_peer
     exec /bin/busybox sh -i ;;
   *axvisor.pci_case=ivshmem-polling-peers*)
     # Dual-peer polling case: both guests run the same smoke with
@@ -575,8 +602,8 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             }
             None => rootfs::qemu_rootfs_path(request, workspace_root, None)?,
         };
-        let smoke_binary = match cargo.env.get(super::ivshmem_smoke::IVSHMEM_SMOKE_ENV) {
-            Some(_) => Some(super::ivshmem_smoke::build_smoke_binary(
+        let smoke_binaries = match cargo.env.get(super::ivshmem_smoke::IVSHMEM_SMOKE_ENV) {
+            Some(_) => Some(super::ivshmem_smoke::build_smoke_binaries(
                 workspace_root,
                 &request.arch,
             )?),
@@ -588,7 +615,7 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             .map(|directory| super::ivshmem_smoke::read_uio_modules(workspace_root, directory))
             .transpose()?;
         ensure!(
-            uio_modules.is_none() || smoke_binary.is_some(),
+            uio_modules.is_none() || smoke_binaries.is_some(),
             "{} requires {}",
             super::ivshmem_smoke::IVSHMEM_UIO_MODULE_DIR_ENV,
             super::ivshmem_smoke::IVSHMEM_SMOKE_ENV
@@ -597,7 +624,7 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             &rootfs_path,
             &output_path,
             &request.arch,
-            smoke_binary.as_deref(),
+            smoke_binaries.as_ref(),
             uio_modules.as_ref(),
         )?;
         println!(
@@ -637,7 +664,7 @@ fn prepare_busybox_initramfs(
     rootfs_path: &Path,
     output_path: &Path,
     arch: &str,
-    smoke_binary: Option<&[u8]>,
+    smoke_binaries: Option<&super::ivshmem_smoke::SmokeBinaries>,
     uio_modules: Option<&super::ivshmem_smoke::UioModules>,
 ) -> anyhow::Result<()> {
     let loader_path = musl_loader_path(arch)?;
@@ -653,7 +680,7 @@ fn prepare_busybox_initramfs(
         lspci: &lspci,
         libpci: &libpci,
         pci_ids: &pci_ids,
-        smoke_binary,
+        smoke_binaries,
         uio_modules,
     })?;
 
@@ -716,7 +743,7 @@ struct BusyboxInitramfsPayload<'a> {
     lspci: &'a [u8],
     libpci: &'a [u8],
     pci_ids: &'a [u8],
-    smoke_binary: Option<&'a [u8]>,
+    smoke_binaries: Option<&'a super::ivshmem_smoke::SmokeBinaries>,
     uio_modules: Option<&'a super::ivshmem_smoke::UioModules>,
 }
 
@@ -761,11 +788,18 @@ fn build_busybox_initramfs(payload: BusyboxInitramfsPayload<'_>) -> anyhow::Resu
         archive.append_regular(libpci_archive_path, payload.libpci)?;
         archive.append_symlink(archive_path(LIBPCI_SONAME_PATH)?, "libpci.so.3.14.0")?;
         archive.append_regular(pci_ids_archive_path, payload.pci_ids)?;
-        if let Some(smoke_binary) = payload.smoke_binary {
-            // The ivshmem cases run the adapter smoke program from the guest;
-            // it is added only when requested so unrelated groups keep a
-            // toolchain-free initramfs.
-            archive.append_regular(super::ivshmem_smoke::SMOKE_ARCHIVE_PATH, smoke_binary)?;
+        if let Some(smoke_binaries) = payload.smoke_binaries {
+            // The ivshmem cases run both the legacy smoke and consolidated
+            // suite while equivalence is established. Unrelated groups keep
+            // a toolchain-free initramfs.
+            archive.append_regular(
+                super::ivshmem_smoke::SMOKE_ARCHIVE_PATH,
+                &smoke_binaries.legacy,
+            )?;
+            archive.append_regular(
+                super::ivshmem_smoke::SUITE_ARCHIVE_PATH,
+                &smoke_binaries.suite,
+            )?;
         }
         if let Some(modules) = payload.uio_modules {
             archive.append_regular(super::ivshmem_smoke::UIO_CORE_ARCHIVE_PATH, &modules.core)?;
@@ -894,7 +928,7 @@ mod tests {
 
     /// Fixed payload fixture shared by the archive-content tests.
     fn test_payload<'a>(
-        smoke_binary: Option<&'a [u8]>,
+        smoke_binaries: Option<&'a super::super::ivshmem_smoke::SmokeBinaries>,
         uio_modules: Option<&'a super::super::ivshmem_smoke::UioModules>,
     ) -> BusyboxInitramfsPayload<'a> {
         BusyboxInitramfsPayload {
@@ -904,15 +938,18 @@ mod tests {
             lspci: b"lspci",
             libpci: b"libpci",
             pci_ids: b"pci-ids",
-            smoke_binary,
+            smoke_binaries,
             uio_modules,
         }
     }
 
     #[test]
-    fn generated_archive_carries_the_smoke_binary_when_requested() {
-        let compressed =
-            build_busybox_initramfs(test_payload(Some(b"smoke-binary-bytes"), None)).unwrap();
+    fn generated_archive_carries_both_ivshmem_binaries_when_requested() {
+        let binaries = super::super::ivshmem_smoke::SmokeBinaries {
+            legacy: b"legacy-smoke-bytes".to_vec(),
+            suite: b"suite-smoke-bytes".to_vec(),
+        };
+        let compressed = build_busybox_initramfs(test_payload(Some(&binaries), None)).unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
@@ -921,7 +958,11 @@ mod tests {
 
         assert_eq!(
             entries.get("bin/ivshmem-bar2-smoke").unwrap(),
-            b"smoke-binary-bytes"
+            b"legacy-smoke-bytes"
+        );
+        assert_eq!(
+            entries.get("bin/ivshmem-pci-suite").unwrap(),
+            b"suite-smoke-bytes"
         );
     }
 
@@ -931,8 +972,12 @@ mod tests {
             core: b"uio-core-module".to_vec(),
             ivshmem: b"ivshmem-pci-module".to_vec(),
         };
+        let binaries = super::super::ivshmem_smoke::SmokeBinaries {
+            legacy: b"legacy-smoke".to_vec(),
+            suite: b"suite-smoke".to_vec(),
+        };
         let compressed =
-            build_busybox_initramfs(test_payload(Some(b"smoke"), Some(&modules))).unwrap();
+            build_busybox_initramfs(test_payload(Some(&binaries), Some(&modules))).unwrap();
         let mut archive = Vec::new();
         GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut archive)
@@ -1028,6 +1073,14 @@ mod tests {
                 .any(|window| window == b"AXVISOR_AARCH64_VPCI_ENUMERATION_PASSED")
         );
         assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-suite-linux".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-suite-linux")
+        );
+        assert!(
+            init.windows(b"axvisor.pci_case=ivshmem-suite-portable".len())
+                .any(|window| window == b"axvisor.pci_case=ivshmem-suite-portable")
+        );
+        assert!(
             init.windows(b"axvisor.pci_case=ivshmem-polling".len())
                 .any(|window| window == b"axvisor.pci_case=ivshmem-polling")
         );
@@ -1058,6 +1111,18 @@ mod tests {
                 .any(|window| {
                     window == b"/bin/ivshmem-bar2-smoke --backend interrupt --cross-peer"
                 })
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-pci-suite --suite-role linux-polling".len())
+                .any(|window| { window == b"/bin/ivshmem-pci-suite --suite-role linux-polling" })
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-pci-suite --suite-role linux-interrupt".len())
+                .any(|window| { window == b"/bin/ivshmem-pci-suite --suite-role linux-interrupt" })
+        );
+        assert!(
+            init.windows(b"/bin/ivshmem-pci-suite --suite-role portable-peer".len())
+                .any(|window| { window == b"/bin/ivshmem-pci-suite --suite-role portable-peer" })
         );
         assert!(
             init.windows(b"/bin/ivshmem-bar2-smoke --backend polling".len())

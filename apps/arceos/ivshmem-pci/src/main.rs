@@ -1,13 +1,18 @@
 //! ArceOS guest smoke test for AxVisor's initial ivshmem PCI endpoint.
 //!
 //! With the bootargs marker `axvisor.pci_case=ivshmem-cross-peer` the smoke
-//! additionally runs the dual-peer handshake shared with the Linux smoke
+//! additionally runs the legacy dual-peer handshake shared with the Linux smoke
 //! (`apps/linux/ivshmem/bar2_smoke/main.c`): the initiator (peer 0)
 //! publishes a request mailbox in its own output section and rings the
 //! responder, the responder validates the request, publishes its reply and
 //! rings back. Both sides observe the remote peer's state through the BAR2
 //! state table. Event waiting polls the BAR0 Event Status register with
 //! write-1-to-clear, matching the Linux polling backend's semantics.
+//!
+//! `axvisor.pci_case=ivshmem-suite-arceos` selects the consolidated three-peer
+//! protocol. Peer 0 is the primary Linux guest, peer 1 is this ArceOS guest,
+//! and peer 2 is a portable role temporarily implemented by Linux until the
+//! planned Zephyr demo is available.
 
 #[cfg(feature = "arceos")]
 use core::ptr::NonNull;
@@ -37,6 +42,11 @@ const IVSHMEM_BAR_SIZE: usize = 0x1_0000;
 // inside this peer's own section.
 const SMOKE_OUTPUT_SECTION_BASE: usize = 0x1000;
 const SMOKE_OUTPUT_SECTION_STRIDE: usize = 0x7000;
+const SUITE_OUTPUT_SECTION_STRIDE: usize = 0x5000;
+const SUITE_MAX_PEERS: u32 = 3;
+const SUITE_LINUX_PEER: u32 = 0;
+const SUITE_ARCEOS_PEER: u32 = 1;
+const SUITE_PORTABLE_PEER: u32 = 2;
 const IVSHMEM_REG_ID: usize = 0x00;
 const IVSHMEM_REG_MAX_PEERS: usize = 0x04;
 const IVSHMEM_REG_DOORBELL: usize = 0x0c;
@@ -55,6 +65,22 @@ const HANDSHAKE_STATE_RESPONDER: u32 = 0x0001_0004;
 const HANDSHAKE_STATE_READY: u32 = 0x0001_0005;
 const MAILBOX_PAYLOAD_SIZE: usize = 0x100;
 
+const SUITE_MAILBOX_MAGIC: u32 = 0x4956_5355;
+const SUITE_PROTOCOL_VERSION: u32 = 1;
+const SUITE_PHASE_ARCEOS_TO_LINUX_IRQ: u32 = 2;
+const SUITE_SEQUENCE_ARCEOS_TO_LINUX_IRQ: u32 = 2;
+const SUITE_STATE_LINUX_IRQ_READY: u32 = 0x3100_0101;
+const SUITE_STATE_LINUX_IRQ_REPLIED: u32 = 0x3100_0103;
+const SUITE_STATE_ARCEOS_BOOTSTRAP: u32 = 0x3200_0000;
+const SUITE_STATE_ARCEOS_OBSERVER_ARMED: u32 = 0x3200_0001;
+const SUITE_STATE_ARCEOS_OBSERVER_CLEAN: u32 = 0x3200_0002;
+const SUITE_STATE_ARCEOS_REQUEST: u32 = 0x3200_0003;
+const SUITE_STATE_ARCEOS_DONE: u32 = 0x3200_0004;
+const SUITE_STATE_PORTABLE_RECEIVED: u32 = 0x3300_0002;
+const SUITE_STATE_PORTABLE_OBSERVER_ARMED: u32 = 0x3300_0004;
+const ARCEOS_TO_LINUX_REQUEST: &[u8] = b"Hello Linux primary, ArceOS requests an MSI-X round trip.";
+const LINUX_TO_ARCEOS_REPLY: &[u8] = b"Hello ArceOS, Linux primary received the MSI-X message.";
+
 // Guest scheduling is not part of the device contract: the handshake waits
 // long enough for the other guest to reach its smoke.
 const HANDSHAKE_TIMEOUT_NANOS: u64 = 30_000_000_000;
@@ -64,13 +90,22 @@ const SELF_DOORBELL_UNAVAILABLE_WAIT_NANOS: u64 = 200_000_000;
 // The bootargs marker that switches the smoke into the dual-peer handshake;
 // the guest FDT carries it from the VM config's [kernel] cmdline.
 const CROSS_PEER_BOOTARGS_MARKER: &str = "axvisor.pci_case=ivshmem-cross-peer";
+const SUITE_BOOTARGS_MARKER: &str = "axvisor.pci_case=ivshmem-suite-arceos";
 
 #[cfg(feature = "arceos")]
 fn main() {
     println!("ARCEOS_IVSHMEM_PCI_START");
     match run() {
         Ok(()) => println!("ARCEOS_IVSHMEM_PCI_PASS"),
-        Err(error) => println!("ARCEOS_IVSHMEM_PCI_FAIL {error}"),
+        Err(error) => {
+            println!("ARCEOS_IVSHMEM_PCI_FAIL {error}");
+            if ax_hal_bootargs_contains(SUITE_BOOTARGS_MARKER) {
+                println!(
+                    "IVSHMEM_PCI_SUITE_FAILED peer=1 role=arceos phase=run step=guest \
+                     detail={error}"
+                );
+            }
+        }
     }
 }
 
@@ -110,14 +145,23 @@ fn run() -> Result<(), String> {
     let registers = map_device_range(bar0, IVSHMEM_BAR0_SIZE, "ivshmem BAR0")?;
     let peer_id = read_u32(registers, IVSHMEM_REG_ID);
     let max_peers = read_u32(registers, IVSHMEM_REG_MAX_PEERS);
-    if max_peers != 2 {
+    let suite = ax_hal_bootargs_contains(SUITE_BOOTARGS_MARKER);
+    let expected_max_peers = if suite { SUITE_MAX_PEERS } else { 2 };
+    if max_peers != expected_max_peers || (suite && peer_id != SUITE_ARCEOS_PEER) {
         return Err(format!(
-            "max_peers reads {max_peers} (peer_id reads {peer_id}), expected 2"
+            "profile peer_id={peer_id} max_peers={max_peers}, expected peer_id={} \
+             max_peers={expected_max_peers}",
+            if suite { SUITE_ARCEOS_PEER } else { peer_id }
         ));
     }
 
     let cross_peer = ax_hal_bootargs_contains(CROSS_PEER_BOOTARGS_MARKER);
-    let own_section = SMOKE_OUTPUT_SECTION_BASE + peer_id as usize * SMOKE_OUTPUT_SECTION_STRIDE;
+    let output_stride = if suite {
+        SUITE_OUTPUT_SECTION_STRIDE
+    } else {
+        SMOKE_OUTPUT_SECTION_STRIDE
+    };
+    let own_section = SMOKE_OUTPUT_SECTION_BASE + peer_id as usize * output_stride;
     let test_offset = own_section + TEST_OFFSET_IN_SECTION;
 
     let shared_memory = map_device_range(bar2, IVSHMEM_BAR_SIZE, "ivshmem BAR2")?;
@@ -132,21 +176,29 @@ fn run() -> Result<(), String> {
     // The BAR0 State write must surface in the shared state table (F4);
     // this peer's entry sits at BAR2 offset `peer_id * 4` in the first page.
     let state_table = shared_memory.as_ptr() as *const u32;
-    write_u32(registers, IVSHMEM_REG_STATE, HANDSHAKE_STATE_SELF);
+    let bootstrap_state = if suite {
+        SUITE_STATE_ARCEOS_BOOTSTRAP
+    } else {
+        HANDSHAKE_STATE_SELF
+    };
+    write_u32(registers, IVSHMEM_REG_STATE, bootstrap_state);
     // SAFETY: the BAR2 mapping covers the whole state table page and the
     // peer entry offset is inside it.
     let own_state = unsafe { core::ptr::read_volatile(state_table.add(peer_id as usize)) };
-    if own_state != HANDSHAKE_STATE_SELF {
+    if own_state != bootstrap_state {
         return Err(format!(
             "BAR0 state write did not surface in the state table: {own_state:#010x}"
         ));
     }
     println!(
         "ivshmem-pci identity={identity:#010x} bar2={bar2:#x} peer_id={peer_id} \
-         test_offset={test_offset:#x} cross_peer={cross_peer}"
+         test_offset={test_offset:#x} cross_peer={cross_peer} suite={suite}"
     );
 
-    if cross_peer {
+    if suite {
+        self_doorbell_tests(registers, peer_id)?;
+        run_suite_arceos_peer(registers, shared_memory)?;
+    } else if cross_peer {
         if peer_id == 0 {
             // Initiator: self-doorbell coverage first, then the exchange.
             self_doorbell_tests(registers, peer_id)?;
@@ -293,7 +345,7 @@ fn wait_remote_state(
 }
 
 #[cfg(feature = "arceos")]
-fn payload_checksum(payload: &[u8; MAILBOX_PAYLOAD_SIZE]) -> u32 {
+fn payload_checksum(payload: &[u8]) -> u32 {
     let mut checksum: u32 = 0x4956_5348;
     for &byte in payload {
         checksum = checksum.wrapping_mul(31).wrapping_add(u32::from(byte));
@@ -347,6 +399,238 @@ fn validate_mailbox(mailbox: usize) -> Result<(), String> {
     }
     if checksum != payload_checksum(&payload) {
         return Err("cross-peer payload checksum mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn run_suite_arceos_peer(registers: NonNull<u8>, shared_memory: NonNull<u8>) -> Result<(), String> {
+    println!("IVSHMEM_PCI_SUITE_CHECKPOINT peer=1 role=arceos phase=observer step=ready");
+    write_u32(
+        registers,
+        IVSHMEM_REG_STATE,
+        SUITE_STATE_ARCEOS_OBSERVER_ARMED,
+    );
+    ensure_no_event_until_state(
+        registers,
+        shared_memory,
+        SUITE_PORTABLE_PEER,
+        SUITE_STATE_PORTABLE_RECEIVED,
+    )?;
+    write_u32(
+        registers,
+        IVSHMEM_REG_STATE,
+        SUITE_STATE_ARCEOS_OBSERVER_CLEAN,
+    );
+    println!("IVSHMEM_PCI_SUITE_CHECKPOINT peer=1 role=arceos phase=observer step=clean");
+
+    wait_suite_state(
+        shared_memory,
+        SUITE_PORTABLE_PEER,
+        SUITE_STATE_PORTABLE_OBSERVER_ARMED,
+    )?;
+    wait_suite_state(shared_memory, SUITE_LINUX_PEER, SUITE_STATE_LINUX_IRQ_READY)?;
+
+    let own_mailbox = suite_mailbox(shared_memory, SUITE_ARCEOS_PEER)?;
+    fill_suite_mailbox(
+        own_mailbox,
+        SUITE_PHASE_ARCEOS_TO_LINUX_IRQ,
+        SUITE_SEQUENCE_ARCEOS_TO_LINUX_IRQ,
+        SUITE_ARCEOS_PEER,
+        SUITE_LINUX_PEER,
+        ARCEOS_TO_LINUX_REQUEST,
+    )?;
+    log_suite_mailbox("tx", own_mailbox, "doorbell")?;
+    write_u32(registers, IVSHMEM_REG_STATE, SUITE_STATE_ARCEOS_REQUEST);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    write_u32(registers, IVSHMEM_REG_DOORBELL, SUITE_LINUX_PEER << 16);
+    println!("IVSHMEM_PCI_SUITE_CHECKPOINT peer=1 role=arceos phase=interrupt-request step=sent");
+
+    if !wait_event(registers, HANDSHAKE_TIMEOUT_NANOS) {
+        return Err("suite interrupt reply timed out".into());
+    }
+    wait_suite_state(
+        shared_memory,
+        SUITE_LINUX_PEER,
+        SUITE_STATE_LINUX_IRQ_REPLIED,
+    )?;
+    let linux_mailbox = suite_mailbox(shared_memory, SUITE_LINUX_PEER)?;
+    validate_suite_mailbox(
+        linux_mailbox,
+        SUITE_PHASE_ARCEOS_TO_LINUX_IRQ,
+        SUITE_SEQUENCE_ARCEOS_TO_LINUX_IRQ,
+        SUITE_LINUX_PEER,
+        SUITE_ARCEOS_PEER,
+        LINUX_TO_ARCEOS_REPLY,
+    )?;
+    log_suite_mailbox("rx", linux_mailbox, "polling")?;
+    write_u32(registers, IVSHMEM_REG_STATE, SUITE_STATE_ARCEOS_DONE);
+    println!("IVSHMEM_PCI_SUITE_ROLE_PASSED peer=1 role=arceos");
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn suite_mailbox(shared_memory: NonNull<u8>, peer_id: u32) -> Result<NonNull<u8>, String> {
+    let address = shared_memory.as_ptr() as usize
+        + SMOKE_OUTPUT_SECTION_BASE
+        + peer_id as usize * SUITE_OUTPUT_SECTION_STRIDE;
+    NonNull::new(address as *mut u8).ok_or_else(|| "suite mailbox pointer is null".into())
+}
+
+#[cfg(feature = "arceos")]
+fn fill_suite_mailbox(
+    mailbox: NonNull<u8>,
+    phase: u32,
+    sequence: u32,
+    source_peer: u32,
+    target_peer: u32,
+    message: &[u8],
+) -> Result<(), String> {
+    if message.is_empty() || message.len() > MAILBOX_PAYLOAD_SIZE {
+        return Err("outgoing suite message length is invalid".into());
+    }
+
+    write_u32(mailbox, 0x00, 0);
+    for index in 0..MAILBOX_PAYLOAD_SIZE {
+        // SAFETY: the payload starts at offset 0x20 and the complete suite
+        // mailbox fits in the peer-owned 20 KiB output section.
+        unsafe {
+            core::ptr::write_volatile(mailbox.as_ptr().add(0x20 + index), 0);
+        }
+    }
+    for (index, byte) in message.iter().copied().enumerate() {
+        // SAFETY: the message length was checked against the payload capacity.
+        unsafe {
+            core::ptr::write_volatile(mailbox.as_ptr().add(0x20 + index), byte);
+        }
+    }
+    write_u32(mailbox, 0x04, SUITE_PROTOCOL_VERSION);
+    write_u32(mailbox, 0x08, phase);
+    write_u32(mailbox, 0x0c, sequence);
+    write_u32(mailbox, 0x10, source_peer);
+    write_u32(mailbox, 0x14, target_peer);
+    write_u32(mailbox, 0x18, payload_checksum(message));
+    write_u32(mailbox, 0x1c, message.len() as u32);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    write_u32(mailbox, 0x00, SUITE_MAILBOX_MAGIC);
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn validate_suite_mailbox(
+    mailbox: NonNull<u8>,
+    phase: u32,
+    sequence: u32,
+    source_peer: u32,
+    target_peer: u32,
+    expected_message: &[u8],
+) -> Result<(), String> {
+    if read_u32(mailbox, 0x00) != SUITE_MAILBOX_MAGIC {
+        return Err("suite mailbox magic mismatch".into());
+    }
+    if read_u32(mailbox, 0x04) != SUITE_PROTOCOL_VERSION {
+        return Err("suite mailbox protocol version mismatch".into());
+    }
+    if read_u32(mailbox, 0x08) != phase || read_u32(mailbox, 0x0c) != sequence {
+        return Err("suite mailbox phase or sequence mismatch".into());
+    }
+    if read_u32(mailbox, 0x10) != source_peer || read_u32(mailbox, 0x14) != target_peer {
+        return Err("suite mailbox route mismatch".into());
+    }
+    let payload_size = usize::try_from(read_u32(mailbox, 0x1c))
+        .map_err(|_| "suite mailbox payload size does not fit usize")?;
+    if payload_size != expected_message.len() || payload_size > MAILBOX_PAYLOAD_SIZE {
+        return Err("suite mailbox payload size mismatch".into());
+    }
+
+    let mut payload = [0u8; MAILBOX_PAYLOAD_SIZE];
+    for (index, byte) in payload.iter_mut().take(payload_size).enumerate() {
+        // SAFETY: the validated payload size fits in the remote suite mailbox.
+        unsafe {
+            *byte = core::ptr::read_volatile(mailbox.as_ptr().add(0x20 + index));
+        }
+    }
+    let message = &payload[..payload_size];
+    if read_u32(mailbox, 0x18) != payload_checksum(message) {
+        return Err("suite mailbox payload checksum mismatch".into());
+    }
+    if message != expected_message {
+        return Err("suite mailbox message content mismatch".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn log_suite_mailbox(action: &str, mailbox: NonNull<u8>, path: &str) -> Result<(), String> {
+    let payload_size = usize::try_from(read_u32(mailbox, 0x1c))
+        .map_err(|_| "suite mailbox payload size does not fit usize")?;
+    if payload_size > MAILBOX_PAYLOAD_SIZE {
+        return Err("suite mailbox payload is too large to log".into());
+    }
+
+    let mut payload = [0u8; MAILBOX_PAYLOAD_SIZE];
+    for (index, byte) in payload.iter_mut().take(payload_size).enumerate() {
+        // SAFETY: the checked payload size fits in the mapped suite mailbox.
+        unsafe {
+            *byte = core::ptr::read_volatile(mailbox.as_ptr().add(0x20 + index));
+        }
+    }
+    let content = core::str::from_utf8(&payload[..payload_size])
+        .map_err(|_| "suite mailbox message is not UTF-8")?;
+    println!(
+        "IVSHMEM_PCI_SUITE_MESSAGE action={action} phase={} sequence={} source={} target={} \
+         path={path} content=\"{content}\"",
+        read_u32(mailbox, 0x08),
+        read_u32(mailbox, 0x0c),
+        read_u32(mailbox, 0x10),
+        read_u32(mailbox, 0x14),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn wait_suite_state(shared_memory: NonNull<u8>, peer_id: u32, expected: u32) -> Result<(), String> {
+    let deadline = ax_hal_monotonic_time_nanos().saturating_add(HANDSHAKE_TIMEOUT_NANOS);
+    let entry = (shared_memory.as_ptr() as usize + peer_id as usize * 4) as *const u32;
+
+    // SAFETY: the BAR2 mapping covers all three state-table entries.
+    while unsafe { core::ptr::read_volatile(entry) } != expected {
+        if ax_hal_monotonic_time_nanos() >= deadline {
+            // SAFETY: the same state-table entry remains mapped for the test.
+            let actual = unsafe { core::ptr::read_volatile(entry) };
+            return Err(format!(
+                "suite peer {peer_id} state is {actual:#010x}, expected {expected:#010x}"
+            ));
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arceos")]
+fn ensure_no_event_until_state(
+    registers: NonNull<u8>,
+    shared_memory: NonNull<u8>,
+    peer_id: u32,
+    expected: u32,
+) -> Result<(), String> {
+    let deadline = ax_hal_monotonic_time_nanos().saturating_add(HANDSHAKE_TIMEOUT_NANOS);
+    let entry = (shared_memory.as_ptr() as usize + peer_id as usize * 4) as *const u32;
+
+    // The portable peer may advance from RECEIVED to REPLIED before this
+    // observer samples it, so this phase deliberately accepts later states.
+    // SAFETY: the BAR2 mapping covers all three state-table entries.
+    while unsafe { core::ptr::read_volatile(entry) } < expected {
+        if read_u32(registers, IVSHMEM_REG_EVENT_STATUS) & 1 != 0 {
+            return Err("portable-directed doorbell reached ArceOS".into());
+        }
+        if ax_hal_monotonic_time_nanos() >= deadline {
+            return Err("portable peer did not receive the directed doorbell".into());
+        }
+        core::hint::spin_loop();
+    }
+    if read_u32(registers, IVSHMEM_REG_EVENT_STATUS) & 1 != 0 {
+        return Err("ArceOS observer has a pending event".into());
     }
     Ok(())
 }

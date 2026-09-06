@@ -31,12 +31,20 @@ pub(super) const IVSHMEM_ARCEOS_SMOKE_ENV: &str = "AXVISOR_TEST_IVSHMEM_ARCEOS_S
 pub(super) const UIO_CORE_ARCHIVE_PATH: &str = "lib/modules/uio.ko";
 pub(super) const UIO_IVSHMEM_ARCHIVE_PATH: &str = "lib/modules/uio_ivshmem.ko";
 
-/// Guest path of the smoke binary inside the generated initramfs.
+/// Guest paths of the legacy smoke and consolidated suite binaries.
 pub(super) const SMOKE_ARCHIVE_PATH: &str = "bin/ivshmem-bar2-smoke";
+pub(super) const SUITE_ARCHIVE_PATH: &str = "bin/ivshmem-pci-suite";
 
 const ADAPTER_SOURCES: &[&str] = &["discovery.c", "backend_polling.c", "errors.c"];
 const SMOKE_SOURCE: &str = "bar2_smoke/main.c";
 const SMOKE_BINARY_NAME: &str = "ivshmem-bar2-smoke";
+const SUITE_SOURCE: &str = "suite/main.c";
+const SUITE_BINARY_NAME: &str = "ivshmem-pci-suite";
+
+pub(super) struct SmokeBinaries {
+    pub(super) legacy: Vec<u8>,
+    pub(super) suite: Vec<u8>,
+}
 
 pub(super) struct UioModules {
     pub(super) core: Vec<u8>,
@@ -141,10 +149,16 @@ pub(super) fn read_uio_modules(
     })
 }
 
-/// Builds the statically linked smoke binary for `arch` and returns its
-/// bytes, recompiling from the current sources on every call.
-pub(super) fn build_smoke_binary(workspace_root: &Path, arch: &str) -> anyhow::Result<Vec<u8>> {
-    build_smoke_binary_with(
+/// Builds both statically linked ivshmem guest programs for `arch`.
+///
+/// The legacy binary remains available while the consolidated case is
+/// validated against the previous cases. Both programs link the same adapter
+/// archive so device discovery and backend semantics cannot drift.
+pub(super) fn build_smoke_binaries(
+    workspace_root: &Path,
+    arch: &str,
+) -> anyhow::Result<SmokeBinaries> {
+    build_smoke_binaries_with(
         workspace_root,
         arch,
         &cc_for_arch(arch),
@@ -152,12 +166,12 @@ pub(super) fn build_smoke_binary(workspace_root: &Path, arch: &str) -> anyhow::R
     )
 }
 
-fn build_smoke_binary_with(
+fn build_smoke_binaries_with(
     workspace_root: &Path,
     arch: &str,
     compiler: &str,
     link_flags: &[&str],
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<SmokeBinaries> {
     if arch != "aarch64" {
         bail!("the ivshmem smoke binary is currently built for aarch64 only");
     }
@@ -189,19 +203,50 @@ fn build_smoke_binary_with(
     }
     let smoke_object =
         compile_c_source(compiler, &cflags, &adapter_dir.join(SMOKE_SOURCE), &out_dir)?;
+    let suite_out_dir = out_dir.join("suite");
+    fs::create_dir_all(&suite_out_dir)
+        .with_context(|| format!("failed to create {}", suite_out_dir.display()))?;
+    let suite_object = compile_c_source(
+        compiler,
+        &cflags,
+        &adapter_dir.join(SUITE_SOURCE),
+        &suite_out_dir,
+    )?;
 
     let archive = out_dir.join("libivshmem.a");
     archive_objects(arch, compiler, &archive, &objects)
         .context("failed to archive the ivshmem adapter library")?;
 
-    let binary = out_dir.join(SMOKE_BINARY_NAME);
+    let legacy = link_smoke_binary(
+        compiler,
+        &out_dir.join(SMOKE_BINARY_NAME),
+        &smoke_object,
+        &archive,
+        link_flags,
+    )?;
+    let suite = link_smoke_binary(
+        compiler,
+        &out_dir.join(SUITE_BINARY_NAME),
+        &suite_object,
+        &archive,
+        link_flags,
+    )?;
+    Ok(SmokeBinaries { legacy, suite })
+}
+
+fn link_smoke_binary(
+    compiler: &str,
+    binary: &Path,
+    object: &Path,
+    archive: &Path,
+    link_flags: &[&str],
+) -> anyhow::Result<Vec<u8>> {
     let mut link = Command::new(compiler);
-    link.arg("-o").arg(&binary).arg(&smoke_object).arg(&archive);
+    link.arg("-o").arg(binary).arg(object).arg(archive);
     link.args(link_flags);
     link.exec()
         .with_context(|| format!("failed to link {}", binary.display()))?;
-
-    fs::read(&binary).with_context(|| format!("failed to read {}", binary.display()))
+    fs::read(binary).with_context(|| format!("failed to read {}", binary.display()))
 }
 
 fn compile_c_source(
@@ -266,9 +311,10 @@ mod tests {
         // layout; it links dynamically because host environments do not all
         // ship a static libc. The static cross build runs in the QEMU case
         // itself.
-        let binary =
-            build_smoke_binary_with(&workspace_root, "aarch64", "cc", &[]).expect("smoke binary");
-        assert!(binary.len() > 1024);
+        let binaries = build_smoke_binaries_with(&workspace_root, "aarch64", "cc", &[])
+            .expect("smoke binaries");
+        assert!(binaries.legacy.len() > 1024);
+        assert!(binaries.suite.len() > 1024);
     }
 
     #[test]
@@ -336,7 +382,7 @@ mod tests {
     #[test]
     fn unsupported_architectures_are_rejected() {
         let workspace_root = crate::context::workspace_root_path().unwrap();
-        assert!(build_smoke_binary(&workspace_root, "riscv64").is_err());
+        assert!(build_smoke_binaries(&workspace_root, "riscv64").is_err());
         assert!(build_arceos_smoke(&workspace_root, "riscv64", "unused.toml").is_err());
     }
 }
