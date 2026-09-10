@@ -142,10 +142,10 @@ impl Axvisor {
         // the executable belonging to an earlier group.
         for (index, build_group) in build_groups.iter_mut().enumerate() {
             build_group.cargo = build::load_cargo_config(&build_group.request)?;
-            // A case may name a non-default managed rootfs (for example the
-            // pciutils image used by the ivshmem-pci case). Prefer it over both
-            // drive-referenced images and the architecture default so the run
-            // does not touch the default registry for an image it never boots.
+            // A case may explicitly name the managed rootfs that supplies its
+            // guest assets. Prefer it over both drive-referenced images and the
+            // architecture default so the run does not prepare an image it
+            // never boots.
             let group_rootfs = match configured_rootfs_image_path(
                 &build_group.cargo,
                 self.app.workspace_root(),

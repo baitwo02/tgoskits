@@ -28,23 +28,23 @@ kind = "axvisor-qemu"
 arch = "aarch64"
 cases = ["smoke", "gicv2-timer-stress", "gicv3-timer-stress"]
 
-# The ivshmem-pci case proves Linux guest enumeration with the standard
-# pciutils tool, so it uses the pciutils-enabled Alpine rootfs instead of the
-# default image. The image is pulled from the fork registry (fast iteration
-# before upstreaming); the case build config selects it through
-# AXVISOR_TEST_ROOTFS_IMAGE.
+# Keep the standard kernel bundle and Alpine rootfs on the same immutable
+# v0.0.13 registry while the image changes are being upstreamed.
 [[check]]
 id = "test-axvisor-aarch64-qemu-ivshmem-pci"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · ivshmem-pci Linux guest (pciutils image)"
+name = "QEMU aarch64 · ivshmem-pci Linux guest (standard v0.0.13 images)"
 timeout_minutes = 30
 command = '''
-echo "==> pull pciutils-enabled aarch64 rootfs for ivshmem-pci"
-export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivshmem-pci-images"
-export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild/rootfs"
-cargo xtask image pull \
-  --registry "https://raw.githubusercontent.com/baitwo02/tgosimages/b78c7f255c3fae3737e6c4909d4749358635b438/registry/ivc-message-v1-3ce6ae8a-lspci.toml" \
-  "rootfs-aarch64-alpine-ivc-message-v1.img:0.0.12-ivc-message-v1-3ce6ae8a-lspci"
+echo "==> configure temporary standard AArch64 v0.0.13 registry"
+mkdir -p tmp/axbuild
+cat > tmp/axbuild/.image.toml <<EOF
+registry = "https://raw.githubusercontent.com/baitwo02/tgosimages/a88032b16400240a44033348086078b05e1c92e0/registry/v0.0.13.toml"
+download_dir = "$PWD/tmp/standard-aarch64-v0.0.13-images"
+extract_dir = "$PWD/tmp/axbuild/rootfs"
+EOF
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
+cargo xtask image pull rootfs-aarch64-alpine.img
 echo "==> axvisor aarch64 ivshmem-pci Linux guest"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-pci
 '''
@@ -57,15 +57,18 @@ cases = ["ivshmem-pci"]
 [[check]]
 id = "test-axvisor-aarch64-qemu-ivshmem-pci-peers"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · ivshmem-pci Linux and ArceOS peer handshakes (pciutils image)"
+name = "QEMU aarch64 · ivshmem-pci peer handshakes (standard v0.0.13 images)"
 timeout_minutes = 30
 command = '''
-echo "==> pull pciutils-enabled aarch64 rootfs for ivshmem-pci-peers"
-export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivshmem-pci-images"
-export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild/rootfs"
-cargo xtask image pull \
-  --registry "https://raw.githubusercontent.com/baitwo02/tgosimages/b78c7f255c3fae3737e6c4909d4749358635b438/registry/ivc-message-v1-3ce6ae8a-lspci.toml" \
-  "rootfs-aarch64-alpine-ivc-message-v1.img:0.0.12-ivc-message-v1-3ce6ae8a-lspci"
+echo "==> configure temporary standard AArch64 v0.0.13 registry"
+mkdir -p tmp/axbuild
+cat > tmp/axbuild/.image.toml <<EOF
+registry = "https://raw.githubusercontent.com/baitwo02/tgosimages/a88032b16400240a44033348086078b05e1c92e0/registry/v0.0.13.toml"
+download_dir = "$PWD/tmp/standard-aarch64-v0.0.13-images"
+extract_dir = "$PWD/tmp/axbuild/rootfs"
+EOF
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
+cargo xtask image pull rootfs-aarch64-alpine.img
 echo "==> axvisor aarch64 ivshmem-pci dual-peer Linux guests"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case ivshmem-pci-peers
 echo "==> axvisor aarch64 ivshmem-pci Linux and ArceOS peers"
@@ -160,15 +163,18 @@ cases = ["smoke"]
 [[check]]
 id = "test-axvisor-qemu-ivc"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · IVC"
+name = "QEMU aarch64 · IVC (standard v0.0.13 images)"
 timeout_minutes = 30
 command = '''
-echo "==> pull IVC Message V1 image"
-export TGOS_IMAGE_DOWNLOAD_DIR="$PWD/tmp/ivc-images"
-export TGOS_IMAGE_EXTRACT_DIR="$PWD/tmp/axbuild/rootfs"
-cargo xtask image pull \
-  --registry "https://raw.githubusercontent.com/baitwo02/tgosimages/4ae69e079f0d2a39b2f5d1b210cc093ffc5bad07/registry/ivc-message-v1-3ce6ae8a.toml" \
-  "rootfs-aarch64-alpine-ivc-message-v1.img:0.0.12-ivc-message-v1-3ce6ae8a"
+echo "==> configure temporary standard AArch64 v0.0.13 registry"
+mkdir -p tmp/axbuild
+cat > tmp/axbuild/.image.toml <<EOF
+registry = "https://raw.githubusercontent.com/baitwo02/tgosimages/a88032b16400240a44033348086078b05e1c92e0/registry/v0.0.13.toml"
+download_dir = "$PWD/tmp/standard-aarch64-v0.0.13-images"
+extract_dir = "$PWD/tmp/axbuild/rootfs"
+EOF
+cargo xtask image pull qemu-aarch64 --extract-dir tmp/axbuild/images
+cargo xtask image pull rootfs-aarch64-alpine.img
 echo "==> axvisor aarch64 IVC"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
 '''

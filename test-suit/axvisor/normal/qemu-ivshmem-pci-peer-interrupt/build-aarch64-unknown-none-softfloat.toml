@@ -10,7 +10,7 @@ vm_configs = [
 AXVISOR_TEST_BUSYBOX_INITRAMFS = "tmp/axbuild/axvisor/qemu-ivshmem-pci-peer-interrupt/initramfs-aarch64.cpio.gz"
 # The generated initramfs extracts pciutils from this image so each guest
 # proves standard PCI enumeration before either backend opens the device.
-AXVISOR_TEST_ROOTFS_IMAGE = "rootfs-aarch64-alpine-ivc-message-v1.img"
+AXVISOR_TEST_ROOTFS_IMAGE = "rootfs-aarch64-alpine.img"
 AXVISOR_TEST_IVSHMEM_SMOKE = "1"
 # These modules must come from the exact guest-kernel build; the initramfs
 # builder rejects missing files and never falls back to polling.
