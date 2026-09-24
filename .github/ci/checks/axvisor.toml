@@ -347,24 +347,25 @@ kind = "axvisor-board"
 board = "orangepi-5-plus-linux"
 cases = ["ping"]
 
-[[check]]
-id = "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark"
-impact_targets = ["axvisor:aarch64", "starry:aarch64"]
-name = "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark"
-nightly_only = true
-performance_report = true
-runner = "board"
-timeout_minutes = 90
-command = '''
-echo "==> build the StarryOS guest from this checkout"
-cargo xtask starry build --config test-suit/starryos/board-orangepi-5-plus/build-aarch64-unknown-none-softfloat.toml --smp 1
-echo "==> axvisor OrangePi 5 Plus AXIVC Zephyr-Starry benchmark"
-cargo xtask axvisor test board --board orangepi-5-plus-ivc-benchmark
-'''
-
-[[check.suite]]
-kind = "axvisor-board"
-board = "orangepi-5-plus-ivc-benchmark"
+# Suspended pending the ivshmem replacement; keep the manual suite available.
+# [[check]]
+# id = "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark"
+# impact_targets = ["axvisor:aarch64", "starry:aarch64"]
+# name = "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark"
+# nightly_only = true
+# performance_report = true
+# runner = "board"
+# timeout_minutes = 90
+# command = '''
+# echo "==> build the StarryOS guest from this checkout"
+# cargo xtask starry build --config test-suit/starryos/board-orangepi-5-plus/build-aarch64-unknown-none-softfloat.toml --smp 1
+# echo "==> axvisor OrangePi 5 Plus AXIVC Zephyr-Starry benchmark"
+# cargo xtask axvisor test board --board orangepi-5-plus-ivc-benchmark
+# '''
+#
+# [[check.suite]]
+# kind = "axvisor-board"
+# board = "orangepi-5-plus-ivc-benchmark"
 
 [[check]]
 id = "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf"
