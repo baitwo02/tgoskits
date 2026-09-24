@@ -25,7 +25,7 @@ cases = ["smoke"]
 [[check]]
 id = "test-axvisor-aarch64-qemu-http-control-plane-browser-console-ivc"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · HTTP control-plane + browser console"
+name = "QEMU aarch64 · HTTP control-plane + browser console + IVC"
 timeout_minutes = 30
 command = '''
 echo "==> axvisor aarch64 HTTP control-plane (incl. pause/resume)"
