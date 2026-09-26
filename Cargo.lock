@@ -8072,7 +8072,6 @@ dependencies = [
  "axbacktrace",
  "axfs-ng-vfs",
  "axhvc",
- "axivc",
  "axklib",
  "axplat-dyn",
  "axpoll",
