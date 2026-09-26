@@ -6,13 +6,15 @@ default_runner = "qcs"
 [[check]]
 id = "test-axvisor-aarch64-qemu-smoke-axtest"
 impact_targets = ["axvisor:aarch64"]
-name = "QEMU aarch64 · Smoke + virtio-blk guest + axtest"
+name = "QEMU aarch64 · Smoke + virtio-blk/ivshmem guests + axtest"
 timeout_minutes = 30
 command = '''
 echo "==> axvisor aarch64 smoke"
 cargo xtask axvisor test qemu --arch aarch64 --test-case smoke
 echo "==> axvisor aarch64 virtio-blk ArceOS guest"
 timeout 240s apps/arceos/virtio-blk-test/run.sh
+echo "==> axvisor aarch64 ivshmem-pci ArceOS guest"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivshmem-pci
 echo "==> axvisor aarch64 axtest"
 cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64
 '''
@@ -20,7 +22,7 @@ cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64
 [[check.suite]]
 kind = "axvisor-qemu"
 arch = "aarch64"
-cases = ["smoke"]
+cases = ["smoke", "qemu-ivshmem-pci"]
 
 [[check]]
 id = "test-axvisor-aarch64-qemu-http-control-plane-browser-console-ivc"
