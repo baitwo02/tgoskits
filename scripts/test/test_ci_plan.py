@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,17 @@ def main_test_rows(plan: dict) -> list[dict]:
         for prefix in MAIN_TEST_PREFIXES
         for row in plan[f"{prefix}_matrix"]["include"]
     ]
+
+
+def selected_test_cases(command: str) -> set[str]:
+    tokens = shlex.split(command, comments=True)
+    cases = set()
+    for index, token in enumerate(tokens):
+        if token == "--test-case" and index + 1 < len(tokens):
+            cases.update(tokens[index + 1].split(","))
+        elif token.startswith("--test-case="):
+            cases.update(token.partition("=")[2].split(","))
+    return cases
 
 
 class CiPlanTests(unittest.TestCase):
@@ -209,7 +221,7 @@ class CiPlanTests(unittest.TestCase):
                     "--board orangepi-5-plus-linux,orangepi-5-plus-starry",
                     commands,
                 )
-                self.assertIn("--test-case qemu-ivc", commands)
+                self.assertIn("qemu-ivc-local", selected_test_cases(commands))
                 # The ordinary CI check keeps the native StarryOS board suite but no
                 # longer registers the single-guest AxVisor smokes.
                 self.assertIn(
