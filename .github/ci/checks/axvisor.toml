@@ -32,8 +32,9 @@ echo "==> axvisor aarch64 HTTP control-plane (incl. pause/resume)"
 cargo xtask axvisor test qemu --arch aarch64 --test-case http-control-plane
 echo "==> axvisor aarch64 browser console"
 cargo xtask axvisor test qemu --arch aarch64 --test-case browser-console
-echo "==> axvisor aarch64 IVC"
-cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
+# Temporarily build the publisher from source until the rootfs image is updated.
+echo "==> axvisor aarch64 IVC (source-built publisher)"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc-local
 '''
 
 [[check.suite]]
@@ -43,6 +44,7 @@ cases = [
   "http-control-plane",
   "browser-console",
   "qemu-ivc",
+  "qemu-ivc-local",
 ]
 
 [[check]]
