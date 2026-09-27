@@ -95,6 +95,7 @@ impl AxVMResources {
                 mapping.flags
             );
             self.address_space
+                .lock()
                 .map_linear(mapping.gpa, mapping.hpa, mapping.size, mapping.flags)
                 .map_err(|error| AxVmError::from_addrspace("map guest address space", error))?;
         }

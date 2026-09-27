@@ -228,6 +228,7 @@ impl AxVMResources {
         if x86_requires_apic_access_page()? {
             let gpa = x86_apic_access_page_gpa()?;
             self.address_space
+                .lock()
                 .map_linear(
                     gpa,
                     x86_apic_access_page_addr()?,
