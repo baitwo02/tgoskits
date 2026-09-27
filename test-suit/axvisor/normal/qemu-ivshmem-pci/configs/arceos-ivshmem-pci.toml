@@ -43,7 +43,12 @@ disabled = [
   { path = "/pcie@10000000" },
 ]
 
-# Private ivshmem test endpoint with one zero-initialized BAR2.
+# One-peer link: the state table is read-only, the output section belongs to peer 0.
 [[devices.virtual]]
 id = "ivshmem0"
 model = "ivshmem-pci"
+link_id = 1
+peer_id = 0
+max_peers = 1
+common_size = 0
+output_size = 0x7000
