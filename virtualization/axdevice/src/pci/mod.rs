@@ -14,6 +14,7 @@ mod error;
 mod frontend;
 mod function;
 mod graph;
+mod msix;
 mod placement;
 mod root;
 mod runtime;
@@ -37,6 +38,11 @@ pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
 pub use graph::{
     PciFunctionRequirement, PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement,
     PciIntxRouter, ResolvedPciIntx,
+};
+pub use msix::{
+    MSIX_BAR_INDEX, MSIX_BAR_SIZE, MSIX_CAPABILITY_ID, MSIX_MESSAGE_CONTROL_ENABLE,
+    MSIX_MESSAGE_CONTROL_FUNCTION_MASK, MSIX_PBA_OFFSET, MSIX_TABLE_ENTRY_SIZE, MSIX_TABLE_OFFSET,
+    MsixState, MsixTableEntry, msix_capability_spec,
 };
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
