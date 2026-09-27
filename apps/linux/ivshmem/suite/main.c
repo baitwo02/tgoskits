@@ -327,7 +327,9 @@ static void wait_remote_state(const volatile uint32_t *state_table,
 {
     long deadline = monotonic_ms() + SUITE_HANDSHAKE_TIMEOUT_MS;
 
-    while (state_table[peer_id] != expected) {
+    /* Peer states advance monotonically; an asynchronous peer can publish
+     * the next checkpoint before this reader samples the previous one. */
+    while (state_table[peer_id] < expected) {
         if (monotonic_ms() >= deadline) {
             char detail[128];
 
