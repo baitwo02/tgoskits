@@ -94,15 +94,16 @@ pub use model::{
 };
 pub(crate) use pci::PciTopologyBuilder;
 pub use pci::{
-    ConfigOffset, EndpointIrqTransitionPermit, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf,
-    PciCapabilityByteMode, PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId,
-    PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciClass, PciCommandRevision,
-    PciCommandState, PciConfigEffectId, PciConfigReadEffect, PciConfigWriteEffect,
-    PciEcamConfigFrontend, PciEndpointContext, PciEndpointIdentity, PciError, PciFunction,
-    PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider, PciIntxPin,
-    PciIntxRequirement, PciIntxRouter, PciMemoryApertureDevice, PciMemoryBar, PciResult,
-    PciRootBinding, PciRootBindingKey, PciRootLifecycle, PciRootState, PciSegment, ResolvedPciBar,
-    ResolvedPciFunction, ResolvedPciIntx, ResolvedPciTopology,
+    ConfigOffset, EndpointIrqTransitionPermit, PciBarAccess, PciBarDecodePolicy, PciBarIndex,
+    PciBarRoute, PciBdf, PciCapabilityByteMode, PciCapabilityEffectAccess,
+    PciCapabilityEffectRegion, PciCapabilityId, PciCapabilityLayout, PciCapabilitySnapshot,
+    PciCapabilitySpec, PciClass, PciCommandRevision, PciCommandState, PciConfigEffectId,
+    PciConfigReadEffect, PciConfigWriteEffect, PciEcamConfigFrontend, PciEndpointContext,
+    PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec,
+    PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement, PciIntxRouter,
+    PciMemoryApertureDevice, PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey,
+    PciRootLifecycle, PciRootState, PciSegment, ResolvedPciBar, ResolvedPciFunction,
+    ResolvedPciIntx, ResolvedPciTopology,
 };
 #[cfg(target_arch = "x86_64")]
 pub(crate) use pci::{all_ones, read_bytes};
