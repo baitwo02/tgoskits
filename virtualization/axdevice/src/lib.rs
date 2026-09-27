@@ -37,6 +37,7 @@ mod error;
 mod fw_cfg;
 mod graph;
 mod interrupt;
+mod ivshmem;
 mod model;
 mod pci;
 // Keep the LoongArch-only implementation out of other production targets, but
@@ -49,6 +50,7 @@ mod resources;
 mod runtime_resources;
 mod serial;
 mod service;
+mod stage2_remap;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
@@ -71,6 +73,14 @@ pub use graph::{
     ResolvedDeviceNode,
 };
 pub use interrupt::{ControllerRegistration, InterruptRegistrationError};
+pub use ivshmem::{
+    BackingAllocation, Bar2Section, DOORBELL_OFFSET, Doorbell, DoorbellEvent, EVENT_STATUS_OFFSET,
+    ID_OFFSET, INTERRUPT_CONTROL_OFFSET, IvshmemDirectPlan, IvshmemError, IvshmemEventSink,
+    IvshmemLink, IvshmemLinkRegistry, IvshmemMemoryLayout, IvshmemRegisters, LinkGeneration,
+    LinkId, LinkProfile, MAX_PEERS_LIMIT, MAXIMUM_PEERS_OFFSET, PeerAttachment, PeerId,
+    PeerReservation, REGISTER_PAGE_SIZE, SHARED_MEMORY_SIZE, STATE_OFFSET, SectionDesc,
+    SharedBackingAllocator, SharedBarBacking,
+};
 #[cfg(target_arch = "loongarch64")]
 // Reusable LoongArch device models. These are target-gated device packages,
 // not part of the architecture-neutral framework core.
@@ -110,6 +120,7 @@ pub use serial::{
     Uart16550, build_16550_mmio, build_16550_port, build_pl011_mmio,
 };
 pub use service::{DeviceServices, ServiceCardinality, ServiceKey};
+pub use stage2_remap::{DirectMapping, DirectMappingFault, GpaRange, Stage2Remap};
 #[cfg(target_arch = "x86_64")]
 // Reusable x86 device models and narrow typed services. These are target-gated
 // device packages, not part of the architecture-neutral framework core.
