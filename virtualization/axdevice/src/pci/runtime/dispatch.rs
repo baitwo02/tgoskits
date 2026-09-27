@@ -75,6 +75,12 @@ impl PciRootBinding {
         Arc::ptr_eq(self.root.topology_arc(), topology)
     }
 
+    /// Resets every route of this root back to power-on state, including
+    /// endpoint-owned state through `PciFunction::reset`.
+    pub fn reset(&self) -> DeviceManagerResult {
+        self.reset_lifecycle()
+    }
+
     pub(crate) fn reset_lifecycle(&self) -> DeviceManagerResult {
         let operation = self.begin_reset_operation()?;
         let result = self.reset_routes();

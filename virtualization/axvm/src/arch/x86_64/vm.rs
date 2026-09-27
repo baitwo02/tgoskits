@@ -159,6 +159,7 @@ fn plan_devices(
         &controller_id,
         axdevice_base::InterruptControllerId::new(0),
         Some(super::pci_config::host_key()),
+        None,
     )?;
     Ok(SimpleVmPlan::new(VmDevicePlan::with_pci_host_for_vm(
         config,

@@ -92,6 +92,7 @@ fn plan_devices(config: &AxVMConfig) -> AxVmResult<RiscvVmPlan> {
         &controller_id,
         axdevice_base::InterruptControllerId::new(0),
         None,
+        None,
     )?;
     Ok(SimpleVmPlan::new(VmDevicePlan::with_pools_for_vm(
         config,

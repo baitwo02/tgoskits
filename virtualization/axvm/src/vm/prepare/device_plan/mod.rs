@@ -255,6 +255,7 @@ mod tests {
             &controller,
             InterruptControllerId::new(0),
             None,
+            None,
         )
         .unwrap();
         nodes
