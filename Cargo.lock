@@ -437,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "ax-mm",
  "ax-std",
+ "fdt-parser",
 ]
 
 [[package]]
