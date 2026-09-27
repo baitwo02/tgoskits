@@ -7,8 +7,8 @@ use super::{
     DeviceManagerResult, EndpointRouteToken, PciBarAccess, PciRootBinding,
     cleanup::PciBindingLease,
     endpoint::{
-        EndpointIrqTransitionPermit, LegacyPciEndpointContext, OwnerPciEndpointContext,
-        PciEndpointContext, PciFunction, RoutedPciEndpointContext,
+        BarAssignment, EndpointIrqTransitionPermit, LegacyPciEndpointContext,
+        OwnerPciEndpointContext, PciEndpointContext, PciFunction, RoutedPciEndpointContext,
     },
     lifecycle::PendingIrqWithdrawal,
     pci_config_error,
@@ -156,6 +156,17 @@ impl PciRootBinding {
             self.rollback_unpublished_endpoint(&token, function);
             return Err(error.into());
         }
+        // Direct-mapped BAR support: hand the resolved BAR table to the
+        // endpoint before the lease is returned; a failing endpoint rolls
+        // the whole bind back.
+        if let Err(error) = function.notify_bar_assignment(&self.bar_assignments(function_id)) {
+            if registered && let Some(grants) = routed_grants {
+                grants.pop();
+            }
+            self.root.unbind_route_for_binding(&token);
+            self.rollback_unpublished_endpoint(&token, function);
+            return Err(DeviceManagerError::Device(error));
+        }
         if let Err(error) = lifecycle.finish_restore() {
             // The route publication itself succeeded. Deferred withdrawals
             // remove their routes before reporting an IRQ cleanup failure, so
@@ -166,6 +177,22 @@ impl PciRootBinding {
             binding: self.clone(),
             token,
         })
+    }
+
+    /// Collects the resolved BAR table of one function for bind-time
+    /// notification.
+    fn bar_assignments(&self, function_id: &DeviceNodeId) -> Vec<BarAssignment> {
+        self.root
+            .topology()
+            .function(function_id)
+            .map(|function| {
+                function
+                    .bars()
+                    .iter()
+                    .map(|bar| BarAssignment::new(bar.index, bar.address, bar.size))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn validate_config_effect_contract(
@@ -410,6 +437,14 @@ impl PciRootBinding {
                     endpoint.command_changed(command, context)
                 })
             }
+            PciConfigWriteOutcome::BarRelocated { token, bar, gpa } => {
+                let Some(token) = token else {
+                    return Ok(());
+                };
+                self.dispatch_legacy(&token, false, |endpoint, _context| {
+                    endpoint.notify_bar_relocated(bar, gpa)
+                })
+            }
         }
     }
 
@@ -495,6 +530,14 @@ impl PciRootBinding {
                     context,
                     |endpoint, context| endpoint.command_changed(command, context),
                 )
+            }
+            PciConfigWriteOutcome::BarRelocated { token, bar, gpa } => {
+                let Some(token) = token else {
+                    return Ok(());
+                };
+                self.dispatch_with_context(&token, false, context, |endpoint, _context| {
+                    endpoint.notify_bar_relocated(bar, gpa)
+                })
             }
         }
     }

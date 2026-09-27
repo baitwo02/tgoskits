@@ -55,6 +55,13 @@ pub(crate) enum PciConfigWriteOutcome {
         token: Option<EndpointRouteToken>,
         command: PciCommandState,
     },
+    /// A guest BAR relocation was accepted; the bound endpoint re-derives
+    /// any direct mappings outside the root state lock.
+    BarRelocated {
+        token: Option<EndpointRouteToken>,
+        bar: PciBarIndex,
+        gpa: u64,
+    },
 }
 
 /// Shared root state for one frozen PCI topology.
@@ -190,9 +197,13 @@ impl PciRootState {
         value: u64,
     ) -> PciResult {
         match self.prepare_write_config(bdf, offset, width, value)? {
-            PciConfigWriteOutcome::Complete | PciConfigWriteOutcome::CommandChanged { .. } => {
-                Ok(())
-            }
+            PciConfigWriteOutcome::Complete
+            | PciConfigWriteOutcome::CommandChanged { .. }
+            // The guest-facing frontends always write config through the
+            // routed `*_with_context` binding APIs, which deliver the
+            // relocation notification; this direct root API has no router
+            // access, so the accepted relocation stands without one.
+            | PciConfigWriteOutcome::BarRelocated { .. } => Ok(()),
             PciConfigWriteOutcome::Effect { .. } => Err(PciError::ConfigEffectUnavailable {
                 detail: "an endpoint binding is required for this config write",
             }),
@@ -366,6 +377,23 @@ impl PciRootState {
                             };
                             state.functions[function_index]
                                 .finish_relocation(bar, accepted.then_some(candidate));
+                            if accepted {
+                                let token = state
+                                    .bindings
+                                    .get(&bdf)
+                                    .and_then(EndpointRouteToken::snapshot_if_admitted);
+                                let bar = PciBarIndex::new(bar as u8).map_err(|_| {
+                                    PciError::InvalidAddress {
+                                        component: "BAR index",
+                                        value: bar as u64,
+                                    }
+                                })?;
+                                return Ok(PciConfigWriteOutcome::BarRelocated {
+                                    token,
+                                    bar,
+                                    gpa: candidate,
+                                });
+                            }
                         }
                     }
                     return Ok(PciConfigWriteOutcome::Complete);
