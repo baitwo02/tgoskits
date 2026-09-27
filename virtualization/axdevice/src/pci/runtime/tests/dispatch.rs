@@ -247,6 +247,22 @@ fn binding_dispatches_config_effects_and_command_transitions() {
     assert!(recording.reads.lock_irqsave().is_empty());
     assert!(recording.writes.lock_irqsave().is_empty());
 
+    // A conventional dword read may straddle a live effect and the frozen
+    // bytes beside it; the result must still include the endpoint value.
+    assert_eq!(
+        binding
+            .read_config(
+                bdf,
+                ConfigOffset::new(capability_offset + 12).unwrap(),
+                AccessWidth::Dword,
+            )
+            .unwrap(),
+        0x5a
+    );
+    let partial = recording.reads.lock_irqsave().pop().unwrap();
+    assert_eq!(partial.0.offset(), 12);
+    assert_eq!(partial.0.width(), AccessWidth::Word);
+
     assert_eq!(
         binding
             .read_config(
@@ -316,14 +332,15 @@ fn binding_dispatches_config_effects_and_command_transitions() {
     assert_eq!(command.1, DeviceId::new(7));
 
     assert!(matches!(
-        binding.read_config(
+        binding.write_config(
             bdf,
             ConfigOffset::new(capability_offset + 12).unwrap(),
             AccessWidth::Dword,
+            0xfeed_beef,
         ),
         Err(DeviceError::InvalidInput { .. })
     ));
-    assert!(recording.reads.lock_irqsave().is_empty());
+    assert!(recording.writes.lock_irqsave().is_empty());
 
     drop(lease);
     assert!(matches!(
