@@ -2,25 +2,26 @@
 #
 [base]
 # Guest vm id.
-id = 1
+id = 2
 # Guest vm name.
-name = "arceos-ivshmem-pci"
+name = "arceos-ivshmem-peer"
 # Virtualization type.
 guest_type = "virtualized"
 # The number of virtual CPUs.
 cpu_num = 1
 # Guest vm physical cpu ids.
-phys_cpu_ids = [1]
+phys_cpu_ids = [2]
 
 #
 # Vm kernel configs
 #
 [kernel]
+cmdline = "axvisor.pci_case=ivshmem-suite-arceos"
 # The entry point of the kernel image.
 entry_point = 0x8020_0000
 # The location of image: "memory" | "fs".
 image_location = "memory"
-# The file path of the kernel image, built from this workspace by guest-builds.toml.
+# The file path of the kernel image built by axbuild before host compilation.
 kernel_path = "${workspace}/target/aarch64-unknown-linux-musl/release/arceos-ivshmem-pci.bin"
 # The load address of the kernel image.
 kernel_load_addr = 0x8020_0000
@@ -43,12 +44,12 @@ disabled = [
   { path = "/pcie@10000000" },
 ]
 
-# One-peer link: the state table is read-only, the output section belongs to peer 0.
+# The ArceOS peer joins the Linux primary and portable peers on one link.
 [[devices.virtual]]
 id = "ivshmem0"
 model = "ivshmem-pci"
-link_id = 1
-peer_id = 0
-max_peers = 1
+link_id = 4
+peer_id = 1
+max_peers = 3
 common_size = 0
-output_size = 0x7000
+output_size = 0x5000

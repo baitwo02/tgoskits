@@ -7,23 +7,23 @@ args = [
   "-smp",
   "4",
   "-m",
-  "4g",
+  "8g",
 ]
 fail_regex = [
   "(?i)\\bpanic(?:ked)?\\b",
-  "(?m)^ARCEOS_IVSHMEM_PCI_FAIL(?:\\s|$)",
+  "run VCpu\\[\\d+\\] get error",
+  "IVSHMEM_PCI_SUITE_FAILED",
+  "ARCEOS_IVSHMEM_PCI_FAIL",
 ]
-timeout = 120
+timeout = 240
 to_bin = true
 uefi = false
 
-# The host build has no `fs` feature, so the shell prompt stays in its
-# fallback form. Match only after the guest maps the generated ECAM,
-# verifies the ivshmem identity, enables BAR2 and completes a write/read
-# round trip.
+# The primary peer prints the final marker only after the polling and MSI-X
+# phases, the ArceOS exchange, and both non-target isolation checks succeed.
 [[shell_check_steps]]
 shell_prefix = "axvisor:$"
 shell_cmd = "vm console 1"
 success_regex = [
-  "(?m)^(?:\\x1b\\[[0-9;]*m)*(?:\\[VM 1\\] )?ARCEOS_IVSHMEM_PCI_PASS\\s*$",
+  "(?m)^(?:\\x1b\\[[0-9;]*m)*(?:\\[VM 1\\] )?IVSHMEM_PCI_SUITE_PASSED\\s*$",
 ]
