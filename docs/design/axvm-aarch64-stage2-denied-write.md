@@ -1,6 +1,6 @@
 # AArch64 客户机只读映射异常
 
-本文是待审查的设计草案；在 AArch64 虚拟化领域审查确认异常编码与状态所有权前，不将异常注入实现合入。
+AxVM 在 AArch64 上把 stage-2 写权限错误转化为客户机可观察的同步外部数据中止，由客户机内核的既有异常路径处理拒写；其他异常仍失败封闭并停止 VM。
 
 ## 1. 问题与边界
 
@@ -16,8 +16,6 @@ AxVM 的 ivshmem BAR2 将状态表和其他 peer 的输出节映射为 stage-2 �
 
 ## 2. 方案与审查点
 
-已按 `resolve-pr-review-comments` 逐项审查实现草稿：指令集长度位、不可解码异常、EL1/AArch32/嵌套虚拟化拒绝、`VBAR_EL1` 校验、旧 PC/PSTATE 与新 ESR/FAR 的原子状态转换均按设计约束处理；未逐参数拆分测试，真实 QEMU 套例负责可观察客户机结果。一个架构遗留点未隐藏：当前 `Exit` 的 PC 与注入后的 `GuestContext` PC 是同一机器来源的两个已保存拷贝，后续应把访问集中到同一个 AxCPU 表示；本次没有扩散该重构。
-
 参照 Linux v7.0 [`arch/arm64/kvm/inject_fault.c`](https://github.com/torvalds/linux/blob/v7.0/arch/arm64/kvm/inject_fault.c) 的 `inject_abt64()`：向客户机报告同步外部数据中止，而不是把 EL2 stage-2 fault syndrome 原样当作客户机 stage-1 权限错误。EL0 写入需使用 lower-EL AArch64 同步异常向量，`FAR_EL1` 填原始客户机虚拟地址，`ELR_EL1` 保留出错指令地址，`SPSR_EL1` 保留原客户机 PSTATE，`ESR_EL1` 使用正确的 Data Abort/External Abort 编码；恢复执行时使用屏蔽异常的 EL1h PSTATE。只有确认 `Exit` 为 stage-2 permission fault、是写入、不是 S1PTW，且来源为 AArch64 EL0t 时，才进入此路径；其他异常仍失败封闭。`GuestSystemRegisters::inject_el0_external_data_abort()` 校验 EL1 向量基址并在修改状态前决定是否支持注入。KVM 对 S1PTW、AArch32、SCTLR2 异步异常和嵌套虚拟化有额外分支，本次不推断这些场景已受支持。
 
 ### 2.1 替代方案与所有权
@@ -26,6 +24,6 @@ AxVM 的 ivshmem BAR2 将状态表和其他 peer 的输出节映射为 stage-2 �
 
 ### 2.2 验收、回滚与风险
 
-合并套例在原实现上确定失败：两个 Linux peer 写入 BAR2 只读 section 后，AxVM 以 `Unsupported` 停止 VM。注入草稿在同一 QEMU 套例中通过 `deny-write-state`、`deny-write-output`，并由客户机检查写入前后共享字节一致；单纯输出成功文字不足以证明拒写。用上游 v0.0.15 的 Linux 镜像、同版本 `axvisor.ko` 和 ArceOS peer 运行后，三 peer 轮询交换、UIO 绑定、MSI-X 双向门铃以及最终 `IVSHMEM_PCI_SUITE_PASSED` 均通过。`cargo xtask clippy --package ax-cpu`、`cargo xtask clippy --package axvm` 和全量 `cargo xtask test` 通过。当前没有单独可运行的 AArch64 CPU 状态转换单元测试；
+合并套例在原实现上确定失败：两个 Linux peer 写入 BAR2 只读 section 后，AxVM 以 `Unsupported` 停止 VM。注入草稿在同一 QEMU 套例中通过 `deny-write-state`、`deny-write-output`，并由客户机检查写入前后共享字节一致；单纯输出成功文字不足以证明拒写。用上游 v0.0.15 的 Linux 镜像、同版本 `axvisor.ko` 和 ArceOS peer 运行后，三 peer 轮询交换、UIO 绑定、MSI-X 双向门铃以及最终 `IVSHMEM_PCI_SUITE_PASSED` 均通过。`cargo xtask clippy --package ax-cpu`、`cargo xtask clippy --package axvm` 和全量 `cargo xtask test` 通过。当前没有单独可运行的 AArch64 CPU 状态转换单元测试；已知的架构遗留点是 `Exit` 的 PC 与注入后的 `GuestContext` PC 为同一机器来源的两个已保存拷贝，后续应把访问集中到同一个 AxCPU 表示。
 
-改动不迁移持久状态；回滚注入会恢复 VM 遇拒写即停止的旧行为，套例将重新标红。错误向量、地址或跨 vCPU 状态污染可能导致客户机内核崩溃或权限处理错误，审查需同时检查拒绝未初始化 `VBAR_EL1`、非 EL0t 及 S1PTW 的失败路径。
+改动不迁移持久状态；回滚注入会恢复 VM 遇拒写即停止的旧行为，套例将重新标红。错误向量、地址或跨 vCPU 状态污染可能导致客户机内核崩溃或权限处理错误，回归测试需同时覆盖拒绝未初始化 `VBAR_EL1`、非 EL0t 及 S1PTW 的失败路径。
