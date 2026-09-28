@@ -364,6 +364,9 @@ run_ivshmem_suite() {
 
 cmdline=$(/bin/busybox cat /proc/cmdline)
 case "$cmdline" in
+  *axvisor.pci_case=ivshmem-message-subscriber*)
+    /bin/ivshmem_subscriber || echo "IVSHMEM_SUBSCRIBER_FAILED init"
+    exec /bin/busybox sh -i ;;
   *axvisor.pci_case=ivshmem-suite-linux*)
     run_ivshmem_suite linux || echo "IVSHMEM_PCI_SUITE_FAILED peer=0 role=linux phase=init step=run"
     exec /bin/busybox sh -i ;;
@@ -876,6 +879,10 @@ fn build_busybox_initramfs(
         if let Some(smoke) = smoke {
             archive.append_regular(super::ivshmem_smoke::SMOKE_ARCHIVE_PATH, &smoke.smoke)?;
             archive.append_regular(super::ivshmem_smoke::SUITE_ARCHIVE_PATH, &smoke.suite)?;
+            archive.append_regular(
+                super::ivshmem_smoke::SUBSCRIBER_ARCHIVE_PATH,
+                &smoke.subscriber,
+            )?;
         }
         if let Some(module) = module {
             archive.append_regular(super::ivshmem_smoke::MODULE_ARCHIVE_PATH, module)?;
@@ -1031,6 +1038,7 @@ mod tests {
         let smoke = super::super::ivshmem_smoke::SmokeBinaries {
             smoke: b"polling".to_vec(),
             suite: b"suite".to_vec(),
+            subscriber: b"subscriber".to_vec(),
         };
         let compressed = build_busybox_initramfs(
             b"busybox",
@@ -1056,6 +1064,12 @@ mod tests {
                 .get(super::super::ivshmem_smoke::SUITE_ARCHIVE_PATH)
                 .unwrap(),
             b"suite"
+        );
+        assert_eq!(
+            entries
+                .get(super::super::ivshmem_smoke::SUBSCRIBER_ARCHIVE_PATH)
+                .unwrap(),
+            b"subscriber"
         );
         assert_eq!(
             entries

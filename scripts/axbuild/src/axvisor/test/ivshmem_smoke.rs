@@ -16,12 +16,14 @@ pub(super) const MODULE_ARCHIVE_PATH: &str = "lib/modules/axvisor.ko";
 pub(super) const MODULE_ROOTFS_PATH: &str = "/root/axvisor.ko";
 pub(super) const SMOKE_ARCHIVE_PATH: &str = "bin/ivshmem-bar2-smoke";
 pub(super) const SUITE_ARCHIVE_PATH: &str = "bin/ivshmem-pci-suite";
+pub(super) const SUBSCRIBER_ARCHIVE_PATH: &str = "bin/ivshmem_subscriber";
 
 const ADAPTER_SOURCES: &[&str] = &["discovery.c", "backend_polling.c", "errors.c"];
 
 pub(super) struct SmokeBinaries {
     pub(super) smoke: Vec<u8>,
     pub(super) suite: Vec<u8>,
+    pub(super) subscriber: Vec<u8>,
 }
 
 fn workspace_path(root: &Path, configured: &str, variable: &str) -> anyhow::Result<PathBuf> {
@@ -135,6 +137,10 @@ pub(super) fn build_smoke_binaries(
     Ok(SmokeBinaries {
         smoke: build("ivshmem-bar2-smoke", &source.join("bar2_smoke/main.c"))?,
         suite: build("ivshmem-pci-suite", &source.join("suite/main.c"))?,
+        subscriber: build(
+            "ivshmem_subscriber",
+            &root.join("apps/linux/ivshmem_subscriber/main.c"),
+        )?,
     })
 }
 

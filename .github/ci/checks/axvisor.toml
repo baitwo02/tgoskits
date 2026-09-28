@@ -38,6 +38,8 @@ cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qem
 # The link-backed ivshmem-pci suite is set to replace the legacy IVC cases.
 echo "==> axvisor aarch64 ivshmem-pci three-peer suite"
 cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivshmem-pci
+echo "==> axvisor aarch64 ivshmem Message V1 (ArceOS + two Linux guests)"
+cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivshmem-message
 '''
 
 [[check.suite]]
@@ -49,6 +51,7 @@ cases = [
   "qemu-ivc",
   "qemu-ivc-local",
   "qemu-ivshmem-pci",
+  "qemu-ivshmem-message",
 ]
 
 [[check]]
