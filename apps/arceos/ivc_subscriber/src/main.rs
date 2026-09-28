@@ -36,6 +36,7 @@ mod subscriber {
             mem::{PhysAddr, VirtAddr, virt_to_phys},
         },
         println, thread,
+        time::{Duration, Instant},
     };
     use axhvc::ivc::{self, IvcGuestPhysAddr};
     use axivc::{
@@ -49,7 +50,8 @@ mod subscriber {
     const ACK_MESSAGE_LEN: usize = APP_HEADER_LEN + ACK_BODY.len();
     const DATA_MESSAGE_LENGTHS: [usize; 3] = [233, 7425, 7484];
     const REQUEST_MESSAGE_LENGTHS: [usize; 5] = [231, 232, 233, 7424, 7484];
-    const MAX_SUBSCRIBE_ATTEMPTS: usize = 80;
+    const CHANNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
+    const CHANNEL_RETRY_DELAY: Duration = Duration::from_millis(100);
     const PUBLISH_COUNT: u64 = REQUEST_MESSAGE_LENGTHS.len() as u64;
     const SUBSCRIBE_DATA_COUNT: u64 = DATA_MESSAGE_LENGTHS.len() as u64;
     static NOTIFY_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -61,9 +63,8 @@ mod subscriber {
 
     pub fn run() {
         let irq_enabled = register_notify_irq();
-        let waiter = IvcPeerEventWaiter::new(irq_enabled, &NOTIFY_IRQ_COUNT);
-        let Some((shm_base_gpa, shm_size)) = subscribe_with_retry(&waiter) else {
-            println!("ivc subscribe failed: retry limit reached");
+        let Some((shm_base_gpa, shm_size)) = subscribe_with_retry() else {
+            println!("ivc subscribe failed: timed out waiting for publisher channel");
             return;
         };
 
@@ -90,7 +91,7 @@ mod subscriber {
             );
             return;
         }
-        if !wait_for_protocol_header(region, &waiter) {
+        if !wait_for_protocol_header(region) {
             println!("ivc subscribe failed: unsupported Message V1 protocol header");
             return;
         }
@@ -120,18 +121,22 @@ mod subscriber {
         println!("ivc subscriber full-duplex demo complete");
     }
 
-    fn wait_for_protocol_header(region: &IvcRegion, waiter: &IvcPeerEventWaiter<'_>) -> bool {
-        for _ in 0..MAX_SUBSCRIBE_ATTEMPTS {
+    fn wait_for_protocol_header(region: &IvcRegion) -> bool {
+        let started = Instant::now();
+        loop {
             if region.protocol_header_matches() {
                 return true;
             }
-            waiter.wait_for_peer_event();
+            if started.elapsed() >= CHANNEL_READY_TIMEOUT {
+                return false;
+            }
+            thread::sleep(CHANNEL_RETRY_DELAY);
         }
-        false
     }
 
-    fn subscribe_with_retry(waiter: &IvcPeerEventWaiter<'_>) -> Option<(usize, usize)> {
-        for attempt in 1..=MAX_SUBSCRIBE_ATTEMPTS {
+    fn subscribe_with_retry() -> Option<(usize, usize)> {
+        let started = Instant::now();
+        for attempt in 1.. {
             let shm_base_gpa = HyperCallOutputValue::new(0);
             let shm_size = HyperCallOutputValue::new(0);
             let shm_base_gpa_ptr = shm_base_gpa.guest_phys_addr();
@@ -148,7 +153,10 @@ mod subscriber {
                     if attempt == 1 || attempt % 10 == 0 {
                         println!("ivc subscribe retry attempt={attempt} err={err}");
                     }
-                    waiter.wait_for_peer_event();
+                    if started.elapsed() >= CHANNEL_READY_TIMEOUT {
+                        break;
+                    }
+                    thread::sleep(CHANNEL_RETRY_DELAY);
                 }
             }
         }
