@@ -59,6 +59,12 @@ impl IvcRing {
             && self.cell_size.load(Ordering::Relaxed) == IVC_CELL_SIZE as u32
     }
 
+    pub(crate) fn can_send(&self) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        (tail.wrapping_sub(head) as usize) < IVC_RING_CAPACITY
+    }
+
     pub(crate) fn try_push_cell(&self, cell: &[u8; IVC_CELL_SIZE]) -> Result<(), IvcCellError> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
@@ -82,6 +88,10 @@ impl IvcRing {
         let cell_index = head as usize % IVC_RING_CAPACITY;
         self.cells[cell_index].read(output);
         true
+    }
+
+    pub(crate) fn can_recv(&self) -> bool {
+        self.head.load(Ordering::Relaxed) != self.tail.load(Ordering::Acquire)
     }
 
     pub(crate) fn pop_cell(&self) {
