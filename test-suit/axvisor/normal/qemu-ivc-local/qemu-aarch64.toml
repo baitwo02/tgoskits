@@ -22,10 +22,31 @@ fail_regex = [
     "(?i)unhandled page fault",
     "(?i)page fault",
     "ivc publish failed",
+    "VM\\[\\d+\\] boot failed",
     "(?m)^linux ivc demo failed\\s*$",
 ]
 to_bin = true
 uefi = false
+
+[[shell_check_steps]]
+shell_prefix = "axvisor:/$"
+shell_cmd = "vm start 1"
+success_regex = ["VM\\[1\\] started successfully"]
+
+[[shell_check_steps]]
+shell_prefix = "axvisor:/$"
+shell_cmd = "vm console 1"
+success_regex = ["Attached VM\\[1\\] console"]
+
+[[shell_check_steps]]
+shell_prefix = "ivc notify irq enabled"
+shell_cmd = "\u0018h"
+success_regex = ["detached VM\\[1\\] console"]
+
+[[shell_check_steps]]
+shell_prefix = "axvisor:/$"
+shell_cmd = "vm start 2"
+success_regex = ["VM\\[2\\] started successfully"]
 
 [[shell_check_steps]]
 shell_prefix = "axvisor:/$"
@@ -40,11 +61,6 @@ success_regex = [
 shell_prefix = "~ #"
 shell_cmd = "\u0018h"
 success_regex = ["detached VM\\[2\\] console"]
-
-[[shell_check_steps]]
-shell_prefix = "axvisor:/$"
-shell_cmd = "vm resume 1"
-success_regex = ["VM\\[1\\] resumed successfully"]
 
 [[shell_check_steps]]
 shell_prefix = "axvisor:/$"
